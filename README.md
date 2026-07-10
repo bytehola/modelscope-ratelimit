@@ -45,20 +45,22 @@ Modelscope 免费额度是**共享配额**——多个 key、多个托管 provid
 
 ### 方式一：使用已构建版本
 
-从 [Releases](https://github.com/bytehola/modelscope-ratelimit/releases) 下载对应平台的预编译产物，放入 CLIProxyAPI 的 `plugins/<os>/<arch>/` 目录。
+从 [Releases](https://github.com/bytehola/modelscope-ratelimit/releases) 下载对应平台的预编译产物。
+
+> ⚠️ **文件名必须为 `modelscope-ratelimit.so` / `.dll`**，去掉平台后缀，需与配置中的 `modelscope-ratelimit` 对应，否则 CPA 无法加载。
 
 **Linux (amd64)**
 
 ```bash
 mkdir -p plugins/linux/amd64
-cp modelscope-ratelimit.so plugins/linux/amd64/
+cp modelscope-ratelimit-linux-amd64.so plugins/linux/amd64/modelscope-ratelimit.so
 ```
 
 **Windows (amd64)**
 
 ```powershell
 mkdir plugins\windows\amd64
-copy modelscope-ratelimit.dll plugins\windows\amd64\
+copy modelscope-ratelimit-windows-amd64.dll plugins\windows\amd64\modelscope-ratelimit.dll
 ```
 
 ### 方式二：从源码构建
