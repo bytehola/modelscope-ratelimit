@@ -61,18 +61,6 @@ mkdir plugins\windows\amd64
 copy modelscope-ratelimit.dll plugins\windows\amd64\
 ```
 
-**macOS (amd64 / arm64)**
-
-```bash
-# Intel
-mkdir -p plugins/darwin/amd64
-cp modelscope-ratelimit.dylib plugins/darwin/amd64/
-
-# Apple Silicon
-mkdir -p plugins/darwin/arm64
-cp modelscope-ratelimit.dylib plugins/darwin/arm64/
-```
-
 ### 方式二：从源码构建
 
 **环境**：Go 1.26+ · [zig](https://ziglang.org/) 0.13+（交叉编译 Windows）· CLIProxyAPI v7.2.51+
