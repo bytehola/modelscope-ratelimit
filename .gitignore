@@ -1,0 +1,9 @@
+# Build artifacts (regenerable via: go build -buildmode=c-shared ./cmd/plugin)
+cmd/plugin/*.so
+cmd/plugin/*.dylib
+cmd/plugin/*.dll
+cmd/plugin/*.h
+cmd/plugin/modelscope-ratelimit
+
+# Go toolchain downloads
+*.tgz

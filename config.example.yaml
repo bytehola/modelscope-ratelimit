@@ -1,0 +1,58 @@
+# ============================================================
+# CLIProxyAPI 配置示例 — modelscope-ratelimit 插件
+# 将相关段落放入 config.yaml 即可。
+# ============================================================
+
+# 1) 将 Modelscope（及魔搭等共享配额的上游）配置为 openai-compatibility 多 key provider。
+#    每个 api-key 代表一个独立账户；name 即插件 providers 引用的提供商名称。
+openai-compatibility:
+  - name: "modelscope" # 插件 providers 中填此名称
+    disabled: false
+    base-url: "https://api-inference.modelscope.cn/v1"
+    api-key-entries: # 多个 key = 多个账户（共享配额）
+      - api-key: "ms-key-AAAAAAAAAAAA"
+      - api-key: "ms-key-BBBBBBBBBBBB"
+      - api-key: "ms-key-CCCCCCCCCCCC"
+    models:
+      - name: "Qwen/Qwen2.5-72B-Instruct"
+        alias: "Qwen-72B" # 客户端用别名请求，插件按别名禁用/调度
+      - name: "Qwen/Qwen2.5-7B-Instruct"
+        alias: "Qwen-7B"
+
+# 2) 启用插件并配置。配置项在后台管理页「插件管理 → 编辑配置」中也可修改。
+plugins:
+  enabled: true
+  dir: "plugins"
+  configs:
+    modelscope-ratelimit:
+      enabled: true
+      priority: 10 # 运行优先级，高于其他调度器即可
+
+      # ---- 必填 ----
+      providers:
+        ["modelscope"] # 需要监控CPA中的AI供应商名称，必填。
+        # 填入顺序决定优先级：先填入的组额度耗尽后才用后面的。
+        # 多个 provider 示例: ["moda", "modelscope"] → 先用 moda，耗尽后回退 modelscope。
+        # 宿主运行时 key 为 openai-compatible-<name>，两者皆可匹配。
+      host_base_url: "http://127.0.0.1:8317" # CPA 管理 API 地址（选填，默认 http://127.0.0.1:8317）。
+      management_key: "your-management-secret" # CPA 管理密钥（必填）。仅服务端使用，不渲染进状态页。
+      # ---- 凭据与退避策略 ----
+      credential_strategy:
+        "round-robin" # 凭据选择策略（仅对监控的 provider 生效）：
+        #   round-robin = 轮询（默认），按 config 中 api-key 顺序轮换
+        #   fill-first  = 填充优先，始终用第一个 key 直到禁用或故障
+      insufficient_quota_cooldown:
+        10
+        # 冷却基准秒数（默认 10）。
+        # 连续失败按指数退避 ×2 递增（10→20→40→60），封顶 60 秒，
+        # 成功响应或次日 00:00 重置回基数。
+
+      # ---- 每日限流（通常留空用默认即可）----
+      timezone: "Asia/Shanghai" # 每日 00:00 重置时区，默认 Asia/Shanghai
+      model_remaining_header: "Modelscope-Ratelimit-Model-Requests-Remaining" # 单模型剩余次数头名
+      total_remaining_header: "Modelscope-Ratelimit-Requests-Remaining" # 总剩余次数头名
+      disable_threshold: 0 # 剩余次数 ≤ 此值即当日禁用该 key/model，默认 0（耗尽）
+
+
+      # ---- 可选 ----
+      # managed_models: ["Qwen-72B"]         # 仅监控这些模型名（别名），留空 = 全部
