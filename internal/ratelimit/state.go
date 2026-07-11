@@ -35,12 +35,13 @@ type rateData struct {
 }
 
 type keyState struct {
-	mu        sync.RWMutex
-	global    *time.Time           // global (all-model) disable time, nil if none
-	models    map[string]time.Time // disabled model -> disable time
-	modelData map[string]*rateData // observed model -> last-seen rate-limit data
-	totalData *rateData            // observed total rate-limit data
-	cooldown  *time.Time           // short-term global cooldown expiry (insufficient_quota), nil if none
+	mu           sync.RWMutex
+	global       *time.Time           // global (all-model) disable time, nil if none
+	models       map[string]time.Time // disabled model -> disable time
+	modelData    map[string]*rateData // observed model -> last-seen rate-limit data
+	totalData    *rateData            // observed total rate-limit data
+	cooldown     *time.Time           // short-term global cooldown expiry (insufficient_quota), nil if none
+	successCount int                  // daily successful request count (reset at midnight)
 }
 
 // Store is the concurrency-safe rate-limit state shared by all plugin hooks.
@@ -107,6 +108,7 @@ type Store struct {
 	cooldownCount     int64
 	cooldownWaitNanos int64 // wall-clock nanoseconds any goroutine was blocking
 	cooldownStatsDay  time.Time
+	successCount      int64     // daily successful managed requests (status page)
 	blockActive       int       // number of goroutines currently in a cooldown sleep
 	blockStart        time.Time // when the current block period started (blockActive 0→1)
 
@@ -828,6 +830,26 @@ func (s *Store) blockLeave() {
 	s.cooldownStatsMu.Unlock()
 }
 
+// recordSuccess increments the global and per-key daily success counters.
+// Called from OnUsage for managed-provider responses that did not fail.
+func (s *Store) recordSuccess(authID string) {
+	s.cooldownStatsMu.Lock()
+	s.successCount++
+	s.cooldownStatsMu.Unlock()
+	ks := s.getOrCreateKey(authID)
+	ks.mu.Lock()
+	ks.successCount++
+	ks.mu.Unlock()
+}
+
+// SuccessStats returns the daily count of successful managed-provider requests.
+func (s *Store) SuccessStats() int {
+	s.cooldownStatsMu.Lock()
+	n := s.successCount
+	s.cooldownStatsMu.Unlock()
+	return int(n)
+}
+
 // defaultJitter returns a random duration in [0, 1s), used to stagger
 // insufficient_quota cooldown retries so they don't thunder-herd.
 func defaultJitter() time.Duration {
@@ -928,6 +950,21 @@ func (s *Store) Status() []DisableStatus {
 // background cleaner and usable on demand.
 func (s *Store) PruneAll(now time.Time) {
 	loc := s.location()
+
+	// Determine whether the daily boundary has crossed before iterating keys,
+	// so per-key daily counters (successCount) can be reset in the same pass.
+	s.cooldownStatsMu.Lock()
+	dayChanged := !s.cooldownStatsDay.IsZero() && !sameDay(s.cooldownStatsDay, now, loc)
+	s.cooldownStatsDay = now
+	if dayChanged {
+		s.cooldownCount = 0
+		s.cooldownWaitNanos = 0
+		s.successCount = 0
+		s.blockActive = 0
+		s.blockStart = time.Time{}
+	}
+	s.cooldownStatsMu.Unlock()
+
 	s.mu.RLock()
 	ids := make([]string, 0, len(s.keys))
 	for id := range s.keys {
@@ -941,6 +978,9 @@ func (s *Store) PruneAll(now time.Time) {
 			continue
 		}
 		ks.mu.Lock()
+		if dayChanged {
+			ks.successCount = 0
+		}
 		if ks.cooldown != nil && !now.Before(*ks.cooldown) {
 			ks.cooldown = nil
 		}
@@ -1012,6 +1052,7 @@ type KeyView struct {
 	TotalLimit     int
 	HasTotalRem    bool
 	HasTotalLim    bool
+	SuccessCount   int
 }
 
 // Snapshot returns a render-ready view of every observed credential's state at
@@ -1066,6 +1107,7 @@ func (s *Store) Snapshot(now time.Time) map[string]KeyView {
 			kv.HasTotalRem = ks.totalData.hasRem
 			kv.HasTotalLim = ks.totalData.hasLim
 		}
+		kv.SuccessCount = ks.successCount
 		ks.mu.RUnlock()
 		out[id] = kv
 	}

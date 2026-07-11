@@ -324,12 +324,12 @@ func (s *Store) RenderStatusHTMLFull(now time.Time, cfg *Config, masked map[stri
 	b.WriteString(`.mcard .ma{font-size:22px;font-weight:600;color:#1a7f37;letter-spacing:-.01em}.mcard .ma-r{color:#bf0711}`)
 	b.WriteString(`.mcard .mk{font-size:12px;color:#86868b;margin-top:4px}`)
 	b.WriteString(`table{width:100%;border-collapse:collapse;background:#fff;border-radius:14px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.04),0 6px 16px rgba(0,0,0,.03)}`)
-	b.WriteString(`th{text-align:left;font-size:11px;font-weight:600;color:#86868b;text-transform:uppercase;letter-spacing:.05em;padding:13px 16px;border-bottom:1px solid #e8e8ed;background:#fafafa}`)
+	b.WriteString(`th{text-align:left;font-size:11px;font-weight:400;color:#86868b;text-transform:uppercase;letter-spacing:.05em;padding:13px 16px;border-bottom:1px solid #e8e8ed;background:#fafafa}`)
 	b.WriteString(`td{padding:13px 16px;border-bottom:1px solid #f0f0f3;font-size:13.5px;vertical-align:middle}`)
 	b.WriteString(`tr:last-child td{border-bottom:none}`)
 	b.WriteString(`tbody tr:nth-child(even) td{background:#f5f5f7}`)
 	b.WriteString(`.key{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;color:#424245;word-break:break-all}`)
-	b.WriteString(`.prov{display:block;font-size:10.5px;font-weight:600;color:#86868b;background:#f0f0f3;border-radius:980px;padding:2px 8px;margin-top:4px;width:fit-content}`)
+	b.WriteString(`.prov{display:block;font-size:10.5px;font-weight:600;color:#86868b;background:#f0f0f3;border-radius:980px;padding:2px 8px;margin:4px auto 0;width:fit-content}`)
 	b.WriteString(`.badge{display:inline-block;font-size:11.5px;font-weight:600;padding:3px 10px;border-radius:980px;white-space:nowrap}`)
 	b.WriteString(`.b-ok{background:#e8f5e9;color:#1a7f37}.b-glob{background:#fdecec;color:#bf0711}.b-mod{background:#fff4e0;color:#b25000}`)
 	b.WriteString(`.when{display:block;font-size:11px;color:#86868b;margin-top:3px}`)
@@ -343,7 +343,12 @@ func (s *Store) RenderStatusHTMLFull(now time.Time, cfg *Config, masked map[stri
 	b.WriteString(`.fill{display:block;height:100%;border-radius:980px}`)
 	b.WriteString(`.fill.g{background:#1a7f37}.fill.a{background:#b25000}.fill.r{background:#bf0711}`)
 	b.WriteString(`.tb{display:flex;flex-direction:column;gap:5px;min-width:120px}`)
-	b.WriteString(`.dash{color:#86868b}`)
+	b.WriteString(`.dash{color:#86868b}td.key,td:nth-child(2){text-align:center}`)
+	b.WriteString(`th{cursor:pointer;user-select:none;text-align:center;position:relative;transition:color .15s}`)
+	b.WriteString(`th:hover{color:#1d1d1f}`)
+	b.WriteString(`th::after{content:"";display:inline-block;width:5px;height:5px;border-radius:50%;background:#1a7f37;opacity:0;transition:opacity .25s ease,transform .25s ease;margin-left:5px;vertical-align:middle}`)
+	b.WriteString(`th.sort-asc::after{opacity:1;transform:translateY(2px)}`)
+	b.WriteString(`th.sort-desc::after{opacity:1;transform:translateY(-4px)}`)
 	b.WriteString(`</style></head><body><div class="wrap">`)
 
 	b.WriteString(`<div class="title">Modelscope 限流</div>`)
@@ -351,12 +356,13 @@ func (s *Store) RenderStatusHTMLFull(now time.Time, cfg *Config, masked map[stri
 		html.EscapeString(providerLabel), total, disabled, available, reset.In(loc).Format("2006-01-02 15:04:05 MST"))
 
 	cdCount, cdWait := s.CooldownStats()
+	b.WriteString(`<div class="cards" style="margin-bottom:22px">`)
+	fmt.Fprintf(&b, `<div class="card"><div class="k">请求成功</div><div class="v green">%d</div></div>`, s.SuccessStats())
 	if cdCount > 0 || cdWait > 0 {
-		b.WriteString(`<div class="cards" style="margin-bottom:22px">`)
 		fmt.Fprintf(&b, `<div class="card"><div class="k">退避触发</div><div class="v">%d 次</div></div>`, cdCount)
 		fmt.Fprintf(&b, `<div class="card"><div class="k">累计等待</div><div class="v">%s</div></div>`, formatDuration(cdWait))
-		b.WriteString(`</div>`)
 	}
+	b.WriteString(`</div>`)
 
 	if len(modelNames) > 0 {
 		b.WriteString(`<div class="section">按模型可用次数汇总</div><div class="cards">`)
@@ -374,9 +380,9 @@ func (s *Store) RenderStatusHTMLFull(now time.Time, cfg *Config, masked map[stri
 	}
 
 	b.WriteString(`<div class="section">Key 明细</div>`)
-	b.WriteString(`<table><thead><tr><th>Key</th><th>状态</th><th>模型剩余</th><th>总剩余</th></tr></thead><tbody>`)
+	b.WriteString(`<table id="rl-keys"><thead><tr><th data-sort-type="text">Key</th><th data-sort-type="num">状态</th><th data-sort-type="num">模型剩余</th><th data-sort-type="num">总剩余</th><th data-sort-type="num">成功</th></tr></thead><tbody>`)
 	if len(authIDs) == 0 {
-		b.WriteString(`<tr><td colspan="4" class="dash">暂无已解析的 key。</td></tr>`)
+		b.WriteString(`<tr><td colspan="5" class="dash">暂无已解析的 key。</td></tr>`)
 	}
 	for _, id := range authIDs {
 		mk := masked[id]
@@ -384,25 +390,33 @@ func (s *Store) RenderStatusHTMLFull(now time.Time, cfg *Config, masked map[stri
 			mk = id
 		}
 		kv, ok := snap[id]
-		b.WriteString(`<tr><td class="key" title="`)
-		b.WriteString(html.EscapeString(id))
-		b.WriteString(`">`)
-		b.WriteString(html.EscapeString(mk))
+		// Compute provider name early for Key column sorting.
+		pn := ""
 		if showProvider {
-			pn := provOfKey[id]
+			pn = provOfKey[id]
 			if pn == "" {
 				pn = providerOf(cfg, id)
 			}
-			if pn != "" {
-				fmt.Fprintf(&b, `<span class="prov">%s</span>`, html.EscapeString(pn))
-			}
+		}
+		keySort := pn
+		if keySort == "" {
+			keySort = mk
+		}
+		b.WriteString(`<tr><td class="key" title="`)
+		b.WriteString(html.EscapeString(id))
+		b.WriteString(`" data-sort="`)
+		b.WriteString(html.EscapeString(keySort))
+		b.WriteString(`">`)
+		b.WriteString(html.EscapeString(mk))
+		if pn != "" {
+			fmt.Fprintf(&b, `<span class="prov">%s</span>`, html.EscapeString(pn))
 		}
 		b.WriteString(`</td>`)
 		// 状态：仅在确有禁用时才标记。原先只要 key 有观测数据就落入
 		// "模型禁用" 分支，导致仅剩次数被观测但未禁用的活跃 key 被误标。
 		switch {
 		case ok && kv.GlobalDisabled:
-			fmt.Fprintf(&b, `<td><span class="badge b-glob">全部禁用</span><span class="when">禁用于 %s</span></td>`, kv.GlobalSince.In(loc).Format("15:04:05"))
+			fmt.Fprintf(&b, `<td data-sort="2"><span class="badge b-glob">全部禁用</span><span class="when">禁用于 %s</span></td>`, kv.GlobalSince.In(loc).Format("15:04:05"))
 		case ok && anyModelDisabled(kv.Models):
 			sortedModels := append([]ModelView(nil), kv.Models...)
 			sort.Slice(sortedModels, func(i, j int) bool {
@@ -419,9 +433,9 @@ func (s *Store) RenderStatusHTMLFull(now time.Time, cfg *Config, masked map[stri
 					fmt.Fprintf(&dis, `<span class="when">%s</span>`, html.EscapeString(mv.Name))
 				}
 			}
-			fmt.Fprintf(&b, `<td>%s</td>`, dis.String())
+			fmt.Fprintf(&b, `<td data-sort="1">%s</td>`, dis.String())
 		default:
-			b.WriteString(`<td><span class="badge b-ok">全部正常</span></td>`)
+			b.WriteString(`<td data-sort="0"><span class="badge b-ok">全部正常</span></td>`)
 		}
 		// 模型剩余（每模型一条进度条）。额度为 0 时模型名/数值/条为红色，
 		// 否则为绿色（按剩余比例填充宽度）；无观测数据时仅显示灰名 + —。
@@ -435,7 +449,8 @@ func (s *Store) RenderStatusHTMLFull(now time.Time, cfg *Config, masked map[stri
 				}
 				return sortedModels[i].Name < sortedModels[j].Name
 			})
-			b.WriteString(`<td><div class="mbars">`)
+			ks := keyOrder[id]
+			fmt.Fprintf(&b, `<td data-sort="%d"><div class="mbars">`, ks.rem)
 			for _, mv := range sortedModels {
 				cls := modelRemClass(mv, kv.GlobalDisabled)
 				c := classSuffix(cls)
@@ -457,7 +472,7 @@ func (s *Store) RenderStatusHTMLFull(now time.Time, cfg *Config, masked map[stri
 			}
 			b.WriteString(`</div></td>`)
 		} else {
-			b.WriteString(`<td class="dash">—</td>`)
+			b.WriteString(`<td class="dash" data-sort="0">—</td>`)
 		}
 		// 总剩余（key 总额度：数值 + 进度条）。
 		switch {
@@ -468,14 +483,52 @@ func (s *Store) RenderStatusHTMLFull(now time.Time, cfg *Config, masked map[stri
 				num = fmt.Sprintf("%d / %d", kv.TotalRemaining, kv.TotalLimit)
 			}
 			w := barWidthPct(kv.TotalRemaining, kv.TotalLimit, kv.HasTotalLim)
-			fmt.Fprintf(&b, `<td><div class="tb"><span class="bv %s">%s</span><div class="track"><i class="fill %s" style="width:%d%%"></i></div></div></td>`, cls, num, cls, w)
+			fmt.Fprintf(&b, `<td data-sort="%d"><div class="tb"><span class="bv %s">%s</span><div class="track"><i class="fill %s" style="width:%d%%"></i></div></div></td>`, kv.TotalRemaining, cls, num, cls, w)
 		default:
-			b.WriteString(`<td class="dash">—</td>`)
+			b.WriteString(`<td class="dash" data-sort="0">—</td>`)
+		}
+		// 成功次数（不区分模型）。
+		if ok && kv.SuccessCount > 0 {
+			fmt.Fprintf(&b, `<td data-sort="%d"><span class="bv g">%d</span></td>`, kv.SuccessCount, kv.SuccessCount)
+		} else {
+			b.WriteString(`<td class="dash" data-sort="0">—</td>`)
 		}
 		b.WriteString(`</tr>`)
 	}
 	b.WriteString(`</tbody></table>`)
-	b.WriteString(`</div></body></html>`)
+	b.WriteString(`<script>
+(function(){
+  var KEY='mrl-sort',t=document.getElementById('rl-keys');
+  if(!t)return;
+  var s=JSON.parse(localStorage.getItem(KEY)||'{"col":3,"dir":-1}');
+  function v(r,i){var td=r.children[i];return td?td.getAttribute('data-sort')||'':'';}
+  function sort(col,dir){
+    var tb=t.querySelector('tbody');if(!tb)return;
+    var rows=Array.prototype.slice.call(tb.rows);
+    if(rows.length<=1)return;
+    rows.sort(function(a,b){
+      var va=v(a,col),vb=v(b,col),na=parseFloat(va),nb=parseFloat(vb);
+      if(!isNaN(na)&&!isNaN(nb))return(na-nb)*dir;
+      return va.localeCompare(vb)*dir;
+    });
+    var df=document.createDocumentFragment();
+    rows.forEach(function(r){df.appendChild(r);});
+    tb.textContent='';tb.appendChild(df);
+  }
+  function ind(){var h=t.querySelectorAll('th');
+    h.forEach(function(th,i){th.className=th.className.replace(/\bsort-asc|sort-desc\b/g,'').trim();
+      if(s.col===i)th.classList.add(s.dir>0?'sort-asc':'sort-desc');});
+  }
+  if(s.col>=0)sort(s.col,s.dir);ind();
+  var h=t.querySelectorAll('th');
+  h.forEach(function(th,i){th.onclick=function(){
+    s={col:i,dir:(s.col===i?-s.dir:-1)};
+    localStorage.setItem(KEY,JSON.stringify(s));
+    sort(s.col,s.dir);ind();
+  };});
+})();
+</script>
+</div></body></html>`)
 	return b.String()
 }
 

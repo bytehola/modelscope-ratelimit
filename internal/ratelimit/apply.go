@@ -184,6 +184,7 @@ func (s *Store) OnUsage(rec UsageRecord) {
 	// which would wrongly reset the backoff on every failure.
 	if !rec.Failed && cfg.ManagesProvider(rec.Provider) {
 		s.resetCooldownBackoff()
+		s.recordSuccess(rec.AuthID)
 	}
 	// 429 responses take the executor's error path (the host returns early and
 	// never calls the response interceptor), so OnUsage is the authoritative

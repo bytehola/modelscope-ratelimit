@@ -2,6 +2,7 @@ package ratelimit
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -146,7 +147,7 @@ func TestRenderStatusHTMLFull(t *testing.T) {
 		}
 	}
 	// Server-side page must not ship any browser key-resolver JS or input.
-	for _, unwanted := range []string{`<script>`, `id="rl-key"`, `id="rl-provs"`} {
+	for _, unwanted := range []string{`id="rl-key"`, `id="rl-provs"`} {
 		if strings.Contains(html, unwanted) {
 			t.Errorf("html must not contain %q (no browser JS)", unwanted)
 		}
@@ -298,7 +299,7 @@ func TestKeyDetailStatusAndColumnOrder(t *testing.T) {
 	html := s.RenderStatusHTMLFull(now, s.config(), masked, 3)
 
 	// Column order: 模型剩余 before 总剩余.
-	hdr := `<th>模型剩余</th><th>总剩余</th>`
+	hdr := `<th data-sort-type="num">模型剩余</th><th data-sort-type="num">总剩余</th>`
 	if !strings.Contains(html, hdr) {
 		t.Errorf("header order wrong, missing %q", hdr)
 	}
@@ -473,4 +474,151 @@ func TestStatusHTMLProviderLabelMultiProvider(t *testing.T) {
 	if !strings.Contains(html2, ">moda<") {
 		t.Fatal("missing moda provider label")
 	}
+}
+
+func TestGeneratePreview(t *testing.T) {
+	loc := time.FixedZone("CST", 8*3600)
+	now := time.Date(2026, 7, 12, 14, 30, 0, 0, loc)
+	s := NewStore(NoopLogger{})
+	s.SetLocation(loc)
+	cur := now
+	s.SetClock(func() time.Time { return cur })
+	s.SetJitter(func() time.Duration { return 0 })
+
+	cfg := DefaultConfig()
+	cfg.Providers = []string{"modelscope", "modelscope-my"}
+	cfg.HostBaseURL = "http://127.0.0.1:8317"
+	cfg.ManagementKey = "preview"
+	cfg.CredentialStrategy = "round-robin"
+	cfg.InsufficientQuotaCooldown = 10
+	s.Reconfigure(cfg)
+
+	// Simulate providerOrderFetcher so provider labels resolve.
+	s.SetProviderOrderFetcher(func() map[string][]string {
+		return map[string][]string{
+			"modelscope": {
+				"openai-compatibility:modelscope:aaa111222333",
+				"openai-compatibility:modelscope:bbb444555666",
+				"openai-compatibility:modelscope:ccc777888999",
+				"openai-compatibility:modelscope:ddd000111222",
+				"openai-compatibility:modelscope:eee333444555",
+			},
+			"modelscope-my": {
+				"openai-compatibility:modelscope-my:fff666777888",
+				"openai-compatibility:modelscope-my:ggg999000111",
+				"openai-compatibility:modelscope-my:hhh222333444",
+			},
+		}
+	})
+
+	// --- modelscope keys ---
+	// key1: healthy, 2 models, success count 42
+	s.OnUsage(UsageRecord{
+		AuthID: "openai-compatibility:modelscope:aaa111222333", Provider: "openai-compatible-modelscope",
+		Model: "ZhipuAI/GLM-5.2", Alias: "glm-5.2", Failed: false,
+		ResponseHeaders: map[string][]string{
+			"Modelscope-Ratelimit-Model-Requests-Remaining": {"48"},
+			"Modelscope-Ratelimit-Model-Requests-Limit":     {"50"},
+			"Modelscope-Ratelimit-Requests-Remaining":       {"960"},
+			"Modelscope-Ratelimit-Requests-Limit":           {"1000"},
+		},
+	})
+	for i := 0; i < 42; i++ {
+		s.OnUsage(UsageRecord{AuthID: "openai-compatibility:modelscope:aaa111222333", Provider: "openai-compatible-modelscope", Model: "glm-5.2", Alias: "glm-5.2", Failed: false})
+	}
+	// key2: model disabled (glm-5.2 exhausted), success 15
+	s.ApplyRateLimit("openai-compatibility:modelscope:bbb444555666", "glm-5.2", map[string][]string{
+		"Modelscope-Ratelimit-Model-Requests-Remaining": {"0"},
+		"Modelscope-Ratelimit-Model-Requests-Limit":     {"50"},
+		"Modelscope-Ratelimit-Requests-Remaining":       {"1846"},
+		"Modelscope-Ratelimit-Requests-Limit":           {"2000"},
+	}, now)
+	s.OnUsage(UsageRecord{AuthID: "openai-compatibility:modelscope:bbb444555666", Provider: "openai-compatible-modelscope", Model: "glm-5.2", Alias: "glm-5.2", Failed: false, ResponseHeaders: map[string][]string{
+		"Modelscope-Ratelimit-Model-Requests-Remaining": {"0"},
+		"Modelscope-Ratelimit-Model-Requests-Limit":     {"50"},
+		"Modelscope-Ratelimit-Requests-Remaining":       {"1846"},
+		"Modelscope-Ratelimit-Requests-Limit":           {"2000"},
+	}})
+	// also has deepseek model with remaining
+	s.OnUsage(UsageRecord{AuthID: "openai-compatibility:modelscope:bbb444555666", Provider: "openai-compatible-modelscope", Model: "deepseek-ai/DeepSeek-V4-Pro", Alias: "deepseek-pro", Failed: false, ResponseHeaders: map[string][]string{
+		"Modelscope-Ratelimit-Model-Requests-Remaining": {"23"},
+		"Modelscope-Ratelimit-Model-Requests-Limit":     {"50"},
+	}})
+	for i := 0; i < 15; i++ {
+		s.OnUsage(UsageRecord{AuthID: "openai-compatibility:modelscope:bbb444555666", Provider: "openai-compatible-modelscope", Model: "deepseek-pro", Alias: "deepseek-pro", Failed: false})
+	}
+	// key3: global disabled, success 3
+	s.ApplyRateLimit("openai-compatibility:modelscope:ccc777888999", "glm-5.2", map[string][]string{
+		"Modelscope-Ratelimit-Requests-Remaining": {"0"},
+		"Modelscope-Ratelimit-Requests-Limit":     {"1000"},
+	}, now)
+	for i := 0; i < 3; i++ {
+		s.OnUsage(UsageRecord{AuthID: "openai-compatibility:modelscope:ccc777888999", Provider: "openai-compatible-modelscope", Model: "glm-5.2", Alias: "glm-5.2", Failed: false})
+	}
+	// key4: healthy, success 28
+	s.OnUsage(UsageRecord{AuthID: "openai-compatibility:modelscope:ddd000111222", Provider: "openai-compatible-modelscope", Model: "glm-5.2", Alias: "glm-5.2", Failed: false, ResponseHeaders: map[string][]string{
+		"Modelscope-Ratelimit-Model-Requests-Remaining": {"50"},
+		"Modelscope-Ratelimit-Model-Requests-Limit":     {"50"},
+		"Modelscope-Ratelimit-Requests-Remaining":       {"980"},
+		"Modelscope-Ratelimit-Requests-Limit":           {"1000"},
+	}})
+	for i := 0; i < 28; i++ {
+		s.OnUsage(UsageRecord{AuthID: "openai-compatibility:modelscope:ddd000111222", Provider: "openai-compatible-modelscope", Model: "glm-5.2", Alias: "glm-5.2", Failed: false})
+	}
+	// key5: never observed (no usage)
+	s.recordSeen([]string{"openai-compatibility:modelscope:eee333444555"})
+
+	// --- modelscope-my keys ---
+	// key6: healthy, success 12
+	s.OnUsage(UsageRecord{AuthID: "openai-compatibility:modelscope-my:fff666777888", Provider: "openai-compatible-modelscope-my", Model: "glm-5.2", Alias: "glm-5.2", Failed: false, ResponseHeaders: map[string][]string{
+		"Modelscope-Ratelimit-Model-Requests-Remaining": {"35"},
+		"Modelscope-Ratelimit-Model-Requests-Limit":     {"50"},
+		"Modelscope-Ratelimit-Requests-Remaining":       {"700"},
+		"Modelscope-Ratelimit-Requests-Limit":           {"1000"},
+	}})
+	for i := 0; i < 12; i++ {
+		s.OnUsage(UsageRecord{AuthID: "openai-compatibility:modelscope-my:fff666777888", Provider: "openai-compatible-modelscope-my", Model: "glm-5.2", Alias: "glm-5.2", Failed: false})
+	}
+	// key7: model disabled, success 5
+	s.ApplyRateLimit("openai-compatibility:modelscope-my:ggg999000111", "glm-5.2", map[string][]string{
+		"Modelscope-Ratelimit-Model-Requests-Remaining": {"0"},
+		"Modelscope-Ratelimit-Model-Requests-Limit":     {"50"},
+		"Modelscope-Ratelimit-Requests-Remaining":       {"1815"},
+		"Modelscope-Ratelimit-Requests-Limit":           {"2000"},
+	}, now)
+	for i := 0; i < 5; i++ {
+		s.OnUsage(UsageRecord{AuthID: "openai-compatibility:modelscope-my:ggg999000111", Provider: "openai-compatible-modelscope-my", Model: "glm-5.2", Alias: "glm-5.2", Failed: false, ResponseHeaders: map[string][]string{
+			"Modelscope-Ratelimit-Model-Requests-Remaining": {"0"},
+			"Modelscope-Ratelimit-Requests-Remaining":       {"1815"},
+		}})
+	}
+	// key8: never observed
+	s.recordSeen([]string{"openai-compatibility:modelscope-my:hhh222333444"})
+
+	// Simulate cooldown stats
+	for i := 0; i < 5; i++ {
+		s.cooldownStatsMu.Lock()
+		s.cooldownCount++
+		s.cooldownStatsMu.Unlock()
+	}
+	s.cooldownStatsMu.Lock()
+	s.cooldownWaitNanos = int64(42 * time.Second)
+	s.cooldownStatsMu.Unlock()
+
+	masked := map[string]string{
+		"openai-compatibility:modelscope:aaa111222333":    "…aaa111222333",
+		"openai-compatibility:modelscope:bbb444555666":    "…bbb444555666",
+		"openai-compatibility:modelscope:ccc777888999":    "…ccc777888999",
+		"openai-compatibility:modelscope:ddd000111222":    "…ddd000111222",
+		"openai-compatibility:modelscope:eee333444555":    "…eee333444555",
+		"openai-compatibility:modelscope-my:fff666777888": "…fff666777888",
+		"openai-compatibility:modelscope-my:ggg999000111": "…ggg999000111",
+		"openai-compatibility:modelscope-my:hhh222333444": "…hhh222333444",
+	}
+
+	html := s.RenderStatusHTMLFull(now, s.config(), masked, 8)
+	if err := os.WriteFile("preview.html", []byte(html), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Log("preview.html generated")
 }
