@@ -436,3 +436,41 @@ func TestKeyDetailSortOrder(t *testing.T) {
 		}
 	}
 }
+
+func TestStatusHTMLProviderLabelMultiProvider(t *testing.T) {
+	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
+	loc := time.FixedZone("CST", 8*3600)
+
+	// Single provider: no provider label should appear.
+	s1 := NewStore(NoopLogger{})
+	s1.SetLocation(loc)
+	s1.SetClock(func() time.Time { return now })
+	s1.Reconfigure(cfgWith("modelscope"))
+	masked1 := map[string]string{
+		"openai-compatibility:modelscope:aaa": "…AAAAAAAA",
+	}
+	html1 := s1.RenderStatusHTMLFull(now, s1.config(), masked1, 1)
+	if strings.Contains(html1, `class="prov"`) {
+		t.Fatal("single provider should not show provider label")
+	}
+
+	// Multiple providers: provider label appears for each key.
+	s2 := NewStore(NoopLogger{})
+	s2.SetLocation(loc)
+	s2.SetClock(func() time.Time { return now })
+	s2.Reconfigure(cfgWith("modelscope", "moda"))
+	masked2 := map[string]string{
+		"openai-compatibility:modelscope:aaa": "…AAAAAAAA",
+		"openai-compatibility:moda:bbb":       "…BBBBBBBB",
+	}
+	html2 := s2.RenderStatusHTMLFull(now, s2.config(), masked2, 2)
+	if !strings.Contains(html2, `class="prov"`) {
+		t.Fatal("multi-provider should show provider labels")
+	}
+	if !strings.Contains(html2, ">modelscope<") {
+		t.Fatal("missing modelscope provider label")
+	}
+	if !strings.Contains(html2, ">moda<") {
+		t.Fatal("missing moda provider label")
+	}
+}

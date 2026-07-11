@@ -82,6 +82,38 @@ func classSuffix(cls string) string {
 	return " " + cls
 }
 
+// formatDuration renders a duration in a compact human-readable form for the
+// status page: "350ms", "12.3s", "2m13s".
+func formatDuration(d time.Duration) string {
+	if d < time.Second {
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	}
+	m := int(d.Minutes())
+	s := int(d.Seconds()) - m*60
+	return fmt.Sprintf("%dm%ds", m, s)
+}
+
+// providerOf returns the configured provider name for an auth ID, or "" when
+// none matches or the config is nil. It tries ProviderIndex (token matching,
+// same logic the scheduler uses) first, then falls back to parsing the
+// "openai-compatibility:<provider>:<hash>" format.
+func providerOf(cfg *Config, id string) string {
+	if cfg == nil {
+		return ""
+	}
+	if idx := cfg.ProviderIndex(id); idx >= 0 {
+		return cfg.Providers[idx]
+	}
+	parts := strings.SplitN(id, ":", 3)
+	if len(parts) >= 2 && parts[0] == "openai-compatibility" {
+		return parts[1]
+	}
+	return ""
+}
+
 // modelAvailable returns the effective available request count for a model view
 // (0 when the key is globally disabled or the model is disabled), used to order
 // model bars from most to least available.
@@ -242,6 +274,33 @@ func (s *Store) RenderStatusHTMLFull(now time.Time, cfg *Config, masked map[stri
 	if cfg != nil && len(cfg.Providers) > 0 {
 		providerLabel = strings.Join(cfg.Providers, ", ")
 	}
+	showProvider := cfg != nil && len(cfg.Providers) > 1
+
+	// Build authoritative authID → provider name reverse map from the
+	// providerOrderFetcher (same management-API resolution that built the
+	// masked map). This avoids token-matching ambiguities when a provider
+	// name contains separators (- space . etc). Falls back to providerOf
+	// (token matching) when the fetcher is unavailable.
+	provOfKey := make(map[string]string)
+	if showProvider {
+		if fp := s.providerOrderFetcher.Load(); fp != nil && *fp != nil {
+			if m := (*fp)(); m != nil {
+				for _, p := range cfg.Providers {
+					pLower := strings.ToLower(strings.TrimSpace(p))
+					for _, aid := range m[pLower] {
+						provOfKey[aid] = p
+					}
+					if pLower != p {
+						for _, aid := range m[p] {
+							if _, ok := provOfKey[aid]; !ok {
+								provOfKey[aid] = p
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 
 	var b strings.Builder
 	b.WriteString(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">`)
@@ -270,6 +329,7 @@ func (s *Store) RenderStatusHTMLFull(now time.Time, cfg *Config, masked map[stri
 	b.WriteString(`tr:last-child td{border-bottom:none}`)
 	b.WriteString(`tbody tr:nth-child(even) td{background:#f5f5f7}`)
 	b.WriteString(`.key{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;color:#424245;word-break:break-all}`)
+	b.WriteString(`.prov{display:block;font-size:10.5px;font-weight:600;color:#86868b;background:#f0f0f3;border-radius:980px;padding:2px 8px;margin-top:4px;width:fit-content}`)
 	b.WriteString(`.badge{display:inline-block;font-size:11.5px;font-weight:600;padding:3px 10px;border-radius:980px;white-space:nowrap}`)
 	b.WriteString(`.b-ok{background:#e8f5e9;color:#1a7f37}.b-glob{background:#fdecec;color:#bf0711}.b-mod{background:#fff4e0;color:#b25000}`)
 	b.WriteString(`.when{display:block;font-size:11px;color:#86868b;margin-top:3px}`)
@@ -289,6 +349,14 @@ func (s *Store) RenderStatusHTMLFull(now time.Time, cfg *Config, masked map[stri
 	b.WriteString(`<div class="title">Modelscope 限流</div>`)
 	fmt.Fprintf(&b, `<div class="sub">供应商 <b>%s</b> · 总共 <b>%d</b> · 已禁用 <b>%d</b> · 可用 <b>%d</b> · 下次重置 <b>%s</b>（每 5 秒自动刷新）</div>`,
 		html.EscapeString(providerLabel), total, disabled, available, reset.In(loc).Format("2006-01-02 15:04:05 MST"))
+
+	cdCount, cdWait := s.CooldownStats()
+	if cdCount > 0 || cdWait > 0 {
+		b.WriteString(`<div class="cards" style="margin-bottom:22px">`)
+		fmt.Fprintf(&b, `<div class="card"><div class="k">退避触发</div><div class="v">%d 次</div></div>`, cdCount)
+		fmt.Fprintf(&b, `<div class="card"><div class="k">累计等待</div><div class="v">%s</div></div>`, formatDuration(cdWait))
+		b.WriteString(`</div>`)
+	}
 
 	if len(modelNames) > 0 {
 		b.WriteString(`<div class="section">按模型可用次数汇总</div><div class="cards">`)
@@ -316,7 +384,20 @@ func (s *Store) RenderStatusHTMLFull(now time.Time, cfg *Config, masked map[stri
 			mk = id
 		}
 		kv, ok := snap[id]
-		fmt.Fprintf(&b, `<tr><td class="key" title="%s">%s</td>`, html.EscapeString(id), html.EscapeString(mk))
+		b.WriteString(`<tr><td class="key" title="`)
+		b.WriteString(html.EscapeString(id))
+		b.WriteString(`">`)
+		b.WriteString(html.EscapeString(mk))
+		if showProvider {
+			pn := provOfKey[id]
+			if pn == "" {
+				pn = providerOf(cfg, id)
+			}
+			if pn != "" {
+				fmt.Fprintf(&b, `<span class="prov">%s</span>`, html.EscapeString(pn))
+			}
+		}
+		b.WriteString(`</td>`)
 		// 状态：仅在确有禁用时才标记。原先只要 key 有观测数据就落入
 		// "模型禁用" 分支，导致仅剩次数被观测但未禁用的活跃 key 被误标。
 		switch {

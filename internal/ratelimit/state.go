@@ -99,6 +99,17 @@ type Store struct {
 	cooldownLevel   int       // current backoff interval (seconds); 0 = idle
 	cooldownLevelAt time.Time // when the level was last advanced
 
+	// cooldownCount and cooldownWaitNanos track daily insufficient_quota
+	// statistics for the status page: how many times the cooldown was
+	// triggered and the total time spent blocking in SchedulerPick. Both
+	// reset at the midnight boundary (PruneAll), same as the backoff level.
+	cooldownStatsMu   sync.Mutex
+	cooldownCount     int64
+	cooldownWaitNanos int64 // wall-clock nanoseconds any goroutine was blocking
+	cooldownStatsDay  time.Time
+	blockActive       int       // number of goroutines currently in a cooldown sleep
+	blockStart        time.Time // when the current block period started (blockActive 0→1)
+
 	// jitterFn returns a random [0, 1s) duration added to each
 	// insufficient_quota cooldown so concurrent retries against a shared
 	// exhausted quota don't all wake at the same instant (thundering herd).
@@ -761,6 +772,9 @@ func (s *Store) setCooldown(authID string, base int, now time.Time) {
 	ks.mu.Lock()
 	ks.cooldown = &until
 	ks.mu.Unlock()
+	s.cooldownStatsMu.Lock()
+	s.cooldownCount++
+	s.cooldownStatsMu.Unlock()
 	s.log.Printf("modelscope-ratelimit: key %s cooldown %s (insufficient_quota)", authID, dur.Truncate(time.Millisecond))
 }
 
@@ -772,6 +786,46 @@ func (s *Store) resetCooldownBackoff() {
 	s.cooldownLevel = 0
 	s.cooldownLevelAt = time.Time{}
 	s.backoffMu.Unlock()
+}
+
+// CooldownStats returns the daily count of insufficient_quota cooldown
+// triggers and the total time spent blocking in SchedulerPick.
+func (s *Store) CooldownStats() (count int, wait time.Duration) {
+	s.cooldownStatsMu.Lock()
+	c, w := s.cooldownCount, s.cooldownWaitNanos
+	s.cooldownStatsMu.Unlock()
+	return int(c), time.Duration(w)
+}
+
+// blockEnter marks the start of a cooldown sleep. When the active count
+// transitions from 0 to 1, the wall-clock start time is recorded. Concurrent
+// sleeps (count > 1) do not move the start — the union of all blocking
+// intervals is tracked, not the sum of individual durations.
+func (s *Store) blockEnter() {
+	s.cooldownStatsMu.Lock()
+	if s.blockActive == 0 {
+		s.blockStart = time.Now()
+	}
+	s.blockActive++
+	s.cooldownStatsMu.Unlock()
+}
+
+// blockLeave marks the end of a cooldown sleep. When the active count drops
+// to 0, the elapsed wall-clock time since blockStart is accumulated. This
+// gives the union of all concurrent blocking intervals, avoiding the
+// over-counting that would occur if each goroutine's sleep duration were
+// summed independently.
+func (s *Store) blockLeave() {
+	s.cooldownStatsMu.Lock()
+	s.blockActive--
+	if s.blockActive <= 0 {
+		s.blockActive = 0
+		if !s.blockStart.IsZero() {
+			s.cooldownWaitNanos += int64(time.Since(s.blockStart))
+			s.blockStart = time.Time{}
+		}
+	}
+	s.cooldownStatsMu.Unlock()
 }
 
 // defaultJitter returns a random duration in [0, 1s), used to stagger
@@ -922,6 +976,15 @@ func (s *Store) PruneAll(now time.Time) {
 		s.cooldownLevelAt = time.Time{}
 	}
 	s.backoffMu.Unlock()
+
+	// Reset daily insufficient_quota statistics at the midnight boundary.
+	s.cooldownStatsMu.Lock()
+	if !s.cooldownStatsDay.IsZero() && !sameDay(s.cooldownStatsDay, now, loc) {
+		s.cooldownCount = 0
+		s.cooldownWaitNanos = 0
+	}
+	s.cooldownStatsDay = now
+	s.cooldownStatsMu.Unlock()
 }
 
 // ModelView is a render-ready snapshot of one model's rate-limit state for a

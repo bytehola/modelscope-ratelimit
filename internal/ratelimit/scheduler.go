@@ -74,10 +74,30 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 	// non-managed provider is never blocked.
 	if hasManaged && cfg.InsufficientQuotaCooldown > 0 {
 		if wait := s.cooldownWaitDuration(now); wait > 0 {
+			// Record the max cooldown expiry before sleeping. After the sleep,
+			// a concurrent request may have set a NEW (longer) cooldown on a
+			// different key. The re-check compares the post-sleep max expiry to
+			// the pre-sleep one: if it moved forward, a new cooldown was set
+			// during the sleep and we block for the remaining time.
+			// cooldownWaitDuration returns expiry.Sub(now), so time already
+			// elapsed during the first sleep is not re-waited.
+			expiryBefore := now.Add(wait)
 			s.log.Printf("modelscope-ratelimit: block %s model=%s (insufficient_quota cooldown)",
 				wait.Truncate(time.Millisecond), s.displayName(req.Model))
+			s.blockEnter()
 			time.Sleep(wait)
+			s.blockLeave()
 			now = s.now()
+			if wait2 := s.cooldownWaitDuration(now); wait2 > 0 {
+				if expiryAfter := now.Add(wait2); expiryAfter.After(expiryBefore) {
+					s.log.Printf("modelscope-ratelimit: block %s model=%s (insufficient_quota cooldown, new during sleep)",
+						wait2.Truncate(time.Millisecond), s.displayName(req.Model))
+					s.blockEnter()
+					time.Sleep(wait2)
+					s.blockLeave()
+					now = s.now()
+				}
+			}
 		}
 	}
 
