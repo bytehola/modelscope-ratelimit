@@ -88,10 +88,39 @@ func DefaultConfig() *Config {
 // "openai-compatible-modelscope".
 const openaiCompatProviderPrefix = "openai-compatible-"
 
-// ProviderIndex returns the position (0-based) of the first entry in Providers
-// that token-matches the given runtime provider key, or -1 when no entry
-// matches. The matching logic is identical to ManagesProvider so that the index
-// reflects config order: a lower index means higher preference.
+// extractProviderName strips the known host prefixes from a provider key or
+// auth ID to recover the bare provider name that the operator configured:
+//
+//   - "openai-compatible-<name>" (dash runtime key from the host scheduler)
+//   - "openai-compatibility:<name>:<hash>" (colon auth-kind prefix / auth ID)
+//   - "<name>" (bare configured name, passed verbatim)
+//
+// After stripping, the caller does an exact (case-insensitive) comparison
+// against Config.Providers. This is unambiguous: "modelscope" and
+// "modelscope-my" never collide, whereas the old token-based approach split
+// "modelscope-my" on "-" and matched the "modelscope" token.
+func extractProviderName(p string) string {
+	if strings.HasPrefix(p, openaiCompatProviderPrefix) {
+		return p[len(openaiCompatProviderPrefix):]
+	}
+	if strings.HasPrefix(p, "openai-compatibility:") {
+		rest := p[len("openai-compatibility:"):]
+		if idx := strings.IndexByte(rest, ':'); idx >= 0 {
+			return rest[:idx]
+		}
+		return rest
+	}
+	return p
+}
+
+// ProviderIndex returns the position (0-based) of the configured provider that
+// matches the given runtime provider key or auth ID, or -1 when no entry
+// matches. The host generates keys in two fixed forms ("openai-compatible-<name>"
+// for scheduler candidates and "openai-compatibility:<name>:<hash>" for auth
+// IDs), so the prefix is stripped and the bare name is compared exactly
+// (case-insensitive). This replaces the old token-based matching which could
+// not distinguish "modelscope" from "modelscope-my" because "-" is a token
+// separator.
 func (c *Config) ProviderIndex(provider string) int {
 	if len(c.Providers) == 0 {
 		return -1
@@ -100,37 +129,17 @@ func (c *Config) ProviderIndex(provider string) int {
 	if p == "" {
 		return -1
 	}
-	tokens := strings.FieldsFunc(p, func(r rune) bool {
-		return r == '-' || r == ':' || r == '.' || r == '_' || r == '/' || r == ' '
-	})
+	p = extractProviderName(p)
 	for idx, want := range c.Providers {
-		w := strings.ToLower(strings.TrimSpace(want))
-		if w == "" {
-			continue
-		}
-		if p == w {
+		if strings.ToLower(strings.TrimSpace(want)) == p {
 			return idx
-		}
-		for _, tok := range tokens {
-			if tok == w {
-				return idx
-			}
 		}
 	}
 	return -1
 }
 
 // ManagesProvider reports whether the given provider key is in scope. An empty
-// Providers set means the plugin manages nothing. Operators configure the bare
-// openai-compatibility name from config.yaml (e.g. "modelscope"). The host may
-// surface that name in several runtime forms — bare ("modelscope"), the dash
-// runtime key ("openai-compatible-modelscope") or the colon auth-kind prefix
-// ("openai-compatibility:modelscope") — so the check is token-based: the
-// provider is lower-cased and split on common separators (- : . _ / space), and
-// a match is any token equal to a configured name (or the bare name verbatim).
-// This stays robust across host key forms without over-matching unrelated
-// providers, and avoids the original failure mode where a format mismatch made
-// the scheduler defer to the built-in rotation and pick disabled keys.
+// Providers set means the plugin manages nothing.
 func (c *Config) ManagesProvider(provider string) bool {
 	return c.ProviderIndex(provider) >= 0
 }

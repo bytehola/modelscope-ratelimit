@@ -575,7 +575,7 @@ func pluginRegistration() any {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             "modelscope-ratelimit",
-			Version:          "1.2.1",
+			Version:          "1.2.2",
 			Author:           "k452b",
 			GitHubRepository: "https://github.com/bytehola/modelscope-ratelimit",
 			ConfigFields: []pluginapi.ConfigField{
