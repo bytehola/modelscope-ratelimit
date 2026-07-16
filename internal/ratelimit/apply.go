@@ -185,18 +185,31 @@ func (s *Store) OnUsage(rec UsageRecord) {
 	if !rec.Failed && cfg.ManagesProvider(rec.Provider) {
 		s.resetCooldownBackoff()
 		s.recordSuccess(rec.AuthID)
+		// Disable the global proxy if it was active — a managed provider
+		// succeeded, so the proxy is no longer needed.
+		s.HandleProxyOnSuccess()
 	}
 	// 429 responses take the executor's error path (the host returns early and
 	// never calls the response interceptor), so OnUsage is the authoritative
-	// path for detecting insufficient_quota cooldowns. The usage hook fires for
-	// EVERY provider (the host's usage manager dispatches each record to all
-	// plugins unconditionally), so a non-managed fallback provider (e.g. Aliyun
-	// Model Studio) that also returns 429+insufficient_quota must NOT receive a
-	// cooldown: cooldownWaitDuration scans the whole store, and a cooldown on a
-	// non-managed key would pollute the global blocking and delay unrelated
-	// traffic. Guard with ManagesProvider so only monitored providers cooldown.
+	// path for detecting 429s. The usage hook fires for EVERY provider (the
+	// host's usage manager dispatches each record to all plugins
+	// unconditionally), so a non-managed fallback provider (e.g. Aliyun Model
+	// Studio) that also returns 429+insufficient_quota must NOT receive a
+	// cooldown or trigger proxy mode. Guard with ManagesProvider so only
+	// monitored providers are affected.
 	if rec.Failed && rec.Failure != nil {
 		if cfg.ManagesProvider(rec.Provider) {
+			// Proxy mode: on ANY 429 from a managed provider, try proxy first.
+			// HandleProxyOn429 waits 2s, probes the proxy, and enables the
+			// global proxy if reachable. Returns true when proxy mode is active
+			// (just enabled or already active); in that case skip the cooldown.
+			// When it returns false (no proxy_url configured, or probe failed),
+			// fall back to insufficient_quota_cooldown.
+			if rec.Failure.StatusCode == 429 && cfg.ProxyURL != "" {
+				if s.HandleProxyOn429(model, now) {
+					return
+				}
+			}
 			s.ApplyInsufficientQuotaCooldown(rec.AuthID, model, rec.Failure.StatusCode, rec.Failure.Body, now)
 		}
 	}

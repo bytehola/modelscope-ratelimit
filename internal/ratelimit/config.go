@@ -47,6 +47,16 @@ type Config struct {
 	// after it expires the key becomes available again. Default 10 seconds.
 	InsufficientQuotaCooldown int `json:"insufficient_quota_cooldown" yaml:"insufficient_quota_cooldown"`
 
+	// ProxyURL, when non-empty, activates proxy mode: on the first 429 from a
+	// managed provider, the plugin waits 2s, probes the proxy by requesting
+	// https://api-inference.modelscope.cn (10s timeout), and if reachable
+	// enables the global upstream proxy via the management API. The proxy
+	// stays on until a managed provider succeeds or all managed keys are
+	// exhausted, then is disabled. When proxy mode is active,
+	// InsufficientQuotaCooldown is ignored. Format: a single proxy URL such
+	// as "socks5://user:pass@host:port" or "http://host:port".
+	ProxyURL string `json:"proxy_url" yaml:"proxy_url"`
+
 	// ManagedModels, if non-empty, restricts monitoring to these model names.
 	// Empty means monitor every model served by the configured providers.
 	ManagedModels []string `json:"managed_models" yaml:"managed_models"`
@@ -209,6 +219,9 @@ func ConfigFromMap(raw map[string]any) (*Config, error) {
 		} else {
 			return nil, fmt.Errorf("invalid insufficient_quota_cooldown: %w", err)
 		}
+	}
+	if v, ok := raw["proxy_url"].(string); ok {
+		cfg.ProxyURL = strings.TrimSpace(v)
 	}
 	return cfg, nil
 }

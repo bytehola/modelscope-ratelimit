@@ -304,6 +304,83 @@ func configure(raw []byte) error {
 	store.SetProviderOrderFetcher(func() map[string][]string {
 		return fetchProviderOrderCached(cfg.HostBaseURL, cfg.ManagementKey, cfg.Providers)
 	})
+	// Inject the proxy toggler: a non-empty proxyURL sets the global upstream
+	// proxy via PUT /v0/management/proxy-url; an empty string clears it via
+	// DELETE. Uses the plugin's own net/http client (not host.http.do) so the
+	// management call is never routed through the proxy it just enabled.
+	store.SetProxyToggler(func(proxyURL string) error {
+		c := currentConfig()
+		if c == nil {
+			return fmt.Errorf("no config")
+		}
+		endpoint := strings.TrimRight(c.HostBaseURL, "/") + "/v0/management/proxy-url"
+		if proxyURL != "" {
+			payload := strings.NewReader(fmt.Sprintf(`{"value":%q}`, proxyURL))
+			req, err := http.NewRequest(http.MethodPut, endpoint, payload)
+			if err != nil {
+				return err
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+c.ManagementKey)
+			resp, err := resolveHTTPClient.Do(req)
+			if err != nil {
+				return err
+			}
+			resp.Body.Close()
+			if resp.StatusCode >= 300 {
+				return fmt.Errorf("management API PUT proxy-url returned %d", resp.StatusCode)
+			}
+		} else {
+			req, err := http.NewRequest(http.MethodDelete, endpoint, nil)
+			if err != nil {
+				return err
+			}
+			req.Header.Set("Authorization", "Bearer "+c.ManagementKey)
+			resp, err := resolveHTTPClient.Do(req)
+			if err != nil {
+				return err
+			}
+			resp.Body.Close()
+			if resp.StatusCode >= 300 {
+				return fmt.Errorf("management API DELETE proxy-url returned %d", resp.StatusCode)
+			}
+		}
+		return nil
+	})
+	// Inject the proxy URL getter: reads the current global proxy URL via
+	// GET /v0/management/proxy-url so the plugin can save and later restore
+	// the host's original proxy when toggling its own.
+	store.SetProxyURLGetter(func() (string, error) {
+		c := currentConfig()
+		if c == nil {
+			return "", fmt.Errorf("no config")
+		}
+		endpoint := strings.TrimRight(c.HostBaseURL, "/") + "/v0/management/proxy-url"
+		req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Authorization", "Bearer "+c.ManagementKey)
+		resp, err := resolveHTTPClient.Do(req)
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return "", err
+		}
+		if resp.StatusCode >= 300 {
+			return "", fmt.Errorf("management API GET proxy-url returned %d", resp.StatusCode)
+		}
+		var result struct {
+			ProxyURL string `json:"proxy-url"`
+		}
+		if err := json.Unmarshal(body, &result); err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(result.ProxyURL), nil
+	})
 	cfgMu.Lock()
 	pluginCfg = cfg
 	cfgMu.Unlock()
@@ -575,7 +652,7 @@ func pluginRegistration() any {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             "modelscope-ratelimit",
-			Version:          "1.2.3",
+			Version:          "1.3.0",
 			Author:           "k452b",
 			GitHubRepository: "https://github.com/bytehola/modelscope-ratelimit",
 			ConfigFields: []pluginapi.ConfigField{

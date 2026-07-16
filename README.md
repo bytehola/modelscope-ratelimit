@@ -93,9 +93,21 @@ plugins:
       management_key: "your-secret"          # CPA 管理密钥（必填）
       credential_strategy: "round-robin"    # round-robin | fill-first
       insufficient_quota_cooldown: 10         # 退避基准秒数，封顶 60s
+      # proxy_url: "socks5://user:pass@127.0.0.1:1080"  # 429 时自动代理（选填）
 ```
 
 > 完整配置见 [`config.example.yaml`](./config.example.yaml)
+
+#### 代理模式（可选）
+
+配置 `proxy_url` 后，托管 provider 收到任意 429 时自动启用全局代理：
+1. 等待 2 秒
+2. 通过代理探测 `https://api-inference.modelscope.cn`（10s 超时）
+3. 探测成功 → 全局开启上游代理，轮换下一个 key 重试
+4. 成功后关闭代理；所有 key 耗尽则返回错误并关闭代理
+5. 探测失败（代理不可用）→ 回退 `insufficient_quota_cooldown` 方案
+
+配置 `proxy_url` 后 `insufficient_quota_cooldown` 自动失效。支持 `http://`、`socks5://` 等 URL 格式（含账号密码）。
 
 ---
 

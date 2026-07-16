@@ -64,6 +64,13 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 		}
 	}
 
+	// Proxy cleanup: when no managed candidates remain (all tried or
+	// unavailable), the request is falling through to non-managed providers.
+	// Disable the global proxy so non-managed traffic goes direct.
+	if !hasManaged {
+		s.DisableProxyIfActive()
+	}
+
 	// Global insufficient-quota blocking: Modelscope shares a quota across all
 	// keys and across managed providers (e.g. moda + modelscope), so a cooldown
 	// on ANY managed key blocks ALL managed scheduling. This prevents
