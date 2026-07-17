@@ -71,6 +71,15 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 		s.DisableProxyIfActive()
 	}
 
+	// Proxy mode: when proxy_url is configured and a 429 trigger is pending
+	// (set by OnUsage), block here for 2s + probe + enable. This is in the
+	// synchronous retry loop (unlike OnUsage which is async), so the 2s wait
+	// actually delays the next credential pick. When proxy_url is configured,
+	// the insufficient_quota_cooldown mechanism is skipped entirely.
+	if hasManaged && cfg.ProxyURL != "" {
+		s.ConsumeProxyTrigger(s.displayName(req.Model), now)
+	}
+
 	// Global insufficient-quota blocking: Modelscope shares a quota across all
 	// keys and across managed providers (e.g. moda + modelscope), so a cooldown
 	// on ANY managed key blocks ALL managed scheduling. This prevents
@@ -78,8 +87,9 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 	// cooldown has expired and keys are available again. Only applied when
 	// there are managed candidates to retry (hasManaged); a request that has
 	// already exhausted every managed key and is falling through to a
-	// non-managed provider is never blocked.
-	if hasManaged && cfg.InsufficientQuotaCooldown > 0 {
+	// non-managed provider is never blocked. Skipped when proxy_url is
+	// configured (proxy mode replaces the cooldown).
+	if hasManaged && cfg.InsufficientQuotaCooldown > 0 && (cfg.ProxyURL == "" || s.IsProxyProbeFailed()) {
 		if wait := s.cooldownWaitDuration(now); wait > 0 {
 			// Record the max cooldown expiry before sleeping. After the sleep,
 			// a concurrent request may have set a NEW (longer) cooldown on a

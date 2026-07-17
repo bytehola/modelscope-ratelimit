@@ -199,16 +199,14 @@ func (s *Store) OnUsage(rec UsageRecord) {
 	// monitored providers are affected.
 	if rec.Failed && rec.Failure != nil {
 		if cfg.ManagesProvider(rec.Provider) {
-			// Proxy mode: on ANY 429 from a managed provider, try proxy first.
-			// HandleProxyOn429 waits 2s, probes the proxy, and enables the
-			// global proxy if reachable. Returns true when proxy mode is active
-			// (just enabled or already active); in that case skip the cooldown.
-			// When it returns false (no proxy_url configured, or probe failed),
-			// fall back to insufficient_quota_cooldown.
-			if rec.Failure.StatusCode == 429 && cfg.ProxyURL != "" {
-				if s.HandleProxyOn429(model, now) {
-					return
-				}
+			// Proxy mode: on 429+insufficient_quota from a managed provider.
+			// When proxy_url is configured and the probe has NOT already
+			// failed, set a trigger flag for SchedulerPick to consume (2s
+			// wait + probe + enable). When the probe already failed once,
+			// fall back to the insufficient_quota_cooldown mechanism.
+			if isInsufficientQuota(rec.Failure.StatusCode, rec.Failure.Body) && cfg.ProxyURL != "" && !s.IsProxyProbeFailed() {
+				s.SetProxyTrigger()
+				return
 			}
 			s.ApplyInsufficientQuotaCooldown(rec.AuthID, model, rec.Failure.StatusCode, rec.Failure.Body, now)
 		}

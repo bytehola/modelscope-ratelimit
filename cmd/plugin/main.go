@@ -661,6 +661,7 @@ func pluginRegistration() any {
 				{Name: "management_key", Type: pluginapi.ConfigFieldTypeString, Description: "CPA 管理密钥。（必填）"},
 				{Name: "credential_strategy", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"round-robin", "fill-first"}, Description: "凭据选择策略（仅对监控的 provider 生效）：round-robin=轮询（默认），fill-first=填充优先"},
 				{Name: "insufficient_quota_cooldown", Type: pluginapi.ConfigFieldTypeInteger, Description: "冷却基准秒数，默认 10。连续失败指数退避×2递增，封顶 60 秒。"},
+				{Name: "proxy_url", Type: pluginapi.ConfigFieldTypeString, Description: "代理 URL（选填，留空=不启用）。配置后 429 时自动探测代理并全局开启，探测失败回退 insufficient_quota_cooldown。格式：socks5://user:pass@host:port"},
 				{Name: "timezone", Type: pluginapi.ConfigFieldTypeString, Description: "每日 00:00 重置所用时区，默认 Asia/Shanghai。（留空即可）"},
 				{Name: "model_remaining_header", Type: pluginapi.ConfigFieldTypeString, Description: "单模型剩余次数响应头名。（留空即可）"},
 				{Name: "total_remaining_header", Type: pluginapi.ConfigFieldTypeString, Description: "总剩余次数响应头名。（留空即可）"},

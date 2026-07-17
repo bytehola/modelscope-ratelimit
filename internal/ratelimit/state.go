@@ -124,14 +124,17 @@ type Store struct {
 	// C-ABI glue, which calls the management API PUT/DELETE proxy-url). The
 	// proxy stays on until a managed provider succeeds or all managed keys
 	// are exhausted, then is disabled. A 60s safety timer auto-disables.
-	proxyMu          sync.Mutex
-	proxyActive      bool
-	proxyEnabling    bool // another goroutine is mid-enable (probe/toggler)
-	proxyEnabledAt   time.Time
-	proxyTimer       *time.Timer
-	originalProxyURL string // host's proxy URL before plugin enabled its own (for restore)
-	proxyToggler     atomic.Pointer[func(proxyURL string) error]
-	proxyURLGetter   atomic.Pointer[func() (string, error)]
+	proxyMu             sync.Mutex
+	proxyActive         bool
+	proxyEnabling       bool // another goroutine is mid-enable (probe/toggler)
+	proxyTriggerPending bool // set by OnUsage on 429, consumed by SchedulerPick (sync)
+	proxyProbeFailed    bool // probe failed once; subsequent 429s skip probe and use cooldown
+	proxyProbed         bool // probe has been performed at least once (success or fail)
+	proxyEnabledAt      time.Time
+	proxyTimer          *time.Timer
+	originalProxyURL    string // host's proxy URL before plugin enabled its own (for restore)
+	proxyToggler        atomic.Pointer[func(proxyURL string) error]
+	proxyURLGetter      atomic.Pointer[func() (string, error)]
 
 	clock func() time.Time // injectable for tests; defaults to time.Now
 

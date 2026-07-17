@@ -43,18 +43,52 @@ func (s *Store) IsProxyActive() bool {
 	return s.proxyActive
 }
 
-// HandleProxyOn429 is called from OnUsage when a 429 is detected from a
-// managed provider and proxy_url is configured. If the proxy is not yet
-// active, it waits 2s, probes the proxy, and enables it if reachable.
-// If the proxy is already active, it just waits 2s for key rotation.
-// Returns true if proxy mode is active (either just enabled or already was).
-func (s *Store) HandleProxyOn429(model string, now time.Time) bool {
+// IsProxyProbeFailed reports whether a previous proxy probe failed. When
+// true, subsequent 429s skip the probe and fall back to the
+// insufficient_quota_cooldown mechanism. Resets when the proxy is
+// successfully enabled or disabled.
+func (s *Store) IsProxyProbeFailed() bool {
+	s.proxyMu.Lock()
+	defer s.proxyMu.Unlock()
+	return s.proxyProbeFailed
+}
+
+// SetProxyTrigger is called from OnUsage (which runs asynchronously and
+// cannot block the retry loop) when a 429 is detected from a managed
+// provider and proxy_url is configured. It just sets a flag — the actual
+// 2s wait + probe + enable happens in ConsumeProxyTrigger, called from
+// SchedulerPick which IS in the synchronous retry loop.
+func (s *Store) SetProxyTrigger() {
+	s.proxyMu.Lock()
+	s.proxyTriggerPending = true
+	s.proxyMu.Unlock()
+}
+
+// ConsumeProxyTrigger is called from SchedulerPick (synchronous, in the
+// retry loop). If a 429 trigger is pending, it waits 2s, probes the proxy,
+// and enables it if reachable. If the proxy is already active, it just
+// waits 2s for key rotation. Returns true if proxy mode is active.
+func (s *Store) ConsumeProxyTrigger(model string, now time.Time) bool {
 	cfg := s.config()
 	if cfg.ProxyURL == "" {
 		return false
 	}
 
 	s.proxyMu.Lock()
+	if !s.proxyTriggerPending {
+		active := s.proxyActive
+		s.proxyMu.Unlock()
+		// No pending trigger. If proxy is already active, wait 2s for
+		// rotation; otherwise no-op.
+		if active {
+			s.log.Printf("modelscope-ratelimit: block %s model=%s (proxy rotation)",
+				proxyWaitDuration, s.displayName(model))
+			time.Sleep(proxyWaitDuration)
+			return true
+		}
+		return false
+	}
+	s.proxyTriggerPending = false
 	if s.proxyActive {
 		s.proxyMu.Unlock()
 		s.log.Printf("modelscope-ratelimit: block %s model=%s (proxy rotation)",
@@ -62,9 +96,20 @@ func (s *Store) HandleProxyOn429(model string, now time.Time) bool {
 		time.Sleep(proxyWaitDuration)
 		return true
 	}
-	// Another goroutine is already in the probe/enable phase. Wait 2s for it
-	// to finish, then re-check proxyActive: if it succeeded, treat as active
-	// (skip cooldown); if it failed or is still in progress, fall back.
+	// Probe already failed once — don't re-probe; fall back to cooldown.
+	if s.proxyProbeFailed {
+		s.proxyMu.Unlock()
+		return false
+	}
+	// Already probed successfully before (proxy was disabled on success/
+	// cleanup). Skip probe, directly re-enable the proxy via the toggler.
+	if s.proxyProbed {
+		s.proxyMu.Unlock()
+		s.log.Printf("modelscope-ratelimit: block %s model=%s (proxy re-enable after prior probe)",
+			proxyWaitDuration, s.displayName(model))
+		time.Sleep(proxyWaitDuration)
+		return s.reenableProxy(model, now)
+	}
 	if s.proxyEnabling {
 		s.proxyMu.Unlock()
 		time.Sleep(proxyWaitDuration)
@@ -73,7 +118,7 @@ func (s *Store) HandleProxyOn429(model string, now time.Time) bool {
 	s.proxyEnabling = true
 	s.proxyMu.Unlock()
 
-	// Wait 2s before probing the proxy.
+	// First-time probe: wait 2s, then probe the proxy.
 	s.log.Printf("modelscope-ratelimit: block %s model=%s (proxy wait before probe)",
 		proxyWaitDuration, s.displayName(model))
 	time.Sleep(proxyWaitDuration)
@@ -82,14 +127,25 @@ func (s *Store) HandleProxyOn429(model string, now time.Time) bool {
 		s.log.Printf("modelscope-ratelimit: proxy probe failed, falling back to insufficient_quota_cooldown")
 		s.proxyMu.Lock()
 		s.proxyEnabling = false
+		s.proxyProbed = true
+		s.proxyProbeFailed = true
 		s.proxyMu.Unlock()
 		return false
 	}
 
+	s.proxyMu.Lock()
+	s.proxyProbed = true
+	s.proxyMu.Unlock()
+
+	return s.reenableProxy(model, now)
+}
+
+// reenableProxy saves the host's original proxy URL and enables the global
+// proxy via the management API. Shared by first-time and subsequent enables.
+func (s *Store) reenableProxy(model string, now time.Time) bool {
+	cfg := s.config()
+
 	// Save the host's current proxy URL so it can be restored on disable.
-	// The getter reads BEFORE the toggler sets the plugin's proxy, so
-	// originalProxyURL captures the true host value (not the plugin's own).
-	// proxyEnabling guarantees no other goroutine races this read+set pair.
 	var original string
 	if getter := s.proxyURLGetter.Load(); getter != nil {
 		if cur, err := (*getter)(); err == nil {
@@ -112,6 +168,7 @@ func (s *Store) HandleProxyOn429(model string, now time.Time) bool {
 	s.proxyMu.Lock()
 	s.proxyActive = true
 	s.proxyEnabling = false
+	s.proxyProbeFailed = false
 	s.proxyEnabledAt = now
 	s.originalProxyURL = original
 	if s.proxyTimer != nil {
