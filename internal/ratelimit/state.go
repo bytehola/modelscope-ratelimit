@@ -119,6 +119,29 @@ type Store struct {
 	// Injectable in tests (return 0) for deterministic timing assertions.
 	jitterFn atomic.Pointer[func() time.Duration]
 
+	// Proxy state: when proxy_url is configured, a 429 from a managed
+	// provider triggers a 2s wait + proxy probe. If the probe succeeds the
+	// global upstream proxy is toggled on via proxyToggler (injected by the
+	// C-ABI glue, which calls the management API PUT/DELETE proxy-url). The
+	// proxy stays on until a managed provider succeeds or all managed keys
+	// are exhausted, then is disabled. A 60s safety timer auto-disables.
+	proxyMu             sync.Mutex
+	proxyActive         bool
+	proxyEnabling       bool // another goroutine is mid-enable (probe/toggler)
+	proxyTriggerPending bool // set by OnUsage on 429, consumed by SchedulerPick (sync)
+	proxyProbeFailed    bool // probe failed once; subsequent 429s skip probe and use cooldown
+	proxyProbed         bool // probe has been performed at least once (success or fail)
+	proxyEnabledAt      time.Time
+	proxyTimer          *time.Timer
+	originalProxyURL    string // host's proxy URL before plugin enabled its own (for restore)
+	proxyToggler        atomic.Pointer[func(proxyURL string) error]
+	proxyURLGetter      atomic.Pointer[func() (string, error)]
+	// Test seams: an injectable probe (avoids real network during tests) and a
+	// proxy-wait override (keeps proxy-mode tests from sleeping 2s). Both are
+	// nil/zero in production, falling back to probeProxy / proxyWaitDuration.
+	probeFn        atomic.Pointer[func(proxyURL string) bool]
+	proxyWaitNanos atomic.Int64
+
 	clock func() time.Time // injectable for tests; defaults to time.Now
 
 	stopMu  sync.Mutex
@@ -885,6 +908,37 @@ func (s *Store) SetJitter(f func() time.Duration) {
 		return
 	}
 	s.jitterFn.Store(&f)
+}
+
+// SetProbeFunc injects a function used in place of the real probeProxy network
+// call. Tests use it to simulate a reachable or unreachable proxy without
+// hitting https://api-inference.modelscope.cn. A nil argument restores the
+// default (real HTTP probe).
+func (s *Store) SetProbeFunc(f func(proxyURL string) bool) {
+	if f == nil {
+		s.probeFn.Store(nil)
+		return
+	}
+	s.probeFn.Store(&f)
+}
+
+// SetProxyWait overrides the proxy 2s rotation/probe wait so proxy-mode tests
+// run without sleeping. A zero or negative duration restores the default
+// (proxyWaitDuration).
+func (s *Store) SetProxyWait(d time.Duration) {
+	if d <= 0 {
+		s.proxyWaitNanos.Store(0)
+		return
+	}
+	s.proxyWaitNanos.Store(int64(d))
+}
+
+// proxyWait returns the configured proxy wait, honoring the test override.
+func (s *Store) proxyWait() time.Duration {
+	if v := s.proxyWaitNanos.Load(); v > 0 {
+		return time.Duration(v)
+	}
+	return proxyWaitDuration
 }
 
 // cooldownWaitDuration returns the longest remaining insufficient_quota cooldown

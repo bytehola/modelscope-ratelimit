@@ -304,6 +304,83 @@ func configure(raw []byte) error {
 	store.SetProviderOrderFetcher(func() map[string][]string {
 		return fetchProviderOrderCached(cfg.HostBaseURL, cfg.ManagementKey, cfg.Providers)
 	})
+	// Inject the proxy toggler: a non-empty proxyURL sets the global upstream
+	// proxy via PUT /v0/management/proxy-url; an empty string clears it via
+	// DELETE. Uses the plugin's own net/http client (not host.http.do) so the
+	// management call is never routed through the proxy it just enabled.
+	store.SetProxyToggler(func(proxyURL string) error {
+		c := currentConfig()
+		if c == nil {
+			return fmt.Errorf("no config")
+		}
+		endpoint := strings.TrimRight(c.HostBaseURL, "/") + "/v0/management/proxy-url"
+		if proxyURL != "" {
+			payload := strings.NewReader(fmt.Sprintf(`{"value":%q}`, proxyURL))
+			req, err := http.NewRequest(http.MethodPut, endpoint, payload)
+			if err != nil {
+				return err
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+c.ManagementKey)
+			resp, err := resolveHTTPClient.Do(req)
+			if err != nil {
+				return err
+			}
+			resp.Body.Close()
+			if resp.StatusCode >= 300 {
+				return fmt.Errorf("management API PUT proxy-url returned %d", resp.StatusCode)
+			}
+		} else {
+			req, err := http.NewRequest(http.MethodDelete, endpoint, nil)
+			if err != nil {
+				return err
+			}
+			req.Header.Set("Authorization", "Bearer "+c.ManagementKey)
+			resp, err := resolveHTTPClient.Do(req)
+			if err != nil {
+				return err
+			}
+			resp.Body.Close()
+			if resp.StatusCode >= 300 {
+				return fmt.Errorf("management API DELETE proxy-url returned %d", resp.StatusCode)
+			}
+		}
+		return nil
+	})
+	// Inject the proxy URL getter: reads the current global proxy URL via
+	// GET /v0/management/proxy-url so the plugin can save and later restore
+	// the host's original proxy when toggling its own.
+	store.SetProxyURLGetter(func() (string, error) {
+		c := currentConfig()
+		if c == nil {
+			return "", fmt.Errorf("no config")
+		}
+		endpoint := strings.TrimRight(c.HostBaseURL, "/") + "/v0/management/proxy-url"
+		req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Authorization", "Bearer "+c.ManagementKey)
+		resp, err := resolveHTTPClient.Do(req)
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return "", err
+		}
+		if resp.StatusCode >= 300 {
+			return "", fmt.Errorf("management API GET proxy-url returned %d", resp.StatusCode)
+		}
+		var result struct {
+			ProxyURL string `json:"proxy-url"`
+		}
+		if err := json.Unmarshal(body, &result); err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(result.ProxyURL), nil
+	})
 	cfgMu.Lock()
 	pluginCfg = cfg
 	cfgMu.Unlock()
@@ -575,7 +652,7 @@ func pluginRegistration() any {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             "modelscope-ratelimit",
-			Version:          "1.2.3",
+			Version:          "1.3.0",
 			Author:           "k452b",
 			GitHubRepository: "https://github.com/bytehola/modelscope-ratelimit",
 			ConfigFields: []pluginapi.ConfigField{
@@ -584,6 +661,7 @@ func pluginRegistration() any {
 				{Name: "management_key", Type: pluginapi.ConfigFieldTypeString, Description: "CPA 管理密钥。（必填）"},
 				{Name: "credential_strategy", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"round-robin", "fill-first"}, Description: "凭据选择策略（仅对监控的 provider 生效）：round-robin=轮询（默认），fill-first=填充优先"},
 				{Name: "insufficient_quota_cooldown", Type: pluginapi.ConfigFieldTypeInteger, Description: "冷却基准秒数，默认 10。连续失败指数退避×2递增，封顶 60 秒。"},
+				{Name: "proxy_url", Type: pluginapi.ConfigFieldTypeString, Description: "代理 URL（选填，留空=不启用）。配置后 429 时自动探测代理并全局开启，探测失败回退 insufficient_quota_cooldown。格式：socks5://user:pass@host:port"},
 				{Name: "timezone", Type: pluginapi.ConfigFieldTypeString, Description: "每日 00:00 重置所用时区，默认 Asia/Shanghai。（留空即可）"},
 				{Name: "model_remaining_header", Type: pluginapi.ConfigFieldTypeString, Description: "单模型剩余次数响应头名。（留空即可）"},
 				{Name: "total_remaining_header", Type: pluginapi.ConfigFieldTypeString, Description: "总剩余次数响应头名。（留空即可）"},

@@ -127,7 +127,13 @@ func (s *Store) ApplyInsufficientQuotaCooldown(authID, model string, statusCode 
 func (s *Store) OnResponse(req ResponseInterceptRequest) ResponseInterceptResponse {
 	authID := AuthIDFromMetadata(req.Metadata)
 	s.ApplyRateLimit(authID, req.Model, req.ResponseHeaders, s.now())
-	s.ApplyInsufficientQuotaCooldown(authID, req.Model, req.StatusCode, req.Body, s.now())
+	// Skip insufficient_quota cooldown when proxy mode is active (proxy_url
+	// configured and probe not failed) — the proxy trigger handles 429s
+	// instead, and a cooldown here would conflict with the 2s proxy wait.
+	cfg := s.config()
+	if !(cfg.ProxyURL != "" && !s.IsProxyProbeFailed()) {
+		s.ApplyInsufficientQuotaCooldown(authID, req.Model, req.StatusCode, req.Body, s.now())
+	}
 	return ResponseInterceptResponse{}
 }
 
@@ -185,16 +191,18 @@ func (s *Store) OnUsage(rec UsageRecord) {
 	if !rec.Failed && cfg.ManagesProvider(rec.Provider) {
 		s.resetCooldownBackoff()
 		s.recordSuccess(rec.AuthID)
+		// Disable the global proxy if it was active — a managed provider
+		// succeeded, so the proxy is no longer needed.
+		s.HandleProxyOnSuccess()
 	}
 	// 429 responses take the executor's error path (the host returns early and
 	// never calls the response interceptor), so OnUsage is the authoritative
-	// path for detecting insufficient_quota cooldowns. The usage hook fires for
-	// EVERY provider (the host's usage manager dispatches each record to all
-	// plugins unconditionally), so a non-managed fallback provider (e.g. Aliyun
-	// Model Studio) that also returns 429+insufficient_quota must NOT receive a
-	// cooldown: cooldownWaitDuration scans the whole store, and a cooldown on a
-	// non-managed key would pollute the global blocking and delay unrelated
-	// traffic. Guard with ManagesProvider so only monitored providers cooldown.
+	// path for detecting 429s. The usage hook fires for EVERY provider (the
+	// host's usage manager dispatches each record to all plugins
+	// unconditionally), so a non-managed fallback provider (e.g. Aliyun Model
+	// Studio) that also returns 429+insufficient_quota must NOT receive a
+	// cooldown or trigger proxy mode. Guard with ManagesProvider so only
+	// monitored providers are affected.
 	if rec.Failed && rec.Failure != nil {
 		if cfg.ManagesProvider(rec.Provider) {
 			// 401 Unauthorized: the API key is invalid or expired. Disable the
@@ -203,6 +211,15 @@ func (s *Store) OnUsage(rec UsageRecord) {
 			if rec.Failure.StatusCode == 401 {
 				s.recordSeen([]string{rec.AuthID})
 				s.disableUnauthorized(rec.AuthID, now)
+				return
+			}
+			// Proxy mode: on 429+insufficient_quota from a managed provider.
+			// When proxy_url is configured and the probe has NOT already
+			// failed, set a trigger flag for SchedulerPick to consume (2s
+			// wait + probe + enable). When the probe already failed once,
+			// fall back to the insufficient_quota_cooldown mechanism.
+			if isInsufficientQuota(rec.Failure.StatusCode, rec.Failure.Body) && cfg.ProxyURL != "" && !s.IsProxyProbeFailed() {
+				s.SetProxyTrigger()
 				return
 			}
 			s.ApplyInsufficientQuotaCooldown(rec.AuthID, model, rec.Failure.StatusCode, rec.Failure.Body, now)
