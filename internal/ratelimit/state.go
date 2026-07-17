@@ -37,6 +37,7 @@ type rateData struct {
 type keyState struct {
 	mu           sync.RWMutex
 	global       *time.Time           // global (all-model) disable time, nil if none
+	globalReason string               // "" = daily quota disable (resets midnight); "unauthorized" = 401 (until restart)
 	models       map[string]time.Time // disabled model -> disable time
 	modelData    map[string]*rateData // observed model -> last-seen rate-limit data
 	totalData    *rateData            // observed total rate-limit data
@@ -527,7 +528,7 @@ func (s *Store) isDisabled(authID, model string, now time.Time) bool {
 	// cooldown is global, not per-key. After the block the cooldown has
 	// expired and the key is available again. Daily disables (global +
 	// per-model) are still checked here.
-	if ks.global != nil && active(*ks.global, now, loc) {
+	if ks.global != nil && (ks.globalReason == "unauthorized" || active(*ks.global, now, loc)) {
 		return true
 	}
 	if t, ok := ks.models[model]; ok && active(t, now, loc) {
@@ -547,7 +548,7 @@ func (s *Store) hasAnyDisable(authID string, now time.Time, loc *time.Location) 
 	if ks.cooldown != nil && now.Before(*ks.cooldown) {
 		return true
 	}
-	if ks.global != nil && active(*ks.global, now, loc) {
+	if ks.global != nil && (ks.globalReason == "unauthorized" || active(*ks.global, now, loc)) {
 		return true
 	}
 	for _, t := range ks.models {
@@ -690,8 +691,27 @@ func (s *Store) disableGlobal(authID, model string, now time.Time) {
 	}
 	t := now
 	ks.global = &t
+	ks.globalReason = ""
 	ks.mu.Unlock()
 	s.log.Printf("modelscope-ratelimit: key %s globally disabled", authID)
+}
+
+// disableUnauthorized marks authID as globally disabled until plugin restart
+// (NOT reset at midnight) because the API key returned 401 (invalid or expired
+// secret). The status page shows "密钥失效" via GlobalReason.
+func (s *Store) disableUnauthorized(authID string, now time.Time) {
+	ks := s.getOrCreateKey(authID)
+	loc := s.location()
+	ks.mu.Lock()
+	if ks.global != nil && (ks.globalReason == "unauthorized" || active(*ks.global, now, loc)) {
+		ks.mu.Unlock()
+		return // already disabled; keep earliest time
+	}
+	t := now
+	ks.global = &t
+	ks.globalReason = "unauthorized"
+	ks.mu.Unlock()
+	s.log.Printf("modelscope-ratelimit: key %s disabled (unauthorized: secret may be invalid)", authID)
 }
 
 // disableModel marks (authID, model) as disabled for the rest of the day.
@@ -984,8 +1004,9 @@ func (s *Store) PruneAll(now time.Time) {
 		if ks.cooldown != nil && !now.Before(*ks.cooldown) {
 			ks.cooldown = nil
 		}
-		if ks.global != nil && !active(*ks.global, now, loc) {
+		if ks.global != nil && ks.globalReason != "unauthorized" && !active(*ks.global, now, loc) {
 			ks.global = nil
+			ks.globalReason = ""
 		}
 		for m, t := range ks.models {
 			if !active(t, now, loc) {
@@ -1045,6 +1066,7 @@ type KeyView struct {
 	AuthID         string
 	GlobalDisabled bool
 	GlobalSince    time.Time
+	GlobalReason   string
 	Cooldown       bool
 	CooldownUntil  time.Time
 	Models         []ModelView
@@ -1079,9 +1101,10 @@ func (s *Store) Snapshot(now time.Time) map[string]KeyView {
 			kv.Cooldown = true
 			kv.CooldownUntil = *ks.cooldown
 		}
-		if ks.global != nil && active(*ks.global, now, loc) {
+		if ks.global != nil && (ks.globalReason == "unauthorized" || active(*ks.global, now, loc)) {
 			kv.GlobalDisabled = true
 			kv.GlobalSince = *ks.global
+			kv.GlobalReason = ks.globalReason
 		}
 		for m, md := range ks.modelData {
 			if !sameDay(md.at, now, loc) {

@@ -416,7 +416,11 @@ func (s *Store) RenderStatusHTMLFull(now time.Time, cfg *Config, masked map[stri
 		// "模型禁用" 分支，导致仅剩次数被观测但未禁用的活跃 key 被误标。
 		switch {
 		case ok && kv.GlobalDisabled:
-			fmt.Fprintf(&b, `<td data-sort="2"><span class="badge b-glob">全部禁用</span><span class="when">禁用于 %s</span></td>`, kv.GlobalSince.In(loc).Format("15:04:05"))
+			if kv.GlobalReason == "unauthorized" {
+				fmt.Fprintf(&b, `<td data-sort="3"><span class="badge b-glob">密钥失效</span><span class="when">禁用于 %s</span></td>`, kv.GlobalSince.In(loc).Format("15:04:05"))
+			} else {
+				fmt.Fprintf(&b, `<td data-sort="2"><span class="badge b-glob">全部禁用</span><span class="when">禁用于 %s</span></td>`, kv.GlobalSince.In(loc).Format("15:04:05"))
+			}
 		case ok && anyModelDisabled(kv.Models):
 			sortedModels := append([]ModelView(nil), kv.Models...)
 			sort.Slice(sortedModels, func(i, j int) bool {

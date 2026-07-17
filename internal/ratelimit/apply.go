@@ -197,6 +197,14 @@ func (s *Store) OnUsage(rec UsageRecord) {
 	// traffic. Guard with ManagesProvider so only monitored providers cooldown.
 	if rec.Failed && rec.Failure != nil {
 		if cfg.ManagesProvider(rec.Provider) {
+			// 401 Unauthorized: the API key is invalid or expired. Disable the
+			// credential globally until plugin restart (not reset at midnight) so
+			// the scheduler skips it. The status page shows "密钥失效".
+			if rec.Failure.StatusCode == 401 {
+				s.recordSeen([]string{rec.AuthID})
+				s.disableUnauthorized(rec.AuthID, now)
+				return
+			}
 			s.ApplyInsufficientQuotaCooldown(rec.AuthID, model, rec.Failure.StatusCode, rec.Failure.Body, now)
 		}
 	}

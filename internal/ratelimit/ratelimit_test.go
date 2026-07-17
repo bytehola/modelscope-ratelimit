@@ -1559,3 +1559,61 @@ func TestInsufficientQuotaJitter(t *testing.T) {
 		}
 	}
 }
+
+// TestOnUsage401DisablesUnauthorized verifies that a 401 from a managed
+// provider globally disables the credential for the rest of the day (invalid or
+// expired secret) without setting an insufficient_quota cooldown.
+func TestOnUsage401DisablesUnauthorized(t *testing.T) {
+	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
+	s, _ := newTestStore(now)
+	s.Reconfigure(cfgWith("modelscope"))
+
+	s.OnUsage(UsageRecord{
+		AuthID:   "auth-1",
+		Provider: "modelscope",
+		Model:    "Qwen-72B",
+		Alias:    "Qwen-72B",
+		Failed:   true,
+		Failure:  &UsageFailure{StatusCode: 401, Body: `{"error":"unauthorized"}`},
+	})
+
+	if !s.isDisabled("auth-1", "Qwen-72B", now) {
+		t.Fatal("401 must globally disable the credential")
+	}
+	if w := s.cooldownWaitDuration(now); w > 0 {
+		t.Fatalf("401 must not set a cooldown, got %s", w)
+	}
+}
+
+// TestUnauthorizedDisablePersistsAcrossMidnight verifies that a 401 disable is
+// persistent until plugin restart: it survives the daily PruneAll boundary,
+// unlike a quota-exhaustion global disable which is cleared at midnight.
+func TestUnauthorizedDisablePersistsAcrossMidnight(t *testing.T) {
+	loc := time.FixedZone("CST", 8*3600)
+	night := time.Date(2026, 7, 8, 23, 59, 0, 0, loc)
+	s, _ := newTestStore(night)
+	s.Reconfigure(cfgWith("modelscope"))
+
+	// 401 at 23:59 -> unauthorized (persistent).
+	s.OnUsage(UsageRecord{
+		AuthID: "auth-1", Provider: "modelscope", Model: "Qwen-72B", Alias: "Qwen-72B",
+		Failed: true, Failure: &UsageFailure{StatusCode: 401, Body: `{"error":"unauthorized"}`},
+	})
+	// Quota-exhaustion global disable at 23:59 (daily).
+	s.disableGlobal("auth-2", "Qwen-72B", night)
+
+	if !s.isDisabled("auth-1", "Qwen-72B", night) || !s.isDisabled("auth-2", "Qwen-72B", night) {
+		t.Fatal("both keys must be disabled before midnight")
+	}
+
+	// Roll past midnight and prune.
+	nextDay := time.Date(2026, 7, 9, 0, 1, 0, 0, loc)
+	s.PruneAll(nextDay)
+
+	if !s.isDisabled("auth-1", "Qwen-72B", nextDay) {
+		t.Fatal("401 unauthorized disable must persist across midnight (until restart)")
+	}
+	if s.isDisabled("auth-2", "Qwen-72B", nextDay) {
+		t.Fatal("quota global disable must be cleared at midnight")
+	}
+}
