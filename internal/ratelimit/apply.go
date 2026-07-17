@@ -127,7 +127,13 @@ func (s *Store) ApplyInsufficientQuotaCooldown(authID, model string, statusCode 
 func (s *Store) OnResponse(req ResponseInterceptRequest) ResponseInterceptResponse {
 	authID := AuthIDFromMetadata(req.Metadata)
 	s.ApplyRateLimit(authID, req.Model, req.ResponseHeaders, s.now())
-	s.ApplyInsufficientQuotaCooldown(authID, req.Model, req.StatusCode, req.Body, s.now())
+	// Skip insufficient_quota cooldown when proxy mode is active (proxy_url
+	// configured and probe not failed) — the proxy trigger handles 429s
+	// instead, and a cooldown here would conflict with the 2s proxy wait.
+	cfg := s.config()
+	if !(cfg.ProxyURL != "" && !s.IsProxyProbeFailed()) {
+		s.ApplyInsufficientQuotaCooldown(authID, req.Model, req.StatusCode, req.Body, s.now())
+	}
 	return ResponseInterceptResponse{}
 }
 
@@ -199,6 +205,14 @@ func (s *Store) OnUsage(rec UsageRecord) {
 	// monitored providers are affected.
 	if rec.Failed && rec.Failure != nil {
 		if cfg.ManagesProvider(rec.Provider) {
+			// 401 Unauthorized: the API key is invalid or expired. Disable
+			// the credential globally for the rest of the day so the
+			// scheduler skips it. The status page shows "密钥失效".
+			if rec.Failure.StatusCode == 401 {
+				s.recordSeen([]string{rec.AuthID})
+				s.disableUnauthorized(rec.AuthID, now)
+				return
+			}
 			// Proxy mode: on 429+insufficient_quota from a managed provider.
 			// When proxy_url is configured and the probe has NOT already
 			// failed, set a trigger flag for SchedulerPick to consume (2s

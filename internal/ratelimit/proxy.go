@@ -45,8 +45,9 @@ func (s *Store) IsProxyActive() bool {
 
 // IsProxyProbeFailed reports whether a previous proxy probe failed. When
 // true, subsequent 429s skip the probe and fall back to the
-// insufficient_quota_cooldown mechanism. Resets when the proxy is
-// successfully enabled or disabled.
+// insufficient_quota_cooldown mechanism. The flag persists until plugin
+// reload (disabled proxies do NOT reset it, so a failed probe stays
+// failed).
 func (s *Store) IsProxyProbeFailed() bool {
 	s.proxyMu.Lock()
 	defer s.proxyMu.Unlock()
@@ -82,8 +83,8 @@ func (s *Store) ConsumeProxyTrigger(model string, now time.Time) bool {
 		// rotation; otherwise no-op.
 		if active {
 			s.log.Printf("modelscope-ratelimit: block %s model=%s (proxy rotation)",
-				proxyWaitDuration, s.displayName(model))
-			time.Sleep(proxyWaitDuration)
+				s.proxyWait(), s.displayName(model))
+			time.Sleep(s.proxyWait())
 			return true
 		}
 		return false
@@ -92,8 +93,8 @@ func (s *Store) ConsumeProxyTrigger(model string, now time.Time) bool {
 	if s.proxyActive {
 		s.proxyMu.Unlock()
 		s.log.Printf("modelscope-ratelimit: block %s model=%s (proxy rotation)",
-			proxyWaitDuration, s.displayName(model))
-		time.Sleep(proxyWaitDuration)
+			s.proxyWait(), s.displayName(model))
+		time.Sleep(s.proxyWait())
 		return true
 	}
 	// Probe already failed once — don't re-probe; fall back to cooldown.
@@ -103,16 +104,19 @@ func (s *Store) ConsumeProxyTrigger(model string, now time.Time) bool {
 	}
 	// Already probed successfully before (proxy was disabled on success/
 	// cleanup). Skip probe, directly re-enable the proxy via the toggler.
+	// Set proxyEnabling so concurrent goroutines wait instead of racing
+	// into reenableProxy and corrupting originalProxyURL.
 	if s.proxyProbed {
+		s.proxyEnabling = true
 		s.proxyMu.Unlock()
 		s.log.Printf("modelscope-ratelimit: block %s model=%s (proxy re-enable after prior probe)",
-			proxyWaitDuration, s.displayName(model))
-		time.Sleep(proxyWaitDuration)
+			s.proxyWait(), s.displayName(model))
+		time.Sleep(s.proxyWait())
 		return s.reenableProxy(model, now)
 	}
 	if s.proxyEnabling {
 		s.proxyMu.Unlock()
-		time.Sleep(proxyWaitDuration)
+		time.Sleep(s.proxyWait())
 		return s.IsProxyActive()
 	}
 	s.proxyEnabling = true
@@ -120,8 +124,8 @@ func (s *Store) ConsumeProxyTrigger(model string, now time.Time) bool {
 
 	// First-time probe: wait 2s, then probe the proxy.
 	s.log.Printf("modelscope-ratelimit: block %s model=%s (proxy wait before probe)",
-		proxyWaitDuration, s.displayName(model))
-	time.Sleep(proxyWaitDuration)
+		s.proxyWait(), s.displayName(model))
+	time.Sleep(s.proxyWait())
 
 	if !s.probeProxy(cfg.ProxyURL) {
 		s.log.Printf("modelscope-ratelimit: proxy probe failed, falling back to insufficient_quota_cooldown")
@@ -171,13 +175,19 @@ func (s *Store) reenableProxy(model string, now time.Time) bool {
 	s.proxyProbeFailed = false
 	s.proxyEnabledAt = now
 	s.originalProxyURL = original
+	s.proxyMu.Unlock()
+
+	// Increment the daily backoff trigger counter so the status page
+	// reflects proxy enables alongside insufficient_quota cooldowns.
+	s.cooldownStatsMu.Lock()
+	s.cooldownCount++
+	s.cooldownStatsMu.Unlock()
 	if s.proxyTimer != nil {
 		s.proxyTimer.Stop()
 	}
 	s.proxyTimer = time.AfterFunc(proxySafetyTimeout, func() {
 		s.disableProxy("safety timeout")
 	})
-	s.proxyMu.Unlock()
 
 	s.log.Printf("modelscope-ratelimit: proxy enabled model=%s", s.displayName(model))
 	return true
@@ -229,6 +239,11 @@ func (s *Store) disableProxy(reason string) {
 // Any HTTP response (even 401/429) means the proxy is reachable; a timeout
 // or connection error means the proxy is unavailable.
 func (s *Store) probeProxy(proxyURLStr string) bool {
+	// Test seam: if a probe function was injected, use it instead of a real
+	// HTTP request so unit tests never touch the network.
+	if pf := s.probeFn.Load(); pf != nil && *pf != nil {
+		return (*pf)(proxyURLStr)
+	}
 	u, err := url.Parse(proxyURLStr)
 	if err != nil {
 		return false

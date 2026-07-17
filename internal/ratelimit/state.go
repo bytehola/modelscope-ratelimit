@@ -37,6 +37,7 @@ type rateData struct {
 type keyState struct {
 	mu           sync.RWMutex
 	global       *time.Time           // global (all-model) disable time, nil if none
+	globalReason string               // reason for global disable: "", "unauthorized"
 	models       map[string]time.Time // disabled model -> disable time
 	modelData    map[string]*rateData // observed model -> last-seen rate-limit data
 	totalData    *rateData            // observed total rate-limit data
@@ -135,6 +136,11 @@ type Store struct {
 	originalProxyURL    string // host's proxy URL before plugin enabled its own (for restore)
 	proxyToggler        atomic.Pointer[func(proxyURL string) error]
 	proxyURLGetter      atomic.Pointer[func() (string, error)]
+	// Test seams: an injectable probe (avoids real network during tests) and a
+	// proxy-wait override (keeps proxy-mode tests from sleeping 2s). Both are
+	// nil/zero in production, falling back to probeProxy / proxyWaitDuration.
+	probeFn        atomic.Pointer[func(proxyURL string) bool]
+	proxyWaitNanos atomic.Int64
 
 	clock func() time.Time // injectable for tests; defaults to time.Now
 
@@ -708,8 +714,28 @@ func (s *Store) disableGlobal(authID, model string, now time.Time) {
 	}
 	t := now
 	ks.global = &t
+	ks.globalReason = ""
 	ks.mu.Unlock()
 	s.log.Printf("modelscope-ratelimit: key %s globally disabled", authID)
+}
+
+// disableUnauthorized marks a credential as globally disabled with reason
+// "unauthorized" (HTTP 401). The key is treated the same as a rate-limit
+// disable by the scheduler (skipped for the rest of the day) but the status
+// page shows "密钥失效" instead of "全部禁用".
+func (s *Store) disableUnauthorized(authID string, now time.Time) {
+	ks := s.getOrCreateKey(authID)
+	loc := s.location()
+	ks.mu.Lock()
+	if ks.global != nil && active(*ks.global, now, loc) {
+		ks.mu.Unlock()
+		return // already disabled today; keep earliest time
+	}
+	t := now
+	ks.global = &t
+	ks.globalReason = "unauthorized"
+	ks.mu.Unlock()
+	s.log.Printf("modelscope-ratelimit: key %s disabled (unauthorized: secret may be invalid)", authID)
 }
 
 // disableModel marks (authID, model) as disabled for the rest of the day.
@@ -885,6 +911,37 @@ func (s *Store) SetJitter(f func() time.Duration) {
 	s.jitterFn.Store(&f)
 }
 
+// SetProbeFunc injects a function used in place of the real probeProxy network
+// call. Tests use it to simulate a reachable or unreachable proxy without
+// hitting https://api-inference.modelscope.cn. A nil argument restores the
+// default (real HTTP probe).
+func (s *Store) SetProbeFunc(f func(proxyURL string) bool) {
+	if f == nil {
+		s.probeFn.Store(nil)
+		return
+	}
+	s.probeFn.Store(&f)
+}
+
+// SetProxyWait overrides the proxy 2s rotation/probe wait so proxy-mode tests
+// run without sleeping. A zero or negative duration restores the default
+// (proxyWaitDuration).
+func (s *Store) SetProxyWait(d time.Duration) {
+	if d <= 0 {
+		s.proxyWaitNanos.Store(0)
+		return
+	}
+	s.proxyWaitNanos.Store(int64(d))
+}
+
+// proxyWait returns the configured proxy wait, honoring the test override.
+func (s *Store) proxyWait() time.Duration {
+	if v := s.proxyWaitNanos.Load(); v > 0 {
+		return time.Duration(v)
+	}
+	return proxyWaitDuration
+}
+
 // cooldownWaitDuration returns the longest remaining insufficient_quota cooldown
 // among ALL keys in the store, or 0 when none are active. It checks all keys
 // (not just req.Candidates) because a cooled-down key is in the host's "tried"
@@ -1004,6 +1061,7 @@ func (s *Store) PruneAll(now time.Time) {
 		}
 		if ks.global != nil && !active(*ks.global, now, loc) {
 			ks.global = nil
+			ks.globalReason = ""
 		}
 		for m, t := range ks.models {
 			if !active(t, now, loc) {
@@ -1063,6 +1121,7 @@ type KeyView struct {
 	AuthID         string
 	GlobalDisabled bool
 	GlobalSince    time.Time
+	GlobalReason   string
 	Cooldown       bool
 	CooldownUntil  time.Time
 	Models         []ModelView
@@ -1100,6 +1159,7 @@ func (s *Store) Snapshot(now time.Time) map[string]KeyView {
 		if ks.global != nil && active(*ks.global, now, loc) {
 			kv.GlobalDisabled = true
 			kv.GlobalSince = *ks.global
+			kv.GlobalReason = ks.globalReason
 		}
 		for m, md := range ks.modelData {
 			if !sameDay(md.at, now, loc) {
