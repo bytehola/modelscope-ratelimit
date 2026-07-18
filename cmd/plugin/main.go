@@ -392,6 +392,20 @@ func configure(raw []byte) error {
 	strategyMu.Lock()
 	strategyCache = strategyEntry{}
 	strategyMu.Unlock()
+	// If the proxy feature was removed in this reload (proxy_url now empty)
+	// but the proxy is still active from the previous config, proactively
+	// restore the host's original proxy now. Must run after pluginCfg is set
+	// so the toggler closure uses the fresh management endpoint.
+	if cfg.ProxyURL == "" {
+		store.DisableProxyOnReconfigure()
+	}
+	// Snapshot the host's current proxy URL once at configure (only when the
+	// plugin's proxy feature is enabled) so disableProxy can restore it later
+	// without re-reading the management API on the hot 429 path. Must run
+	// after pluginCfg is set so the getter closure sees the fresh config.
+	if cfg.ProxyURL != "" {
+		store.SnapshotHostProxy()
+	}
 	return nil
 }
 
@@ -652,7 +666,7 @@ func pluginRegistration() any {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             "modelscope-ratelimit",
-			Version:          "1.3.0",
+			Version:          "1.4.0",
 			Author:           "k452b",
 			GitHubRepository: "https://github.com/bytehola/modelscope-ratelimit",
 			ConfigFields: []pluginapi.ConfigField{

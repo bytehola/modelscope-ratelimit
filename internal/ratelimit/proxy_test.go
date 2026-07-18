@@ -1,6 +1,7 @@
 package ratelimit
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -318,8 +319,19 @@ func TestConsumeProxyTriggerProbesAndEnables(t *testing.T) {
 	s.SetProxyURLGetter(func() (string, error) { getterCalled = true; return "orig-proxy", nil })
 	defer s.DisableProxyIfActive()
 
+	// Snapshot the host proxy once at configure (production does this in
+	// the C-ABI glue). reenableProxy no longer re-reads the getter.
+	s.SnapshotHostProxy()
+	if !getterCalled {
+		t.Fatal("SnapshotHostProxy must read the host's original proxy")
+	}
+	if got := s.OriginalProxyURL(); got != "orig-proxy" {
+		t.Fatalf("snapshot = %q, want orig-proxy", got)
+	}
+	getterCalled = false // reenableProxy must NOT call the getter again
+
 	// Set the trigger the way OnUsage would.
-	s.SetProxyTrigger()
+	s.SetProxyTrigger("auth-1", "Qwen-72B")
 
 	req := SchedulerPickRequest{
 		Provider:  "modelscope",
@@ -342,8 +354,12 @@ func TestConsumeProxyTriggerProbesAndEnables(t *testing.T) {
 	if len(toggled) != 1 || toggled[0] != "http://127.0.0.1:8888" {
 		t.Fatalf("toggler must set the configured proxy URL, got %v", toggled)
 	}
-	if !getterCalled {
-		t.Fatal("getter must read the host's original proxy for restore")
+	if getterCalled {
+		t.Fatal("reenableProxy must NOT re-read the getter (snapshot taken at configure)")
+	}
+	// The boot snapshot must survive enable unchanged.
+	if got := s.OriginalProxyURL(); got != "orig-proxy" {
+		t.Fatalf("originalProxyURL = %q after enable, want orig-proxy", got)
 	}
 }
 
@@ -358,7 +374,7 @@ func TestConsumeProxyTriggerProbeFailureFallsBack(t *testing.T) {
 	var toggled []string
 	s.SetProxyToggler(func(u string) error { toggled = append(toggled, u); return nil })
 
-	s.SetProxyTrigger()
+	s.SetProxyTrigger("auth-1", "Qwen-72B")
 
 	req := SchedulerPickRequest{
 		Provider:  "modelscope",
@@ -427,6 +443,422 @@ func TestDisableProxyIfActiveNoopWhenInactive(t *testing.T) {
 	s.SetProxyToggler(func(u string) error { called = true; return nil })
 
 	s.DisableProxyIfActive()
+
+	if called {
+		t.Fatal("toggler must not be called when proxy is inactive")
+	}
+}
+
+// --- 401 x proxy-mode interaction (post-merge) ---------------------------
+
+// With proxy mode configured, a 401 disable must still persist across the
+// midnight boundary (proxy mode does not weaken the persistent 401 semantics).
+func TestProxy401PersistsAcrossMidnight(t *testing.T) {
+	loc := time.FixedZone("CST", 8*3600)
+	night := time.Date(2026, 7, 8, 23, 59, 0, 0, loc)
+	s, _ := newTestStore(night)
+	s.Reconfigure(proxyCfg("http://127.0.0.1:8888", "modelscope"))
+
+	s.OnUsage(UsageRecord{
+		AuthID: "auth-1", Provider: "modelscope", Model: "Qwen-72B", Alias: "Qwen-72B",
+		Failed: true, Failure: &UsageFailure{StatusCode: 401, Body: `{"error":"unauthorized"}`},
+	})
+	if s.proxyTriggerPending {
+		t.Fatal("401 must not set the proxy trigger")
+	}
+
+	nextDay := time.Date(2026, 7, 9, 0, 1, 0, 0, loc)
+	s.PruneAll(nextDay)
+	if !s.isDisabled("auth-1", "Qwen-72B", nextDay) {
+		t.Fatal("401 disable must persist across midnight even with proxy configured")
+	}
+}
+
+// SchedulerPick with proxy configured must skip a 401-disabled key and route
+// to a healthy one instead (the unauthorized disable is honored by the
+// scheduler, not bypassed by proxy mode).
+func TestProxySchedulerSkipsUnauthorizedKey(t *testing.T) {
+	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
+	s, _ := newTestStore(now)
+	s.Reconfigure(proxyCfg("http://127.0.0.1:8888", "modelscope"))
+
+	s.OnUsage(UsageRecord{
+		AuthID: "auth-1", Provider: "modelscope", Model: "Qwen-72B", Alias: "Qwen-72B",
+		Failed: true, Failure: &UsageFailure{StatusCode: 401, Body: `{"error":"unauthorized"}`},
+	})
+
+	req := SchedulerPickRequest{
+		Provider:  "modelscope",
+		Providers: []string{"modelscope"},
+		Model:     "Qwen-72B",
+		Candidates: []Candidate{
+			{ID: "auth-1", Provider: "modelscope", Priority: 1},
+			{ID: "auth-2", Provider: "modelscope", Priority: 1},
+		},
+	}
+	resp, err := s.SchedulerPick(req)
+	if err != nil || !resp.Handled {
+		t.Fatalf("pick failed: %+v err=%v", resp, err)
+	}
+	if resp.AuthID != "auth-2" {
+		t.Fatalf("scheduler must skip the 401-disabled key, picked %q", resp.AuthID)
+	}
+}
+
+// A successful managed response (which resets the cooldown backoff and turns
+// the proxy off) must NOT clear another key's persistent 401 disable.
+func TestProxySuccessDoesNotClearUnauthorizedDisable(t *testing.T) {
+	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
+	s, _ := newTestStore(now)
+	s.Reconfigure(proxyCfg("http://127.0.0.1:8888", "modelscope"))
+	var toggled []string
+	s.SetProxyToggler(func(u string) error { toggled = append(toggled, u); return nil })
+	setProxyActiveForTest(s, "orig")
+
+	// auth-1 is 401-disabled.
+	s.OnUsage(UsageRecord{
+		AuthID: "auth-1", Provider: "modelscope", Model: "Qwen-72B", Alias: "Qwen-72B",
+		Failed: true, Failure: &UsageFailure{StatusCode: 401, Body: `{"error":"unauthorized"}`},
+	})
+
+	// auth-2 succeeds (managed) -> resets backoff, disables proxy.
+	s.OnUsage(UsageRecord{
+		AuthID: "auth-2", Provider: "modelscope", Model: "Qwen-72B", Alias: "Qwen-72B",
+		Failed: false, ResponseHeaders: hdr("100"),
+	})
+
+	if !s.isDisabled("auth-1", "Qwen-72B", now) {
+		t.Fatal("managed success on another key must not clear the 401 disable")
+	}
+	if s.IsProxyActive() {
+		t.Fatal("managed success must disable the active proxy")
+	}
+}
+
+// When the proxy is already active (probe succeeded), a 401 from a managed
+// provider must still disable the credential persistently and must NOT fire
+// the proxy trigger (401 is checked before the proxy-trigger guard).
+func TestProxy401WhileActiveDisablesNotTriggers(t *testing.T) {
+	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
+	s, _ := newTestStore(now)
+	s.Reconfigure(proxyCfg("http://127.0.0.1:8888", "modelscope"))
+	setProxyActiveForTest(s, "orig")
+
+	s.OnUsage(UsageRecord{
+		AuthID: "auth-1", Provider: "modelscope", Model: "Qwen-72B", Alias: "Qwen-72B",
+		Failed: true, Failure: &UsageFailure{StatusCode: 401, Body: `{"error":"unauthorized"}`},
+	})
+
+	if s.proxyTriggerPending {
+		t.Fatal("401 must not set the proxy trigger even when proxy is active")
+	}
+	if w := s.cooldownWaitDuration(now); w > 0 {
+		t.Fatalf("401 must not set a cooldown, got %s", w)
+	}
+	if !s.isDisabled("auth-1", "Qwen-72B", now) {
+		t.Fatal("401 must disable the credential even with proxy active")
+	}
+	if !s.IsProxyActive() {
+		t.Fatal("a 401 alone must not turn the active proxy off (only success does)")
+	}
+}
+
+// --- proxy + insufficient_quota backoff combination ----------------------
+
+// Backoff progression: the first proxy-enable 429 sets no cooldown (level 0);
+// each subsequent 429 while the proxy is active escalates the shared
+// insufficient_quota backoff (base -> x2 -> x2 ...). A managed 200 resets the
+// level and disables the proxy, so the next 429 starts over at the enable.
+func TestProxyBackoffProgression(t *testing.T) {
+	loc := time.FixedZone("CST", 8*3600)
+	t0 := time.Date(2026, 7, 8, 10, 0, 0, 0, loc)
+	s, cur := newTestStore(t0)
+	cfg := proxyCfg("http://127.0.0.1:8888", "modelscope")
+	cfg.InsufficientQuotaCooldown = 1 // base 1s for fast progression
+	s.Reconfigure(cfg)
+	s.SetProxyWait(time.Millisecond)
+	s.SetProbeFunc(func(string) bool { return true })
+	var toggled []string
+	s.SetProxyToggler(func(u string) error { toggled = append(toggled, u); return nil })
+	s.SetProxyURLGetter(func() (string, error) { return "orig", nil })
+
+	// Snapshot once at configure (mirrors production). reenableProxy no
+	// longer re-reads the getter on each enable.
+	s.SnapshotHostProxy()
+
+	// 1st 429: proxy inactive -> probe + enable. No backoff, no cooldown.
+	s.SetProxyTrigger("auth-1", "Qwen-72B")
+	if !s.ConsumeProxyTrigger("Qwen-72B", t0) {
+		t.Fatal("1st 429 must enable the proxy")
+	}
+	if !s.IsProxyActive() {
+		t.Fatal("proxy must be active after 1st 429")
+	}
+	if w := s.cooldownWaitDuration(t0); w > 0 {
+		t.Fatalf("1st 429 must not set a cooldown, got %s", w)
+	}
+
+	// helper to advance the clock clear of the previous cooldown+window.
+	advance := func(d time.Duration) { *cur = cur.Add(d) }
+
+	// 2nd 429 (proxy active): 1s rotation + setCooldown -> base (1s).
+	advance(3 * time.Second)
+	s.SetProxyTrigger("auth-1", "Qwen-72B")
+	s.ConsumeProxyTrigger("Qwen-72B", *cur)
+	if w := s.cooldownWaitDuration(*cur); w != time.Second {
+		t.Fatalf("2nd 429 cooldown = %s, want 1s", w)
+	}
+
+	// 3rd 429: x2 -> 2s.
+	advance(3 * time.Second)
+	s.SetProxyTrigger("auth-1", "Qwen-72B")
+	s.ConsumeProxyTrigger("Qwen-72B", *cur)
+	if w := s.cooldownWaitDuration(*cur); w != 2*time.Second {
+		t.Fatalf("3rd 429 cooldown = %s, want 2s", w)
+	}
+
+	// 4th 429: x2 -> 4s.
+	advance(5 * time.Second)
+	s.SetProxyTrigger("auth-1", "Qwen-72B")
+	s.ConsumeProxyTrigger("Qwen-72B", *cur)
+	if w := s.cooldownWaitDuration(*cur); w != 4*time.Second {
+		t.Fatalf("4th 429 cooldown = %s, want 4s", w)
+	}
+
+	// 200 from a managed provider: reset the backoff LEVEL (so the next 429
+	// starts from base) and disable the proxy. The per-key cooldown is left
+	// to expire naturally — in production the 200 arrives only after the
+	// scheduler already slept through it.
+	advance(5 * time.Second) // clear the 4s cooldown + window
+	s.OnUsage(UsageRecord{
+		AuthID: "auth-1", Provider: "modelscope", Model: "Qwen-72B", Alias: "Qwen-72B",
+		Failed: false, ResponseHeaders: hdr("100"),
+	})
+	if s.IsProxyActive() {
+		t.Fatal("200 must disable the proxy")
+	}
+
+	// Post-reset 1st 429: re-enable (no backoff, level stays 0).
+	s.SetProxyTrigger("auth-1", "Qwen-72B")
+	if !s.ConsumeProxyTrigger("Qwen-72B", *cur) {
+		t.Fatal("post-reset 429 must re-enable the proxy")
+	}
+	if !s.IsProxyActive() {
+		t.Fatal("proxy must be active again after reset+429")
+	}
+	if w := s.cooldownWaitDuration(*cur); w > 0 {
+		t.Fatalf("post-reset 1st 429 must not set a cooldown, got %s", w)
+	}
+
+	// Post-reset 2nd 429: must restart at base (1s), NOT continue at 8s —
+	// this proves the 200 reset the backoff level.
+	advance(3 * time.Second)
+	s.SetProxyTrigger("auth-1", "Qwen-72B")
+	s.ConsumeProxyTrigger("Qwen-72B", *cur)
+	if w := s.cooldownWaitDuration(*cur); w != time.Second {
+		t.Fatalf("post-reset 2nd 429 cooldown = %s, want 1s (base, level was reset)", w)
+	}
+	s.DisableProxyIfActive()
+}
+
+// Via SchedulerPick: the first 429 (proxy enable) returns quickly (no backoff
+// sleep); the second 429 blocks for ~insufficient_quota_cooldown (the backoff).
+func TestProxyFirstNoBackoffSecondBackoff(t *testing.T) {
+	loc := time.FixedZone("CST", 8*3600)
+	t0 := time.Date(2026, 7, 8, 10, 0, 0, 0, loc)
+	s, cur := newTestStore(t0)
+	cfg := proxyCfg("http://127.0.0.1:8888", "modelscope")
+	cfg.InsufficientQuotaCooldown = 1
+	s.Reconfigure(cfg)
+	s.SetProxyWait(time.Millisecond)
+	s.SetProbeFunc(func(string) bool { return true })
+	s.SetProxyToggler(func(string) error { return nil })
+	s.SetProxyURLGetter(func() (string, error) { return "", nil })
+	defer s.DisableProxyIfActive()
+
+	// Snapshot once at configure (mirrors production).
+	s.SnapshotHostProxy()
+
+	req := SchedulerPickRequest{
+		Provider: "modelscope", Providers: []string{"modelscope"}, Model: "Qwen-72B",
+		Candidates: []Candidate{{ID: "auth-1", Provider: "modelscope", Priority: 1}},
+	}
+
+	// 1st 429 -> enable proxy; pick should be fast (probe+enable, no backoff).
+	s.OnUsage(UsageRecord{
+		AuthID: "auth-1", Provider: "modelscope", Model: "Qwen-72B", Alias: "Qwen-72B",
+		Failed: true, Failure: &UsageFailure{StatusCode: 429, Body: insufficientQuotaBody()},
+	})
+	start := time.Now()
+	resp, err := s.SchedulerPick(req)
+	if err != nil || !resp.Handled || resp.AuthID != "auth-1" {
+		t.Fatalf("1st pick failed: %+v err=%v", resp, err)
+	}
+	if time.Since(start) > 300*time.Millisecond {
+		t.Fatalf("1st 429 must not block on backoff, took %s", time.Since(start))
+	}
+
+	// advance clock clear of the (absent) cooldown + window before 2nd 429.
+	*cur = cur.Add(3 * time.Second)
+
+	// 2nd 429 (proxy active) -> must block ~1s (the backoff base).
+	s.OnUsage(UsageRecord{
+		AuthID: "auth-1", Provider: "modelscope", Model: "Qwen-72B", Alias: "Qwen-72B",
+		Failed: true, Failure: &UsageFailure{StatusCode: 429, Body: insufficientQuotaBody()},
+	})
+	start = time.Now()
+	resp, err = s.SchedulerPick(req)
+	if err != nil || !resp.Handled {
+		t.Fatalf("2nd pick failed: %+v err=%v", resp, err)
+	}
+	if d := time.Since(start); d < 900*time.Millisecond {
+		t.Fatalf("2nd 429 must block ~1s on backoff, took %s", d)
+	}
+}
+
+// --- SnapshotHostProxy (configure-time host-proxy snapshot) ---------------
+
+// SnapshotHostProxy must be a no-op while a proxy enable is mid-flight
+// (proxyEnabling true): during that window the host may already be routed
+// through the plugin proxy while proxyActive is still false, so a GET would
+// capture the plugin's own URL and corrupt the restore snapshot. The prior
+// snapshot must be preserved instead.
+func TestSnapshotHostProxySkipsWhileEnabling(t *testing.T) {
+	s, _ := newTestStore(time.Now())
+	s.Reconfigure(proxyCfg("http://127.0.0.1:8888", "modelscope"))
+	s.SetProxyToggler(func(string) error { return nil })
+	s.SetProxyURLGetter(func() (string, error) { return "host-orig", nil })
+
+	s.SnapshotHostProxy()
+	if got := s.OriginalProxyURL(); got != "host-orig" {
+		t.Fatalf("snapshot = %q, want host-orig", got)
+	}
+
+	// Simulate the mid-enable window: host now resolves to the plugin proxy.
+	s.SetProxyURLGetter(func() (string, error) { return "plugin-proxy", nil })
+	s.proxyMu.Lock()
+	s.proxyEnabling = true
+	s.proxyMu.Unlock()
+
+	s.SnapshotHostProxy() // must skip: keep "host-orig"
+	if got := s.OriginalProxyURL(); got != "host-orig" {
+		t.Fatalf("snapshot overwritten during enable = %q, want host-orig kept", got)
+	}
+}
+
+// A GET failure at configure must leave the snapshot empty (disable then
+// clears the plugin proxy, matching "host had none") and never panic.
+func TestSnapshotHostProxyGetterFailureLeavesEmpty(t *testing.T) {
+	s, _ := newTestStore(time.Now())
+	s.Reconfigure(proxyCfg("http://127.0.0.1:8888", "modelscope"))
+	s.SetProxyToggler(func(string) error { return nil })
+	s.SetProxyURLGetter(func() (string, error) { return "", fmt.Errorf("management API down") })
+
+	s.SnapshotHostProxy()
+	if got := s.OriginalProxyURL(); got != "" {
+		t.Fatalf("snapshot = %q, want empty on GET failure", got)
+	}
+}
+
+// Reload that removes proxy_url while the proxy is active must proactively
+// disable the proxy and restore the host's original proxy URL (the boot
+// snapshot), instead of leaving the plugin proxy enabled with no config.
+func TestDisableProxyOnReconfigureRestoresHostProxy(t *testing.T) {
+	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
+	s, _ := newTestStore(now)
+	s.Reconfigure(proxyCfg("http://127.0.0.1:8888", "modelscope"))
+	s.SetProxyWait(time.Millisecond)
+	s.SetProbeFunc(func(string) bool { return true })
+
+	var toggled []string
+	s.SetProxyToggler(func(u string) error { toggled = append(toggled, u); return nil })
+	s.SetProxyURLGetter(func() (string, error) { return "host-orig", nil })
+	s.SnapshotHostProxy()
+
+	// Enable the proxy (first-time probe path).
+	s.SetProxyTrigger("auth-1", "Qwen-72B")
+	if !s.ConsumeProxyTrigger("Qwen-72B", now) {
+		t.Fatal("enable must succeed")
+	}
+	if !s.IsProxyActive() {
+		t.Fatal("proxy must be active after enable")
+	}
+	if got := toggled[len(toggled)-1]; got != "http://127.0.0.1:8888" {
+		t.Fatalf("enable PUT = %q, want plugin proxy", got)
+	}
+
+	// Reload: new config drops proxy_url entirely.
+	s.Reconfigure(cfgWith("modelscope"))
+	s.DisableProxyOnReconfigure()
+
+	if s.IsProxyActive() {
+		t.Fatal("proxy must be disabled after proxy_url removed")
+	}
+	if got := toggled[len(toggled)-1]; got != "host-orig" {
+		t.Fatalf("reload restore = %q, want host-orig", got)
+	}
+}
+
+// The configure-time host-proxy snapshot must survive disable/re-enable
+// cycles: disableProxy must NOT clear originalProxyURL, so a later
+// re-enable (which does not re-GET) and disable still restores the host's
+// original proxy. This locks in the snapshot-at-configure design — without
+// it, the second disable would DELETE (empty snapshot) instead of restoring.
+func TestProxySnapshotSurvivesDisableReenableCycle(t *testing.T) {
+	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
+	s, _ := newTestStore(now)
+	s.Reconfigure(proxyCfg("http://127.0.0.1:8888", "modelscope"))
+	s.SetProxyWait(time.Millisecond)
+	s.SetProbeFunc(func(string) bool { return true })
+
+	var toggled []string
+	s.SetProxyToggler(func(u string) error { toggled = append(toggled, u); return nil })
+	s.SetProxyURLGetter(func() (string, error) { return "host-orig", nil })
+	s.SnapshotHostProxy()
+	if got := s.OriginalProxyURL(); got != "host-orig" {
+		t.Fatalf("snapshot = %q, want host-orig", got)
+	}
+
+	// 1st enable + disable (managed success).
+	s.SetProxyTrigger("auth-1", "Qwen-72B")
+	if !s.ConsumeProxyTrigger("Qwen-72B", now) {
+		t.Fatal("1st enable must succeed")
+	}
+	s.HandleProxyOnSuccess() // disable -> restore host-orig
+	if s.IsProxyActive() {
+		t.Fatal("proxy must be off after success")
+	}
+	// Snapshot must NOT be cleared by disable.
+	if got := s.OriginalProxyURL(); got != "host-orig" {
+		t.Fatalf("snapshot cleared after disable = %q, want host-orig (must persist)", got)
+	}
+	if got := toggled[len(toggled)-1]; got != "host-orig" {
+		t.Fatalf("1st disable restore = %q, want host-orig", got)
+	}
+
+	// 2nd enable (re-enable after prior probe: no re-GET) + disable.
+	s.SetProxyTrigger("auth-1", "Qwen-72B")
+	if !s.ConsumeProxyTrigger("Qwen-72B", now) {
+		t.Fatal("2nd enable must succeed")
+	}
+	if got := s.OriginalProxyURL(); got != "host-orig" {
+		t.Fatalf("snapshot lost after re-enable = %q, want host-orig", got)
+	}
+	s.HandleProxyOnSuccess()
+	if got := toggled[len(toggled)-1]; got != "host-orig" {
+		t.Fatalf("2nd disable restore = %q, want host-orig (snapshot must persist across cycle)", got)
+	}
+}
+
+// DisableProxyOnReconfigure is a no-op when the proxy is inactive (e.g. a
+// reload that removes proxy_url before the proxy was ever enabled).
+func TestDisableProxyOnReconfigureNoopWhenInactive(t *testing.T) {
+	s, _ := newTestStore(time.Now())
+	s.Reconfigure(proxyCfg("http://127.0.0.1:8888", "modelscope"))
+	called := false
+	s.SetProxyToggler(func(string) error { called = true; return nil })
+
+	s.DisableProxyOnReconfigure()
 
 	if called {
 		t.Fatal("toggler must not be called when proxy is inactive")

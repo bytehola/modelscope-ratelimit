@@ -219,7 +219,7 @@ func (s *Store) OnUsage(rec UsageRecord) {
 			// wait + probe + enable). When the probe already failed once,
 			// fall back to the insufficient_quota_cooldown mechanism.
 			if isInsufficientQuota(rec.Failure.StatusCode, rec.Failure.Body) && cfg.ProxyURL != "" && !s.IsProxyProbeFailed() {
-				s.SetProxyTrigger()
+				s.SetProxyTrigger(rec.AuthID, model)
 				return
 			}
 			s.ApplyInsufficientQuotaCooldown(rec.AuthID, model, rec.Failure.StatusCode, rec.Failure.Body, now)

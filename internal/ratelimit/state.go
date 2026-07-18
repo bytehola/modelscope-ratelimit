@@ -57,6 +57,15 @@ type Store struct {
 	// arbitrary value left over from the previous provider.
 	managedCursorsMu sync.Mutex
 	managedCursors   map[string]uint64
+	// managedOrder remembers the largest host-ordered candidate ID list seen
+	// per managed provider. When providerFullOrder is unavailable (fetcher
+	// unset or management API unreachable), pickManaged uses this snapshot as
+	// the stable "full" list so a 429 retry (which shrinks the candidate
+	// group) still scans forward in a fixed order and lands on the next key,
+	// instead of indexing a shrunken list with a cursor advanced by the prior
+	// pick. Grown from every fresh candidate group; reset on reconfigure.
+	managedOrderMu sync.Mutex
+	managedOrder   map[string][]string
 
 	// nonManagedRR is the round-robin cursor for non-managed fallback
 	// candidates (Case 1). It is separate from the managed cursors so that
@@ -127,10 +136,12 @@ type Store struct {
 	// are exhausted, then is disabled. A 60s safety timer auto-disables.
 	proxyMu             sync.Mutex
 	proxyActive         bool
-	proxyEnabling       bool // another goroutine is mid-enable (probe/toggler)
-	proxyTriggerPending bool // set by OnUsage on 429, consumed by SchedulerPick (sync)
-	proxyProbeFailed    bool // probe failed once; subsequent 429s skip probe and use cooldown
-	proxyProbed         bool // probe has been performed at least once (success or fail)
+	proxyEnabling       bool   // another goroutine is mid-enable (probe/toggler)
+	proxyTriggerPending bool   // set by OnUsage on 429, consumed by SchedulerPick (sync)
+	proxyTriggerAuthID  string // authID of the 429 that set the trigger (for setCooldown)
+	proxyTriggerModel   string // model of the 429 that set the trigger
+	proxyProbeFailed    bool   // probe failed once; subsequent 429s skip probe and use cooldown
+	proxyProbed         bool   // probe has been performed at least once (success or fail)
 	proxyEnabledAt      time.Time
 	proxyTimer          *time.Timer
 	originalProxyURL    string // host's proxy URL before plugin enabled its own (for restore)
@@ -162,6 +173,7 @@ func NewStore(log Logger) *Store {
 		seen:           make(map[string]struct{}),
 		aliasUpstream:  make(map[string]string),
 		managedCursors: make(map[string]uint64),
+		managedOrder:   make(map[string][]string),
 		clock:          time.Now,
 		stop:           make(chan struct{}),
 		log:            log,
@@ -253,6 +265,60 @@ func (s *Store) providerFullOrder(providerCfgName string) []string {
 	return m[strings.ToLower(strings.TrimSpace(providerCfgName))]
 }
 
+// recordObservedOrder grows the per-provider observed-order snapshot from a
+// candidate group. A fresh request carries every key the host can route to
+// (in host order); a 429 retry carries a strict subset (the tried key is
+// absent). Only a group at least as large as the remembered one extends it,
+// preserving the full order so the fallback scan can skip absent entries.
+// Safe to call concurrently and outside managedCursorsMu (uses its own lock).
+func (s *Store) recordObservedOrder(provider string, group []Candidate) {
+	if len(group) == 0 {
+		return
+	}
+	key := strings.ToLower(strings.TrimSpace(provider))
+	s.managedOrderMu.Lock()
+	defer s.managedOrderMu.Unlock()
+	cur := s.managedOrder[key]
+	if len(group) < len(cur) {
+		// Retry subset: keep the fuller remembered list so the scan has a
+		// stable superset to index into.
+		return
+	}
+	// Equal-or-larger group: rebuild preserving prior order, then append any
+	// newly seen IDs (handles a key added while the plugin is running).
+	seen := make(map[string]bool, len(cur))
+	out := make([]string, 0, len(group))
+	for _, id := range cur {
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	for _, c := range group {
+		if !seen[c.ID] {
+			seen[c.ID] = true
+			out = append(out, c.ID)
+		}
+	}
+	s.managedOrder[key] = out
+}
+
+// observedOrder returns a copy of the per-provider observed-order snapshot,
+// or nil when none has been recorded yet. Read-only; safe under
+// managedCursorsMu.
+func (s *Store) observedOrder(provider string) []string {
+	key := strings.ToLower(strings.TrimSpace(provider))
+	s.managedOrderMu.Lock()
+	defer s.managedOrderMu.Unlock()
+	src := s.managedOrder[key]
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]string, len(src))
+	copy(out, src)
+	return out
+}
+
 // pickManaged selects one candidate from a non-empty managed-provider group,
 // honoring config.yaml api-key order even across 429 retries and disabled keys.
 //
@@ -265,18 +331,29 @@ func (s *Store) providerFullOrder(providerCfgName string) []string {
 //
 // fill-first always picks the first available key in config order.
 //
-// When the full-order list is unavailable (fetcher unset or provider unknown),
-// it falls back to sorting the candidates by config order and using the simple
-// round-robin/fill-first cursor on the sorted slice.
+// When the fetcher-supplied full-order list is unavailable, the plugin falls
+// back to a per-provider observed-order snapshot grown from prior candidate
+// groups, so retries still scan a stable superset and skip absent keys. Only
+// the very first call (no fetcher, no snapshot yet) degrades to simple
+// round-robin on the current group.
 func (s *Store) pickManaged(group []Candidate, providerCfgName string) (Candidate, bool) {
 	if len(group) == 0 {
 		return Candidate{}, false
 	}
 	strategy := s.managedStrategy()
 
+	// Grow the observed-order snapshot BEFORE acquiring the cursor mutex so
+	// the short managedCursorsMu critical section never waits on this map
+	// write. The snapshot is the fallback "full" list when the fetcher is
+	// unavailable (unset or transient management-API failure).
+	s.recordObservedOrder(providerCfgName, group)
+
 	if strategy == "fill-first" {
 		// Always pick the first available key in config order.
 		full := s.providerFullOrder(providerCfgName)
+		if len(full) == 0 {
+			full = s.observedOrder(providerCfgName)
+		}
 		if len(full) > 0 {
 			present := make(map[string]bool, len(group))
 			byID := make(map[string]Candidate, len(group))
@@ -308,6 +385,15 @@ func (s *Store) pickManaged(group []Candidate, providerCfgName string) (Candidat
 
 	cursor := s.managedCursors[providerCfgName]
 
+	if len(full) == 0 {
+		// No fetcher-supplied order: use the observed-order snapshot grown
+		// from prior candidate groups. It is a superset of the current
+		// (possibly retry-shrunken) group, so the scan-skip-absent logic
+		// below still lands on the next key in the remembered order instead
+		// of indexing a shrunken list with a stale cursor.
+		full = s.observedOrder(providerCfgName)
+	}
+
 	if len(full) > 0 {
 		// Full-order path: scan from cursor position in the complete
 		// config-ordered list (including disabled/tried keys), skipping
@@ -334,9 +420,10 @@ func (s *Store) pickManaged(group []Candidate, providerCfgName string) (Candidat
 		return byID[full[found]], true
 	}
 
-	// Fallback: no full-order info. Simple round-robin on host-ordered
-	// candidates using the per-provider cursor (deterministic, not
-	// config-aligned, but at least isolated from other providers).
+	// First-ever call with no fetcher and no observed snapshot yet: simple
+	// round-robin on the current host-ordered group using the per-provider
+	// cursor (isolated from other providers). This branch only runs once per
+	// provider before the snapshot is populated.
 	n := cursor + 1
 	s.managedCursors[providerCfgName] = n
 	idx := int((n - 1) % uint64(len(group)))
@@ -379,6 +466,11 @@ func (s *Store) Reconfigure(cfg *Config) {
 	s.managedCursors = make(map[string]uint64)
 	s.managedCursorsMu.Unlock()
 	s.nonManagedRR.Store(0)
+	// Reset the observed-order snapshots too: a new provider set or reordered
+	// api-keys means the remembered host-ordered lists are stale.
+	s.managedOrderMu.Lock()
+	s.managedOrder = make(map[string][]string)
+	s.managedOrderMu.Unlock()
 	// Reset the exponential-backoff level so a changed insufficient_quota_cooldown
 	// base takes effect immediately instead of continuing from a stale level.
 	s.backoffMu.Lock()
@@ -1003,7 +1095,11 @@ func (s *Store) Status() []DisableStatus {
 		}
 		ks.mu.RLock()
 		st := DisableStatus{AuthID: id, Models: map[string]time.Time{}}
-		if ks.global != nil && active(*ks.global, now, loc) {
+		// A 401 (unauthorized) global disable persists across the midnight
+		// boundary (globalReason == "unauthorized"); a daily-quota global
+		// disable is only active on its own calendar day. Match isDisabled
+		// and Snapshot so Status() never diverges from the scheduler's view.
+		if ks.global != nil && (ks.globalReason == "unauthorized" || active(*ks.global, now, loc)) {
 			t := *ks.global
 			st.Global = &t
 		}

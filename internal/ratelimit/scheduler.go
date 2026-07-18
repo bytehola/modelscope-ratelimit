@@ -87,9 +87,10 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 	// cooldown has expired and keys are available again. Only applied when
 	// there are managed candidates to retry (hasManaged); a request that has
 	// already exhausted every managed key and is falling through to a
-	// non-managed provider is never blocked. Skipped when proxy_url is
-	// configured (proxy mode replaces the cooldown).
-	if hasManaged && cfg.InsufficientQuotaCooldown > 0 && (cfg.ProxyURL == "" || s.IsProxyProbeFailed()) {
+	// non-managed provider is never blocked. Runs in proxy mode too: a 429
+	// while the proxy is already active escalates the shared backoff
+	// (the first proxy-enable 429 sets no cooldown, so this is a no-op then).
+	if hasManaged && cfg.InsufficientQuotaCooldown > 0 && (cfg.ProxyURL == "" || s.IsProxyProbeFailed() || s.IsProxyActive()) {
 		if wait := s.cooldownWaitDuration(now); wait > 0 {
 			// Record the max cooldown expiry before sleeping. After the sleep,
 			// a concurrent request may have set a NEW (longer) cooldown on a
