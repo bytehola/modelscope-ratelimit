@@ -22,6 +22,7 @@ func setProxyActiveForTest(s *Store, original string) {
 	s.proxyActive = true
 	s.proxyProbed = true
 	s.originalProxyURL = original
+	s.originalSnapshotted = true
 	s.proxyMu.Unlock()
 }
 
@@ -319,17 +320,6 @@ func TestConsumeProxyTriggerProbesAndEnables(t *testing.T) {
 	s.SetProxyURLGetter(func() (string, error) { getterCalled = true; return "orig-proxy", nil })
 	defer s.DisableProxyIfActive()
 
-	// Snapshot the host proxy once at configure (production does this in
-	// the C-ABI glue). reenableProxy no longer re-reads the getter.
-	s.SnapshotHostProxy()
-	if !getterCalled {
-		t.Fatal("SnapshotHostProxy must read the host's original proxy")
-	}
-	if got := s.OriginalProxyURL(); got != "orig-proxy" {
-		t.Fatalf("snapshot = %q, want orig-proxy", got)
-	}
-	getterCalled = false // reenableProxy must NOT call the getter again
-
 	// Set the trigger the way OnUsage would.
 	s.SetProxyTrigger("auth-1", "Qwen-72B")
 
@@ -354,8 +344,8 @@ func TestConsumeProxyTriggerProbesAndEnables(t *testing.T) {
 	if len(toggled) != 1 || toggled[0] != "http://127.0.0.1:8888" {
 		t.Fatalf("toggler must set the configured proxy URL, got %v", toggled)
 	}
-	if getterCalled {
-		t.Fatal("reenableProxy must NOT re-read the getter (snapshot taken at configure)")
+	if !getterCalled {
+		t.Fatal("first enable must snapshot the host proxy via GET (lazy, on first enable)")
 	}
 	// The boot snapshot must survive enable unchanged.
 	if got := s.OriginalProxyURL(); got != "orig-proxy" {
@@ -446,6 +436,139 @@ func TestDisableProxyIfActiveNoopWhenInactive(t *testing.T) {
 
 	if called {
 		t.Fatal("toggler must not be called when proxy is inactive")
+	}
+}
+
+// The first 429 (proxy enable) must NOT apply an artificial pre-wait: probe
+// and enable immediately so the request proceeds without delay. proxyWait
+// only affects the concurrent-waiter path now, so a large SetProxyWait must
+// NOT slow the first enable.
+func TestProxyFirstEnableNoArtificialWait(t *testing.T) {
+	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
+	s, _ := newTestStore(now)
+	s.Reconfigure(proxyCfg("http://127.0.0.1:8888", "modelscope"))
+	s.SetProxyWait(2 * time.Second) // would block 2s if a pre-wait remained
+	s.SetProbeFunc(func(string) bool { return true })
+	s.SetProxyToggler(func(string) error { return nil })
+	s.SetProxyURLGetter(func() (string, error) { return "host-orig", nil })
+	defer s.DisableProxyIfActive()
+
+	s.SetProxyTrigger("auth-1", "Qwen-72B")
+	start := time.Now()
+	if !s.ConsumeProxyTrigger("Qwen-72B", now) {
+		t.Fatal("1st enable must succeed")
+	}
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Fatalf("1st enable must have no artificial pre-wait, took %s", d)
+	}
+	if !s.IsProxyActive() {
+		t.Fatal("proxy must be active after 1st enable")
+	}
+}
+
+// Fix: a 429 arriving right at the previous cooldown's expiry (after the
+// cooldown block slept through it) must ESCALATE, not be absorbed as the same
+// round. Previously the round check used cooldownLevelAt+level+1s, so a retry
+// at expiry (level < level+1s) was wrongly kept — making the escalation
+// 10,10,20,40 instead of 10,20,40,60.
+func TestProxyBackoffEscalatesAtExpiry(t *testing.T) {
+	loc := time.FixedZone("CST", 8*3600)
+	t0 := time.Date(2026, 7, 8, 10, 0, 0, 0, loc)
+	s, cur := newTestStore(t0) // jitter = 0
+	cfg := proxyCfg("http://127.0.0.1:8888", "modelscope")
+	cfg.InsufficientQuotaCooldown = 10
+	s.Reconfigure(cfg)
+	s.SetProxyWait(time.Millisecond)
+	s.SetProbeFunc(func(string) bool { return true })
+	s.SetProxyToggler(func(string) error { return nil })
+	s.SetProxyURLGetter(func() (string, error) { return "host-orig", nil })
+	defer s.DisableProxyIfActive()
+
+	// 1st 429: enable proxy, no cooldown.
+	s.SetProxyTrigger("auth-1", "Qwen-72B")
+	if !s.ConsumeProxyTrigger("Qwen-72B", t0) {
+		t.Fatal("1st 429 must enable the proxy")
+	}
+	if w := s.cooldownWaitDuration(t0); w > 0 {
+		t.Fatalf("1st 429 must set no cooldown, got %s", w)
+	}
+
+	// 2nd 429 (proxy active): level -> base 10s.
+	s.SetProxyTrigger("auth-1", "Qwen-72B")
+	s.ConsumeProxyTrigger("Qwen-72B", *cur)
+	if w := s.cooldownWaitDuration(*cur); w != 10*time.Second {
+		t.Fatalf("2nd 429 cooldown = %s, want 10s", w)
+	}
+
+	// 3rd 429 arriving exactly at the 10s expiry (as the cooldown block
+	// would, after sleeping through it): must escalate to 20s.
+	*cur = (*cur).Add(10 * time.Second)
+	s.SetProxyTrigger("auth-1", "Qwen-72B")
+	s.ConsumeProxyTrigger("Qwen-72B", *cur)
+	if w := s.cooldownWaitDuration(*cur); w != 20*time.Second {
+		t.Fatalf("3rd 429 at expiry must escalate to 20s, got %s", w)
+	}
+
+	// 4th at the 20s expiry -> 40s.
+	*cur = (*cur).Add(20 * time.Second)
+	s.SetProxyTrigger("auth-1", "Qwen-72B")
+	s.ConsumeProxyTrigger("Qwen-72B", *cur)
+	if w := s.cooldownWaitDuration(*cur); w != 40*time.Second {
+		t.Fatalf("4th 429 at expiry must escalate to 40s, got %s", w)
+	}
+}
+
+// Fix: a 429 while the proxy is active resets the 60s safety timer so it only
+// fires after a quiescent period (no 429s). Without the reset, the timer
+// fires 60s from the initial enable regardless of ongoing 429s, cycling the
+// proxy off mid-exhaustion and resetting the backoff each cycle.
+func TestProxySafetyTimerResetsOnActive429(t *testing.T) {
+	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
+	s, _ := newTestStore(now)
+	s.Reconfigure(proxyCfg("http://127.0.0.1:8888", "modelscope"))
+	s.SetProxyWait(time.Millisecond)
+	s.SetProbeFunc(func(string) bool { return true })
+	s.SetProxyToggler(func(string) error { return nil })
+	s.SetProxyURLGetter(func() (string, error) { return "host-orig", nil })
+	// Short safety timeout so the test runs fast.
+	s.SetProxySafetyTimeout(80 * time.Millisecond)
+	defer s.DisableProxyIfActive()
+
+	// 1st 429: enable proxy.
+	s.SetProxyTrigger("auth-1", "Qwen-72B")
+	if !s.ConsumeProxyTrigger("Qwen-72B", now) {
+		t.Fatal("1st 429 must enable the proxy")
+	}
+
+	// Halfway to the safety timeout, a 2nd 429 resets it.
+	time.Sleep(40 * time.Millisecond)
+	s.SetProxyTrigger("auth-1", "Qwen-72B")
+	s.ConsumeProxyTrigger("Qwen-72B", now)
+	if !s.IsProxyActive() {
+		t.Fatal("proxy must stay active after 2nd 429")
+	}
+
+	// 60ms later: without the reset the timer (80ms from enable, 40ms elapsed
+	// before the 2nd 429) would have fired at ~80ms; with the reset it fires
+	// ~80ms after the 2nd 429, so at 40+60=100ms the proxy is still on.
+	time.Sleep(60 * time.Millisecond)
+	if !s.IsProxyActive() {
+		t.Fatal("proxy must stay active — 2nd 429 must have reset the safety timer")
+	}
+}
+
+// Invariant: the proxy safety timeout must exceed the max cooldown
+// (maxInsufficientQuotaCooldown). At the 60s backoff cap the cooldown block
+// sleeps the full cap; if the safety timer (reset on each 429) were <= the
+// cap, it would fire DURING the block, disabling the proxy mid-block. After
+// the block the next 429 re-enables via the no-cooldown re-enable path, and
+// since the old cooldown expired, the following request isn't blocked —
+// bursting two requests. safety > cap guarantees the timer can't fire during
+// any cooldown block.
+func TestProxySafetyTimeoutExceedsMaxCooldown(t *testing.T) {
+	if proxySafetyTimeout <= maxInsufficientQuotaCooldown*time.Second {
+		t.Fatalf("proxySafetyTimeout %s must exceed max cooldown %s to avoid mid-block disable",
+			proxySafetyTimeout, maxInsufficientQuotaCooldown*time.Second)
 	}
 }
 
@@ -582,10 +705,6 @@ func TestProxyBackoffProgression(t *testing.T) {
 	s.SetProxyToggler(func(u string) error { toggled = append(toggled, u); return nil })
 	s.SetProxyURLGetter(func() (string, error) { return "orig", nil })
 
-	// Snapshot once at configure (mirrors production). reenableProxy no
-	// longer re-reads the getter on each enable.
-	s.SnapshotHostProxy()
-
 	// 1st 429: proxy inactive -> probe + enable. No backoff, no cooldown.
 	s.SetProxyTrigger("auth-1", "Qwen-72B")
 	if !s.ConsumeProxyTrigger("Qwen-72B", t0) {
@@ -676,9 +795,6 @@ func TestProxyFirstNoBackoffSecondBackoff(t *testing.T) {
 	s.SetProxyURLGetter(func() (string, error) { return "", nil })
 	defer s.DisableProxyIfActive()
 
-	// Snapshot once at configure (mirrors production).
-	s.SnapshotHostProxy()
-
 	req := SchedulerPickRequest{
 		Provider: "modelscope", Providers: []string{"modelscope"}, Model: "Qwen-72B",
 		Candidates: []Candidate{{ID: "auth-1", Provider: "modelscope", Priority: 1}},
@@ -716,47 +832,64 @@ func TestProxyFirstNoBackoffSecondBackoff(t *testing.T) {
 	}
 }
 
-// --- SnapshotHostProxy (configure-time host-proxy snapshot) ---------------
+// --- snapshotHostProxyOnce (lazy, on first enable) ---------------------
 
-// SnapshotHostProxy must be a no-op while a proxy enable is mid-flight
-// (proxyEnabling true): during that window the host may already be routed
-// through the plugin proxy while proxyActive is still false, so a GET would
-// capture the plugin's own URL and corrupt the restore snapshot. The prior
-// snapshot must be preserved instead.
-func TestSnapshotHostProxySkipsWhileEnabling(t *testing.T) {
+// snapshotHostProxyOnce is idempotent: the first call reads the host proxy
+// via GET and stores it; subsequent calls return immediately without
+// re-reading — the lazy-once contract that keeps the hot path GET-free
+// while still snapshotting only after the server is up (first 429).
+func TestSnapshotHostProxyOnceOnlyGetsOnce(t *testing.T) {
 	s, _ := newTestStore(time.Now())
 	s.Reconfigure(proxyCfg("http://127.0.0.1:8888", "modelscope"))
-	s.SetProxyToggler(func(string) error { return nil })
-	s.SetProxyURLGetter(func() (string, error) { return "host-orig", nil })
+	calls := 0
+	s.SetProxyURLGetter(func() (string, error) { calls++; return "host-orig", nil })
 
-	s.SnapshotHostProxy()
+	if !s.snapshotHostProxyOnce() {
+		t.Fatal("first snapshotHostProxyOnce must succeed")
+	}
 	if got := s.OriginalProxyURL(); got != "host-orig" {
 		t.Fatalf("snapshot = %q, want host-orig", got)
 	}
+	if calls != 1 {
+		t.Fatalf("getter called %d times, want 1", calls)
+	}
 
-	// Simulate the mid-enable window: host now resolves to the plugin proxy.
-	s.SetProxyURLGetter(func() (string, error) { return "plugin-proxy", nil })
-	s.proxyMu.Lock()
-	s.proxyEnabling = true
-	s.proxyMu.Unlock()
-
-	s.SnapshotHostProxy() // must skip: keep "host-orig"
-	if got := s.OriginalProxyURL(); got != "host-orig" {
-		t.Fatalf("snapshot overwritten during enable = %q, want host-orig kept", got)
+	// Second call must NOT re-GET (flag set).
+	if !s.snapshotHostProxyOnce() {
+		t.Fatal("second snapshotHostProxyOnce must return true without re-GET")
+	}
+	if calls != 1 {
+		t.Fatalf("getter called %d times after 2nd, want 1 (once)", calls)
 	}
 }
 
-// A GET failure at configure must leave the snapshot empty (disable then
-// clears the plugin proxy, matching "host had none") and never panic.
-func TestSnapshotHostProxyGetterFailureLeavesEmpty(t *testing.T) {
-	s, _ := newTestStore(time.Now())
+// A failed host-proxy GET must NOT enable the proxy: without a snapshot,
+// disableProxy would DELETE the host's real proxy instead of restoring it.
+// snapshotHostProxyOnce returns false, leaves the flag unset (so the next
+// enable retries), and reenableProxy must skip the PUT entirely.
+func TestSnapshotGetterFailureDefersEnable(t *testing.T) {
+	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
+	s, _ := newTestStore(now)
 	s.Reconfigure(proxyCfg("http://127.0.0.1:8888", "modelscope"))
-	s.SetProxyToggler(func(string) error { return nil })
+	s.SetProxyWait(time.Millisecond)
+	s.SetProbeFunc(func(string) bool { return true })
+	s.SetProxyToggler(func(string) error {
+		t.Fatal("toggler must not run when host-proxy snapshot is unavailable")
+		return nil
+	})
 	s.SetProxyURLGetter(func() (string, error) { return "", fmt.Errorf("management API down") })
 
-	s.SnapshotHostProxy()
+	// First-time enable path: probe OK, but snapshot GET fails -> reenableProxy
+	// must NOT enable the proxy.
+	s.SetProxyTrigger("auth-1", "Qwen-72B")
+	if s.ConsumeProxyTrigger("Qwen-72B", now) {
+		t.Fatal("enable must be deferred when host-proxy snapshot is unavailable")
+	}
+	if s.IsProxyActive() {
+		t.Fatal("proxy must remain inactive when snapshot failed")
+	}
 	if got := s.OriginalProxyURL(); got != "" {
-		t.Fatalf("snapshot = %q, want empty on GET failure", got)
+		t.Fatalf("originalProxyURL = %q, want empty on GET failure", got)
 	}
 }
 
@@ -773,7 +906,6 @@ func TestDisableProxyOnReconfigureRestoresHostProxy(t *testing.T) {
 	var toggled []string
 	s.SetProxyToggler(func(u string) error { toggled = append(toggled, u); return nil })
 	s.SetProxyURLGetter(func() (string, error) { return "host-orig", nil })
-	s.SnapshotHostProxy()
 
 	// Enable the proxy (first-time probe path).
 	s.SetProxyTrigger("auth-1", "Qwen-72B")
@@ -799,10 +931,10 @@ func TestDisableProxyOnReconfigureRestoresHostProxy(t *testing.T) {
 	}
 }
 
-// The configure-time host-proxy snapshot must survive disable/re-enable
-// cycles: disableProxy must NOT clear originalProxyURL, so a later
-// re-enable (which does not re-GET) and disable still restores the host's
-// original proxy. This locks in the snapshot-at-configure design — without
+// The lazy host-proxy snapshot (taken once on first enable) must survive
+// disable/re-enable cycles: disableProxy must NOT clear originalProxyURL, so
+// a later re-enable (which does not re-GET) and disable still restores the
+// host's original proxy. This locks in the snapshot-once design — without
 // it, the second disable would DELETE (empty snapshot) instead of restoring.
 func TestProxySnapshotSurvivesDisableReenableCycle(t *testing.T) {
 	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
@@ -814,10 +946,6 @@ func TestProxySnapshotSurvivesDisableReenableCycle(t *testing.T) {
 	var toggled []string
 	s.SetProxyToggler(func(u string) error { toggled = append(toggled, u); return nil })
 	s.SetProxyURLGetter(func() (string, error) { return "host-orig", nil })
-	s.SnapshotHostProxy()
-	if got := s.OriginalProxyURL(); got != "host-orig" {
-		t.Fatalf("snapshot = %q, want host-orig", got)
-	}
 
 	// 1st enable + disable (managed success).
 	s.SetProxyTrigger("auth-1", "Qwen-72B")

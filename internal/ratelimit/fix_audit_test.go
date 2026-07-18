@@ -25,7 +25,6 @@ func TestFixProxyOriginalSurvivesReenableCycle(t *testing.T) {
 		return nil
 	})
 	s.SetProxyURLGetter(func() (string, error) { return "host-orig", nil })
-	s.SnapshotHostProxy()
 
 	// Enable (first-time probe path).
 	s.SetProxyTrigger("auth-1", "Qwen-72B")

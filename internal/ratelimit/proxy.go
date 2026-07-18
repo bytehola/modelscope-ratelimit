@@ -15,9 +15,17 @@ const (
 	// connection error means the proxy is unavailable.
 	proxyProbeURL = "https://api-inference.modelscope.cn"
 
-	proxyProbeTimeout  = 10 * time.Second
-	proxyWaitDuration  = 1 * time.Second
-	proxySafetyTimeout = 60 * time.Second
+	proxyProbeTimeout = 10 * time.Second
+	proxyWaitDuration = 1 * time.Second
+	// proxySafetyTimeout auto-disables a forgotten proxy after this long with
+	// no 429/200 activity. It must be STRICTLY GREATER than
+	// maxInsufficientQuotaCooldown (the longest a cooldown block can sleep):
+	// otherwise, at the 60s backoff cap, the safety timer fires DURING the
+	// cooldown block, disabling the proxy mid-block. After the block the next
+	// 429 re-enables the proxy via the no-cooldown re-enable path, and since
+	// the old cooldown expired, the following request isn't blocked — bursting
+	// two requests. 2x the cap gives a 60s quiescent margin after the block.
+	proxySafetyTimeout = 2 * maxInsufficientQuotaCooldown * time.Second
 )
 
 // SetProxyToggler injects the function that sets or clears the global
@@ -36,41 +44,46 @@ func (s *Store) SetProxyURLGetter(fn func() (string, error)) {
 	s.proxyURLGetter.Store(&fn)
 }
 
-// SnapshotHostProxy records the host's current upstream proxy URL ONCE, at
-// configure time, so disableProxy can restore it later. Moving the read off
-// the hot 429 path (where reenableProxy used to GET every enable) eliminates
-// the hazard where a transient GET failure left originalProxyURL empty and
-// caused disable to DELETE a host proxy that actually existed.
+// snapshotHostProxyOnce records the host's current upstream proxy URL the
+// first time the plugin is about to enable its own proxy. It is called from
+// reenableProxy, which runs on the first 429 — by then the host API server is
+// already serving requests (unlike configure, which fires before the server
+// listens, so a configure-time GET always fails with connection refused).
 //
-// Called from the C-ABI glue after proxyURLGetter is injected. If the plugin's
-// own proxy is currently active (reload-while-active edge case), the existing
-// boot snapshot is kept instead of being overwritten with the plugin's proxy
-// URL. A GET failure at configure logs a warning and leaves the snapshot
-// empty (disable then clears the plugin proxy, matching "host had none").
-func (s *Store) SnapshotHostProxy() {
+// Idempotent: once the snapshot succeeds (originalSnapshotted=true) it is
+// never re-read, so later re-enables reuse the stored value. Returns true if
+// a snapshot is available (already taken or just taken); false if the GET
+// failed or no getter is injected, in which case reenableProxy must NOT
+// enable the proxy — a missing snapshot would make disableProxy DELETE the
+// host's real proxy instead of restoring it.
+func (s *Store) snapshotHostProxyOnce() bool {
 	s.proxyMu.Lock()
-	if s.proxyActive || s.proxyEnabling {
-		// Proxy active or mid-enable: keep the prior boot snapshot. During
-		// the enable window (proxyEnabling true) the host may already be
-		// routed through the plugin proxy while proxyActive is still false,
-		// so a GET here would capture the plugin's own URL — keep the prior
-		// snapshot instead of overwriting it.
+	if s.originalSnapshotted {
 		s.proxyMu.Unlock()
-		return
+		return true
 	}
 	s.proxyMu.Unlock()
 
+	// reenableProxy is the proxyEnabling owner, so no concurrent caller
+	// reaches here; the flag check above plus the write below under proxyMu
+	// are sufficient.
 	var current string
+	ok := false
 	if getter := s.proxyURLGetter.Load(); getter != nil {
-		if cur, err := (*getter)(); err != nil {
-			s.log.Printf("modelscope-ratelimit: failed to snapshot host proxy at configure: %v (restore will clear plugin proxy on disable)", err)
+		if v, err := (*getter)(); err == nil {
+			current = v
+			ok = true
 		} else {
-			current = cur
+			s.log.Printf("modelscope-ratelimit: failed to snapshot host proxy: %v (proxy enable deferred)", err)
 		}
 	}
 	s.proxyMu.Lock()
-	s.originalProxyURL = current
+	if ok {
+		s.originalProxyURL = current
+		s.originalSnapshotted = true
+	}
 	s.proxyMu.Unlock()
+	return ok
 }
 
 // IsProxyActive reports whether the global proxy is currently enabled.
@@ -139,16 +152,29 @@ func (s *Store) ConsumeProxyTrigger(model string, now time.Time) bool {
 		// A subsequent 429 while the proxy is already active means the new IP
 		// did not resolve the quota exhaustion. Escalate via the shared
 		// insufficient_quota exponential backoff (base -> x2 -> ... capped at
-		// 60s): the 1s rotation wait is the "1s" portion, and the cooldown
-		// block in SchedulerPick adds the backoff portion (10/20/40/60). The
-		// first proxy-enable 429 (proxy was inactive) does NOT reach here, so
-		// the backoff level stays 0 until the second 429.
-		s.log.Printf("modelscope-ratelimit: block %s model=%s (proxy rotation)",
-			s.proxyWait(), s.displayName(model))
-		time.Sleep(s.proxyWait())
+		// 60s). No separate rotation sleep here: the proxy is already up, so
+		// the cooldown block in SchedulerPick blocks for the backoff duration
+		// (base insufficient_quota_cooldown + jitter) directly — the 2nd 429
+		// thus waits ~insufficient_quota_cooldown, not 1s+cooldown.
+		// The first proxy-enable 429 (proxy was inactive) does NOT reach here,
+		// so the backoff level stays 0 until the second 429.
 		if authID != "" && cfg.InsufficientQuotaCooldown > 0 {
 			s.setCooldown(authID, cfg.InsufficientQuotaCooldown, now)
 		}
+		// A 429 while the proxy is active means the proxy is still needed;
+		// reset the safety timer so it only fires after proxySafetyTimeout of
+		// NO 429 activity (quiescence), not a fixed 60s from the initial
+		// enable. Otherwise the proxy cycles off mid-exhaustion every 60s,
+		// resetting the backoff each cycle.
+		s.proxyMu.Lock()
+		if s.proxyTimer != nil {
+			s.proxyTimer.Reset(s.proxySafetyTimeoutDur())
+		} else {
+			s.proxyTimer = time.AfterFunc(s.proxySafetyTimeoutDur(), func() {
+				s.disableProxy("safety timeout")
+			})
+		}
+		s.proxyMu.Unlock()
 		return true
 	}
 	// Probe already failed once — don't re-probe; fall back to cooldown.
@@ -174,19 +200,15 @@ func (s *Store) ConsumeProxyTrigger(model string, now time.Time) bool {
 	if s.proxyProbed {
 		s.proxyEnabling = true
 		s.proxyMu.Unlock()
-		s.log.Printf("modelscope-ratelimit: block %s model=%s (proxy re-enable after prior probe)",
-			s.proxyWait(), s.displayName(model))
-		time.Sleep(s.proxyWait())
+		// Re-enable immediately (no artificial rotation delay): the proxy was
+		// already probed successfully, so just PUT it back and proceed.
 		return s.reenableProxy(model, now)
 	}
 	s.proxyEnabling = true
 	s.proxyMu.Unlock()
 
-	// First-time probe: wait 2s, then probe the proxy.
-	s.log.Printf("modelscope-ratelimit: block %s model=%s (proxy wait before probe)",
-		s.proxyWait(), s.displayName(model))
-	time.Sleep(s.proxyWait())
-
+	// First-time probe: probe immediately (no artificial pre-wait), then
+	// enable. The request proceeds right after the proxy is up.
 	if !s.probeProxy(cfg.ProxyURL) {
 		s.log.Printf("modelscope-ratelimit: proxy probe failed, falling back to insufficient_quota_cooldown")
 		s.proxyMu.Lock()
@@ -206,17 +228,28 @@ func (s *Store) ConsumeProxyTrigger(model string, now time.Time) bool {
 
 // reenableProxy enables the global proxy via the management API (PUT of the
 // plugin's configured proxy URL). Shared by first-time and subsequent
-// enables. The host's original proxy URL is snapshotted once at configure
-// (SnapshotHostProxy) and restored from originalProxyURL in disableProxy;
-// reenableProxy never reads or writes originalProxyURL.
+// enables. The host's original proxy URL is snapshotted once (lazily, on the
+// first enable via snapshotHostProxyOnce) and restored from originalProxyURL
+// in disableProxy; later enables reuse the stored snapshot without re-GET.
 func (s *Store) reenableProxy(model string, now time.Time) bool {
 	cfg := s.config()
 
+	// Snapshot the host's current proxy URL the first time we enable ours.
+	// Done here (first 429, server up) not at configure (server not up yet).
+	// If unavailable, do NOT enable: a missing snapshot would make disable
+	// DELETE the host's real proxy instead of restoring it.
+	if !s.snapshotHostProxyOnce() {
+		s.proxyMu.Lock()
+		s.proxyEnabling = false
+		s.proxyMu.Unlock()
+		return false
+	}
+
 	// Enable the global proxy: PUT the plugin's configured proxy URL. The
-	// host's original proxy was snapshotted once at configure (SnapshotHostProxy)
-	// and is restored from originalProxyURL in disableProxy. reenableProxy
-	// never re-reads the management API, so a transient GET failure on the hot
-	// 429 path cannot corrupt the restore value.
+	// host's original proxy was snapshotted once above (snapshotHostProxyOnce,
+	// on the first enable) and is restored from originalProxyURL in
+	// disableProxy. reenableProxy never re-reads the management API on
+	// subsequent enables, so the restore value stays stable.
 	fn := s.proxyToggler.Load()
 	if fn != nil {
 		if err := (*fn)(cfg.ProxyURL); err != nil {
@@ -233,9 +266,9 @@ func (s *Store) reenableProxy(model string, now time.Time) bool {
 	s.proxyEnabling = false
 	s.proxyProbeFailed = false
 	s.proxyEnabledAt = now
-	// originalProxyURL intentionally untouched: snapshotted once at
-	// configure (SnapshotHostProxy) and retained across disable/re-enable
-	// cycles so every disable can restore the host's original proxy.
+	// originalProxyURL intentionally untouched here: snapshotted once on the
+	// first enable and retained across disable/re-enable cycles so every
+	// disable can restore the host's original proxy.
 	s.proxyMu.Unlock()
 
 	// Increment the daily backoff trigger counter so the status page
@@ -246,7 +279,7 @@ func (s *Store) reenableProxy(model string, now time.Time) bool {
 	if s.proxyTimer != nil {
 		s.proxyTimer.Stop()
 	}
-	s.proxyTimer = time.AfterFunc(proxySafetyTimeout, func() {
+	s.proxyTimer = time.AfterFunc(s.proxySafetyTimeoutDur(), func() {
 		s.disableProxy("safety timeout")
 	})
 

@@ -47,15 +47,9 @@ plugins:
         # 连续失败按指数退避 ×2 递增（10→20→40→60），封顶 60 秒，
         # 成功响应或次日 00:00 重置回基数。
       # proxy_url: "socks5://user:pass@127.0.0.1:1080"
-        # 代理 URL（选填，留空 = 不启用代理模式）。
-        # 配置后，托管 provider 收到任意 429 时：
-        #   1. 等待 2 秒
-        #   2. 通过代理探测 https://api-inference.modelscope.cn（10s 超时）
-        #   3. 探测成功 → 全局开启上游代理，轮换下一个 key 重试
-        #   4. 成功后关闭代理；所有 key 耗尽则返回错误并关闭代理
-        # 探测失败（代理不可用）→ 回退 insufficient_quota_cooldown 方案。
-        # 配置 proxy_url 后 insufficient_quota_cooldown 自动失效。
-        # 支持格式：http://user:pass@host:port、socks5://user:pass@host:port
+      # 代理 URL（选填，留空 = 不启用代理模式）。
+      # 配置后，托管 provider 收到任意 429 时才会开启，成功后关闭。
+      # 支持格式：http://user:pass@host:port、socks5://user:pass@host:port
 
       # ---- 每日限流（通常留空用默认即可）----
       timezone: "Asia/Shanghai" # 每日 00:00 重置时区，默认 Asia/Shanghai

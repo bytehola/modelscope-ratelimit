@@ -109,6 +109,13 @@ type Store struct {
 	backoffMu       sync.Mutex
 	cooldownLevel   int       // current backoff interval (seconds); 0 = idle
 	cooldownLevelAt time.Time // when the level was last advanced
+	// cooldownExpiresAt is when the current round's cooldown actually expires
+	// (level + the jitter used when the level was advanced). It anchors "same
+	// round" detection: a failure before this point is the same round of an
+	// exhausted shared quota (kept, not doubled); a failure after is a new
+	// round (doubled). Using the actual expiry — not cooldownLevelAt+level+1s
+	// — avoids under-escalating when the next retry arrives right at expiry.
+	cooldownExpiresAt time.Time
 
 	// cooldownCount and cooldownWaitNanos track daily insufficient_quota
 	// statistics for the status page: how many times the cooldown was
@@ -145,6 +152,7 @@ type Store struct {
 	proxyEnabledAt      time.Time
 	proxyTimer          *time.Timer
 	originalProxyURL    string // host's proxy URL before plugin enabled its own (for restore)
+	originalSnapshotted bool   // host proxy snapshot taken once (lazy, on first enable); guards re-GET
 	proxyToggler        atomic.Pointer[func(proxyURL string) error]
 	proxyURLGetter      atomic.Pointer[func() (string, error)]
 	// Test seams: an injectable probe (avoids real network during tests) and a
@@ -152,6 +160,9 @@ type Store struct {
 	// nil/zero in production, falling back to probeProxy / proxyWaitDuration.
 	probeFn        atomic.Pointer[func(proxyURL string) bool]
 	proxyWaitNanos atomic.Int64
+	// proxySafetyNanos overrides proxySafetyTimeout for tests (so the
+	// safety-timer reset can be exercised without waiting 60s). 0 = default.
+	proxySafetyNanos atomic.Int64
 
 	clock func() time.Time // injectable for tests; defaults to time.Now
 
@@ -476,6 +487,7 @@ func (s *Store) Reconfigure(cfg *Config) {
 	s.backoffMu.Lock()
 	s.cooldownLevel = 0
 	s.cooldownLevelAt = time.Time{}
+	s.cooldownExpiresAt = time.Time{}
 	s.backoffMu.Unlock()
 }
 
@@ -869,6 +881,12 @@ func (s *Store) setCooldown(authID string, base int, now time.Time) {
 	if authID == "" || base <= 0 {
 		return
 	}
+	// Compute the jitter up front so the round-expiry anchor and the per-key
+	// cooldown use the same value.
+	jitter := time.Duration(0)
+	if jf := s.jitterFn.Load(); jf != nil && *jf != nil {
+		jitter = (*jf)()
+	}
 	s.backoffMu.Lock()
 	level := s.cooldownLevel
 	advanced := false
@@ -877,13 +895,16 @@ func (s *Store) setCooldown(authID string, base int, now time.Time) {
 		// First failure since the backoff was reset.
 		level = base
 		advanced = true
-	case now.Before(s.cooldownLevelAt.Add(time.Duration(level)*time.Second + time.Second)):
-		// Still inside the previous cooldown window (level + jitter buffer):
-		// multiple keys of the same shared quota failing together (one round).
-		// Keep the level AND the original window start so the round isn't
-		// over-counted or slid forward. The extra second accounts for jitter
-		// so a failure while the actual (level+jitter) cooldown is still
-		// active isn't mistaken for a new round.
+	case now.Before(s.cooldownExpiresAt):
+		// Still inside the previous round's actual cooldown (level + the
+		// jitter that was in effect when the level was advanced): multiple
+		// keys of the same shared quota failing together are one round.
+		// Keep the level AND the original round anchor (cooldownLevelAt /
+		// cooldownExpiresAt) so the round isn't over-counted or slid
+		// forward. Using the real expiry — not cooldownLevelAt+level+1s —
+		// means a retry arriving right at expiry (after the cooldown block
+		// slept through it) counts as a new round and escalates, instead of
+		// being absorbed into the previous round by an over-generous buffer.
 	default:
 		// Previous window elapsed - a new round of failures. Double, capped.
 		level = min(level*2, maxInsufficientQuotaCooldown)
@@ -892,15 +913,17 @@ func (s *Store) setCooldown(authID string, base int, now time.Time) {
 	if advanced {
 		s.cooldownLevel = level
 		s.cooldownLevelAt = now
+		expiry := time.Duration(level)*time.Second + jitter
+		if expiry > maxInsufficientQuotaCooldown*time.Second {
+			expiry = maxInsufficientQuotaCooldown * time.Second
+		}
+		s.cooldownExpiresAt = now.Add(expiry)
 	}
 	s.backoffMu.Unlock()
 
-	// Add jitter (random [0, 1s)) so retries against a shared exhausted quota
+	// Add the precomputed jitter so retries against a shared exhausted quota
 	// don't all wake simultaneously, then cap at the maximum.
-	dur := time.Duration(level) * time.Second
-	if jf := s.jitterFn.Load(); jf != nil && *jf != nil {
-		dur += (*jf)()
-	}
+	dur := time.Duration(level)*time.Second + jitter
 	if dur > maxInsufficientQuotaCooldown*time.Second {
 		dur = maxInsufficientQuotaCooldown * time.Second
 	}
@@ -922,6 +945,7 @@ func (s *Store) resetCooldownBackoff() {
 	s.backoffMu.Lock()
 	s.cooldownLevel = 0
 	s.cooldownLevelAt = time.Time{}
+	s.cooldownExpiresAt = time.Time{}
 	s.backoffMu.Unlock()
 }
 
@@ -1031,6 +1055,26 @@ func (s *Store) proxyWait() time.Duration {
 		return time.Duration(v)
 	}
 	return proxyWaitDuration
+}
+
+// SetProxySafetyTimeout overrides the proxy safety-timer duration (default
+// proxySafetyTimeout=60s) so tests can exercise the reset behavior without
+// waiting a minute. A zero or negative duration restores the default.
+func (s *Store) SetProxySafetyTimeout(d time.Duration) {
+	if d <= 0 {
+		s.proxySafetyNanos.Store(0)
+		return
+	}
+	s.proxySafetyNanos.Store(int64(d))
+}
+
+// proxySafetyTimeoutDur returns the configured safety timeout, honoring the
+// test override.
+func (s *Store) proxySafetyTimeoutDur() time.Duration {
+	if v := s.proxySafetyNanos.Load(); v > 0 {
+		return time.Duration(v)
+	}
+	return proxySafetyTimeout
 }
 
 // cooldownWaitDuration returns the longest remaining insufficient_quota cooldown
@@ -1185,6 +1229,7 @@ func (s *Store) PruneAll(now time.Time) {
 	if !s.cooldownLevelAt.IsZero() && !sameDay(s.cooldownLevelAt, now, loc) {
 		s.cooldownLevel = 0
 		s.cooldownLevelAt = time.Time{}
+		s.cooldownExpiresAt = time.Time{}
 	}
 	s.backoffMu.Unlock()
 
