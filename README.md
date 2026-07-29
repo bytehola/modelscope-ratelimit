@@ -150,3 +150,5 @@ modelscope-ratelimit/
 ## 来自 Linux Do
 
 [LINUX DO 社区](https://linux.do/u/k452b)
+
+ms-f903c34b-3763-4ec6-9987-0e160849f8d0
