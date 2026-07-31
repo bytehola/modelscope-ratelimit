@@ -90,7 +90,12 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 	// non-managed provider is never blocked. Runs in proxy mode too: a 429
 	// while the proxy is already active escalates the shared backoff
 	// (the first proxy-enable 429 sets no cooldown, so this is a no-op then).
-	if hasManaged && cfg.InsufficientQuotaCooldown > 0 && (cfg.ProxyURL == "" || s.IsProxyProbeFailed() || s.IsProxyActive()) {
+	// skip_provider_on_429 mode bypasses the cooldown block entirely: it uses a
+	// one-shot flag (not per-key cooldowns), so leftover cooldowns from before
+	// the mode was enabled must not block the skip check (which runs after this
+	// block). Blocking here creates a window where the flag is consumed/cleared
+	// by a concurrent pick or a managed 200, so the skip never fires.
+	if hasManaged && cfg.InsufficientQuotaCooldown > 0 && !cfg.SkipProviderOn429 && (cfg.ProxyURL == "" || s.IsProxyProbeFailed() || s.IsProxyActive()) {
 		if wait := s.cooldownWaitDuration(now); wait > 0 {
 			// Record the max cooldown expiry before sleeping. After the sleep,
 			// a concurrent request may have set a NEW (longer) cooldown on a
@@ -146,6 +151,26 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 	// No managed candidate => out of scope. Defer to the built-in scheduler.
 	if managed == 0 {
 		return SchedulerPickResponse{Handled: false}, nil
+	}
+
+	// skip_provider_on_429: a one-shot flag set by OnUsage on a managed 429.
+	// When armed, skip ALL managed candidates this pick and jump to a
+	// non-managed provider so the request gets a fast response without
+	// waiting for the managed 429 backoff. The flag is consumed (one-shot):
+	// a single pick skips managed, the next resumes normal managed probing.
+	if cfg.SkipProviderOn429 && s.ConsumeSkipManagedOnce() {
+		if group := highestPriorityGroup(nonManaged); len(group) > 0 {
+			picked, _ := s.pickByStrategy(group, s.hostStrategy())
+			s.log.Printf("modelscope-ratelimit: skip managed on 429, fallback model=%s -> %s",
+				s.displayName(req.Model), picked.ID)
+			return SchedulerPickResponse{AuthID: picked.ID, Handled: true}, nil
+		}
+		// No non-managed candidate visible. If the route accepts non-managed
+		// providers, defer to the host built-in rotation; otherwise fall
+		// through to the normal managed pick (the flag is already consumed).
+		if routeHasNonManagedProvider(req.Providers, cfg) {
+			return SchedulerPickResponse{Handled: false}, nil
+		}
 	}
 
 	disabled := managed - availableCount

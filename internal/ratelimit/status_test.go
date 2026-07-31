@@ -60,8 +60,8 @@ func TestOverviewCountsHTMLAndLogs(t *testing.T) {
 	}
 
 	// k1 global, k2 model-only.
-	s.ApplyRateLimit("k1", "Qwen-72B", totalExhaustedHdr(), now)
-	s.ApplyRateLimit("k2", "Qwen-72B", modelExhaustedHdr(), now)
+	s.ApplyRateLimit("k1", "Qwen-72B", totalExhaustedHdr(), 0, "", now)
+	s.ApplyRateLimit("k2", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
 
 	total, disabled, available := s.Overview(now)
 	if total != 3 || disabled != 2 || available != 1 {
@@ -126,8 +126,8 @@ func TestRenderStatusHTMLFull(t *testing.T) {
 	s, _, _ := newRecordingStore(now)
 
 	// Two disabled keys among the resolved set.
-	s.ApplyRateLimit("k1", "Qwen-72B", totalExhaustedHdr(), now)
-	s.ApplyRateLimit("k2", "Qwen-72B", modelExhaustedHdr(), now)
+	s.ApplyRateLimit("k1", "Qwen-72B", totalExhaustedHdr(), 0, "", now)
+	s.ApplyRateLimit("k2", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
 
 	// Server-side resolution supplies masked keys and a real total of 10.
 	masked := map[string]string{"k1": "\u2026AAAAAAAA", "k2": "\u2026BBBBBBBB"}
@@ -184,11 +184,11 @@ func TestScheduleLogShowsModelRemaining(t *testing.T) {
 	}
 
 	// k2 still has 100 model requests left (active, recorded, not disabled).
-	s.ApplyRateLimit("k2", "Qwen-72B", modelRemHdr(100, 500), now)
+	s.ApplyRateLimit("k2", "Qwen-72B", modelRemHdr(100, 500), 0, "", now)
 	// k3 still has 40 model requests left.
-	s.ApplyRateLimit("k3", "Qwen-72B", modelRemHdr(40, 500), now)
+	s.ApplyRateLimit("k3", "Qwen-72B", modelRemHdr(40, 500), 0, "", now)
 	// k1 exhausts the model quota -> disabled. The disable log is now concise.
-	s.ApplyRateLimit("k1", "Qwen-72B", modelExhaustedHdr(), now)
+	s.ApplyRateLimit("k1", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
 	log.Lines() // drain disables
 
 	// A pick with k1 disabled emits a schedule summary reporting the remaining
@@ -219,7 +219,7 @@ func TestDedupModelsByNameMergesAliasAndUpstream(t *testing.T) {
 		Model: "Tencent-Hunyuan/Hy3", Alias: "hy3",
 		ResponseHeaders: modelExhaustedHdr(),
 	})
-	s.ApplyRateLimit("k1", "Tencent-Hunyuan/Hy3", modelExhaustedHdr(), now)
+	s.ApplyRateLimit("k1", "Tencent-Hunyuan/Hy3", modelExhaustedHdr(), 0, "", now)
 
 	snap := s.Snapshot(now)
 	kv := snap["k1"]
@@ -263,7 +263,7 @@ func TestDedupModelsByNamePrefersLatestObservation(t *testing.T) {
 
 	// Later: same display name, fresh quota observed under the upstream name.
 	*cur = now
-	s.ApplyRateLimit("k1", "MiniMax/MiniMax-M3", modelRemHdr(100, 500), now)
+	s.ApplyRateLimit("k1", "MiniMax/MiniMax-M3", modelRemHdr(100, 500), 0, "", now)
 
 	snap := s.Snapshot(now)
 	merged := dedupModelsByName(snap["k1"].Models)
@@ -289,11 +289,11 @@ func TestKeyDetailStatusAndColumnOrder(t *testing.T) {
 	s, _, _ := newRecordingStore(now)
 
 	// k1: active, observed remaining (100 model / 500 total) — must be 正常.
-	s.ApplyRateLimit("k1", "Qwen-72B", modelRemHdr(100, 500), now)
+	s.ApplyRateLimit("k1", "Qwen-72B", modelRemHdr(100, 500), 0, "", now)
 	// k2: model-exhausted — 模型禁用.
-	s.ApplyRateLimit("k2", "Qwen-72B", modelExhaustedHdr(), now)
+	s.ApplyRateLimit("k2", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
 	// k3: total-exhausted — 全局禁用.
-	s.ApplyRateLimit("k3", "Qwen-72B", totalExhaustedHdr(), now)
+	s.ApplyRateLimit("k3", "Qwen-72B", totalExhaustedHdr(), 0, "", now)
 
 	masked := map[string]string{"k1": "k1tail0000001", "k2": "k2tail0000002", "k3": "k3tail0000003"}
 	html := s.RenderStatusHTMLFull(now, s.config(), masked, 3)
@@ -412,10 +412,10 @@ func TestKeyDetailSortOrder(t *testing.T) {
 	}
 	// k1 normal rem 100, k2 normal rem 50, k3 unobserved (no data),
 	// k4 model-disabled, k5 global-disabled.
-	s.ApplyRateLimit("k1", "Qwen-72B", modelRemHdr(100, 500), now)
-	s.ApplyRateLimit("k2", "Qwen-72B", modelRemHdr(50, 500), now)
-	s.ApplyRateLimit("k4", "Qwen-72B", modelExhaustedHdr(), now)
-	s.ApplyRateLimit("k5", "Qwen-72B", totalExhaustedHdr(), now)
+	s.ApplyRateLimit("k1", "Qwen-72B", modelRemHdr(100, 500), 0, "", now)
+	s.ApplyRateLimit("k2", "Qwen-72B", modelRemHdr(50, 500), 0, "", now)
+	s.ApplyRateLimit("k4", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
+	s.ApplyRateLimit("k5", "Qwen-72B", totalExhaustedHdr(), 0, "", now)
 
 	masked := map[string]string{"k1": "k1tail", "k2": "k2tail", "k3": "k3tail", "k4": "k4tail", "k5": "k5tail"}
 	html := s.RenderStatusHTMLFull(now, s.config(), masked, 5)
@@ -532,7 +532,7 @@ func TestGeneratePreview(t *testing.T) {
 		"Modelscope-Ratelimit-Model-Requests-Limit":     {"50"},
 		"Modelscope-Ratelimit-Requests-Remaining":       {"1846"},
 		"Modelscope-Ratelimit-Requests-Limit":           {"2000"},
-	}, now)
+	}, 0, "", now)
 	s.OnUsage(UsageRecord{AuthID: "openai-compatibility:modelscope:bbb444555666", Provider: "openai-compatible-modelscope", Model: "glm-5.2", Alias: "glm-5.2", Failed: false, ResponseHeaders: map[string][]string{
 		"Modelscope-Ratelimit-Model-Requests-Remaining": {"0"},
 		"Modelscope-Ratelimit-Model-Requests-Limit":     {"50"},
@@ -551,7 +551,7 @@ func TestGeneratePreview(t *testing.T) {
 	s.ApplyRateLimit("openai-compatibility:modelscope:ccc777888999", "glm-5.2", map[string][]string{
 		"Modelscope-Ratelimit-Requests-Remaining": {"0"},
 		"Modelscope-Ratelimit-Requests-Limit":     {"1000"},
-	}, now)
+	}, 0, "", now)
 	for i := 0; i < 3; i++ {
 		s.OnUsage(UsageRecord{AuthID: "openai-compatibility:modelscope:ccc777888999", Provider: "openai-compatible-modelscope", Model: "glm-5.2", Alias: "glm-5.2", Failed: false})
 	}
@@ -585,7 +585,7 @@ func TestGeneratePreview(t *testing.T) {
 		"Modelscope-Ratelimit-Model-Requests-Limit":     {"50"},
 		"Modelscope-Ratelimit-Requests-Remaining":       {"1815"},
 		"Modelscope-Ratelimit-Requests-Limit":           {"2000"},
-	}, now)
+	}, 0, "", now)
 	for i := 0; i < 5; i++ {
 		s.OnUsage(UsageRecord{AuthID: "openai-compatibility:modelscope-my:ggg999000111", Provider: "openai-compatible-modelscope-my", Model: "glm-5.2", Alias: "glm-5.2", Failed: false, ResponseHeaders: map[string][]string{
 			"Modelscope-Ratelimit-Model-Requests-Remaining": {"0"},

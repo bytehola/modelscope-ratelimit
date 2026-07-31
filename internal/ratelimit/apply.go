@@ -47,7 +47,7 @@ func lookupHeader(headers map[string][]string, name string) []string {
 //   - No rate-limit headers present  => not a Modelscope response, no-op.
 //   - Total remaining exhausted      => global disable (all models).
 //   - Model remaining exhausted      => per-model disable only.
-func (s *Store) ApplyRateLimit(authID, model string, headers map[string][]string, now time.Time) {
+func (s *Store) ApplyRateLimit(authID, model string, headers map[string][]string, statusCode int, body string, now time.Time) {
 	if authID == "" {
 		// Without an auth id we cannot attribute the disable; the usage hook
 		// (which always carries AuthID) will catch it.
@@ -74,13 +74,20 @@ func (s *Store) ApplyRateLimit(authID, model string, headers map[string][]string
 		modelRem, modelOK, modelLim, modelLimOK,
 		totalRem, totalOK, totalLim, totalLimOK)
 	// Global exhaustion takes precedence and covers every model.
-	if totalOK && totalRem <= cfg.DisableThreshold {
-		s.disableGlobal(authID, model, now)
-		return
-	}
-	if modelOK && modelRem <= cfg.DisableThreshold {
-		s.disableModel(authID, model, now)
-		return
+	// skip_provider_on_429 mode bypasses the daily disable ONLY for
+	// insufficient_quota 429s (pool-level rate window — the key recovers
+	// when the window slides). Other 429s (exceeded-today, limit_burst_rate)
+	// still get the daily disable (the key is genuinely exhausted for the
+	// day).
+	if !cfg.SkipProviderOn429 || !isInsufficientQuota(statusCode, body) {
+		if totalOK && totalRem <= cfg.DisableThreshold {
+			s.disableGlobal(authID, model, now)
+			return
+		}
+		if modelOK && modelRem <= cfg.DisableThreshold {
+			s.disableModel(authID, model, now)
+			return
+		}
 	}
 	// No disable triggered: remaining is above threshold. The backoff reset
 	// is NOT done here — a 429+insufficient_quota response can still carry
@@ -126,12 +133,12 @@ func (s *Store) ApplyInsufficientQuotaCooldown(authID, model string, statusCode 
 // observes; it never rewrites Modelscope responses).
 func (s *Store) OnResponse(req ResponseInterceptRequest) ResponseInterceptResponse {
 	authID := AuthIDFromMetadata(req.Metadata)
-	s.ApplyRateLimit(authID, req.Model, req.ResponseHeaders, s.now())
+	s.ApplyRateLimit(authID, req.Model, req.ResponseHeaders, req.StatusCode, req.Body, s.now())
 	// Skip insufficient_quota cooldown when proxy mode is active (proxy_url
 	// configured and probe not failed) — the proxy trigger handles 429s
 	// instead, and a cooldown here would conflict with the 2s proxy wait.
 	cfg := s.config()
-	if !(cfg.ProxyURL != "" && !s.IsProxyProbeFailed()) {
+	if !(cfg.ProxyURL != "" && !s.IsProxyProbeFailed()) && !cfg.SkipProviderOn429 {
 		s.ApplyInsufficientQuotaCooldown(authID, req.Model, req.StatusCode, req.Body, s.now())
 	}
 	return ResponseInterceptResponse{}
@@ -143,7 +150,7 @@ func (s *Store) OnResponse(req ResponseInterceptRequest) ResponseInterceptRespon
 func (s *Store) OnStreamChunk(req StreamChunkInterceptRequest) StreamChunkInterceptResponse {
 	if req.ChunkIndex == -1 {
 		authID := AuthIDFromMetadata(req.Metadata)
-		s.ApplyRateLimit(authID, req.Model, req.ResponseHeaders, s.now())
+		s.ApplyRateLimit(authID, req.Model, req.ResponseHeaders, 0, "", s.now())
 	}
 	return StreamChunkInterceptResponse{}
 }
@@ -177,7 +184,16 @@ func (s *Store) OnUsage(rec UsageRecord) {
 		model = rec.Model
 	}
 	now := s.now()
-	s.ApplyRateLimit(rec.AuthID, model, rec.ResponseHeaders, now)
+	// Extract status/body for ApplyRateLimit's skip_provider_on_429 gate:
+	// only insufficient_quota 429s skip the daily disable; other 429s
+	// (exceeded-today, limit_burst_rate) still get daily-disabled.
+	var statusCode int
+	var body string
+	if rec.Failed && rec.Failure != nil {
+		statusCode = rec.Failure.StatusCode
+		body = rec.Failure.Body
+	}
+	s.ApplyRateLimit(rec.AuthID, model, rec.ResponseHeaders, statusCode, body, now)
 	cfg := s.config()
 	// A successful (non-failed) response from a managed provider means the
 	// shared upstream quota recovered; reset the exponential backoff so the
@@ -195,6 +211,10 @@ func (s *Store) OnUsage(rec UsageRecord) {
 		// succeeded, so the proxy is no longer needed.
 		s.HandleProxyOnSuccess()
 	}
+	// Clear the one-shot skip-managed flag: a managed 200 means the provider
+	// recovered, so the next pick should try managed again (not skip it).
+	s.skipManagedOnce.Store(false)
+
 	// 429 responses take the executor's error path (the host returns early and
 	// never calls the response interceptor), so OnUsage is the authoritative
 	// path for detecting 429s. The usage hook fires for EVERY provider (the
@@ -211,6 +231,18 @@ func (s *Store) OnUsage(rec UsageRecord) {
 			if rec.Failure.StatusCode == 401 {
 				s.recordSeen([]string{rec.AuthID})
 				s.disableUnauthorized(rec.AuthID, now)
+				return
+			}
+			// skip_provider_on_429 mode: on any 429 from a managed provider,
+			// arm the one-shot flag so the next SchedulerPick jumps straight to
+			// a non-managed provider. No cooldown, no proxy, no daily disable.
+			// Only insufficient_quota 429s trigger the skip (pool-level rate
+			// window). Other 429s (exceeded-today, limit_burst_rate) fall
+			// through to normal daily-disable + cooldown handling.
+			if cfg.SkipProviderOn429 && isInsufficientQuota(rec.Failure.StatusCode, rec.Failure.Body) {
+				s.recordSeen([]string{rec.AuthID})
+				s.SetSkipManagedOnce()
+				s.log.Printf("modelscope-ratelimit: managed 429, skip to next provider model=%s", s.displayName(model))
 				return
 			}
 			// Proxy mode: on 429+insufficient_quota from a managed provider.

@@ -168,12 +168,14 @@ func (s *Store) ConsumeProxyTrigger(model string, now time.Time) bool {
 		// resetting the backoff each cycle.
 		s.proxyMu.Lock()
 		if s.proxyTimer != nil {
-			s.proxyTimer.Reset(s.proxySafetyTimeoutDur())
-		} else {
-			s.proxyTimer = time.AfterFunc(s.proxySafetyTimeoutDur(), func() {
-				s.disableProxy("safety timeout")
-			})
+			s.proxyTimer.Stop()
 		}
+		gen := s.proxyGeneration.Add(1)
+		s.proxyTimer = time.AfterFunc(s.proxySafetyTimeoutDur(), func() {
+			if s.proxyGeneration.Load() == gen {
+				s.disableProxy("safety timeout")
+			}
+		})
 		s.proxyMu.Unlock()
 		return true
 	}
@@ -279,8 +281,11 @@ func (s *Store) reenableProxy(model string, now time.Time) bool {
 	if s.proxyTimer != nil {
 		s.proxyTimer.Stop()
 	}
+	gen := s.proxyGeneration.Add(1)
 	s.proxyTimer = time.AfterFunc(s.proxySafetyTimeoutDur(), func() {
-		s.disableProxy("safety timeout")
+		if s.proxyGeneration.Load() == gen {
+			s.disableProxy("safety timeout")
+		}
 	})
 
 	s.log.Printf("modelscope-ratelimit: proxy enabled model=%s", s.displayName(model))

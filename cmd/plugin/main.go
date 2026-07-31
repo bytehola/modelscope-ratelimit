@@ -659,7 +659,7 @@ func pluginRegistration() any {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             "modelscope-ratelimit",
-			Version:          "1.4.2",
+			Version:          "1.5.0",
 			Author:           "k452b",
 			GitHubRepository: "https://github.com/bytehola/modelscope-ratelimit",
 			ConfigFields: []pluginapi.ConfigField{
@@ -669,6 +669,7 @@ func pluginRegistration() any {
 				{Name: "credential_strategy", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"round-robin", "fill-first"}, Description: "凭据选择策略（仅对监控的 provider 生效）：round-robin=轮询（默认），fill-first=填充优先"},
 				{Name: "insufficient_quota_cooldown", Type: pluginapi.ConfigFieldTypeInteger, Description: "冷却基准秒数，默认 10。连续失败指数退避×2递增，封顶 60 秒。"},
 				{Name: "proxy_url", Type: pluginapi.ConfigFieldTypeString, Description: "代理 URL（选填，留空=不启用）。只有在 429 时才会开启，成功后关闭。格式：socks5://user:pass@host:port"},
+				{Name: "skip_provider_on_429", Type: pluginapi.ConfigFieldTypeBoolean, Description: "开启后，托管 provider 一旦 429，下一次调度直接跳到非托管 provider（一次性，不等冷却）。默认 false。"},
 				{Name: "timezone", Type: pluginapi.ConfigFieldTypeString, Description: "每日 00:00 重置所用时区，默认 Asia/Shanghai。（留空即可）"},
 				{Name: "model_remaining_header", Type: pluginapi.ConfigFieldTypeString, Description: "单模型剩余次数响应头名。（留空即可）"},
 				{Name: "total_remaining_header", Type: pluginapi.ConfigFieldTypeString, Description: "总剩余次数响应头名。（留空即可）"},

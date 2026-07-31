@@ -163,6 +163,16 @@ type Store struct {
 	// proxySafetyNanos overrides proxySafetyTimeout for tests (so the
 	// safety-timer reset can be exercised without waiting 60s). 0 = default.
 	proxySafetyNanos atomic.Int64
+	// proxyGeneration is a monotonic counter incremented each time the safety
+	// timer is (re)armed. The timer callback captures the generation it was
+	// created with and only calls disableProxy if it matches the current
+	// value — a stale callback from a superseded timer is silently dropped.
+	proxyGeneration atomic.Int64
+	// skipManagedOnce is the one-shot flag for skip_provider_on_429 mode: set
+	// by OnUsage on a managed 429, consumed (read+clear) by the next
+	// SchedulerPick, which skips managed candidates and picks a non-managed
+	// provider. One-shot: a single pick consumes it.
+	skipManagedOnce atomic.Bool
 
 	clock func() time.Time // injectable for tests; defaults to time.Now
 
@@ -489,6 +499,9 @@ func (s *Store) Reconfigure(cfg *Config) {
 	s.cooldownLevelAt = time.Time{}
 	s.cooldownExpiresAt = time.Time{}
 	s.backoffMu.Unlock()
+	// Clear the one-shot skip-managed flag: a stale flag from a previous
+	// config would make the next pick skip managed for no reason.
+	s.skipManagedOnce.Store(false)
 }
 
 // Start launches the background goroutine that prunes expired disables so the
@@ -1075,6 +1088,19 @@ func (s *Store) proxySafetyTimeoutDur() time.Duration {
 		return time.Duration(v)
 	}
 	return proxySafetyTimeout
+}
+
+// SetSkipManagedOnce arms the one-shot "skip managed provider" flag (set by
+// OnUsage on a managed 429 when skip_provider_on_429 is enabled).
+func (s *Store) SetSkipManagedOnce() {
+	s.skipManagedOnce.Store(true)
+}
+
+// ConsumeSkipManagedOnce atomically reads and clears the one-shot flag.
+// Returns true exactly once per SetSkipManagedOnce call (the pick that should
+// skip managed). Used by SchedulerPick.
+func (s *Store) ConsumeSkipManagedOnce() bool {
+	return s.skipManagedOnce.CompareAndSwap(true, false)
 }
 
 // cooldownWaitDuration returns the longest remaining insufficient_quota cooldown

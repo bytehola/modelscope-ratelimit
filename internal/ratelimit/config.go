@@ -57,6 +57,13 @@ type Config struct {
 	// as "socks5://user:pass@host:port" or "http://host:port".
 	ProxyURL string `json:"proxy_url" yaml:"proxy_url"`
 
+	// SkipProviderOn429 activates "skip-provider-on-429" mode: on any 429 from
+	// a managed provider, the next scheduler pick jumps straight to a
+	// non-managed provider (one-shot, no cooldown, no proxy, no daily
+	// disable), so the request gets a fast response instead of waiting for
+	// the managed 429 backoff. Default false.
+	SkipProviderOn429 bool `json:"skip_provider_on_429" yaml:"skip_provider_on_429"`
+
 	// ManagedModels, if non-empty, restricts monitoring to these model names.
 	// Empty means monitor every model served by the configured providers.
 	ManagedModels []string `json:"managed_models" yaml:"managed_models"`
@@ -222,6 +229,9 @@ func ConfigFromMap(raw map[string]any) (*Config, error) {
 	}
 	if v, ok := raw["proxy_url"].(string); ok {
 		cfg.ProxyURL = strings.TrimSpace(v)
+	}
+	if v, ok := raw["skip_provider_on_429"].(bool); ok {
+		cfg.SkipProviderOn429 = v
 	}
 	return cfg, nil
 }
