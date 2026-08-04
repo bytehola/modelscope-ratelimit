@@ -168,14 +168,15 @@ type Store struct {
 	// created with and only calls disableProxy if it matches the current
 	// value — a stale callback from a superseded timer is silently dropped.
 	proxyGeneration atomic.Int64
-	// skipManaged is the latching flag for skip_provider_on_429 mode: set by
-	// OnUsage on a managed insufficient_quota 429, read (not consumed) by every
-	// SchedulerPick. While true, all managed candidates are skipped in favour
-	// of non-managed providers. Cleared by ANY 200 response (so the next request
-	// probes the free managed quota again). Latching: the flag persists across
-	// non-managed failures, preventing the managed↔non-managed interleaving
-	// that a one-shot flag caused.
-	skipManaged atomic.Bool
+	// skipProviders is the per-provider latching skip set for
+	// skip_provider_on_429 mode. OnUsage adds a provider name when it returns
+	// 429+insufficient_quota; SchedulerPick filters out candidates from
+	// providers in this set. Per-provider granularity: only the provider that
+	// 429'd is skipped, other managed providers remain available. Cleared by
+	// ANY 200 (so the next request probes the free managed quota again) or
+	// when all managed candidates are tried (managed==0).
+	skipMu        sync.RWMutex
+	skipProviders map[string]struct{}
 
 	clock func() time.Time // injectable for tests; defaults to time.Now
 
@@ -502,9 +503,9 @@ func (s *Store) Reconfigure(cfg *Config) {
 	s.cooldownLevelAt = time.Time{}
 	s.cooldownExpiresAt = time.Time{}
 	s.backoffMu.Unlock()
-	// Clear the skip-managed flag: a stale flag from a previous config would
-	// make the next pick skip managed for no reason.
-	s.skipManaged.Store(false)
+	// Clear the per-provider skip set: stale entries from a previous config
+	// would make the next pick skip managed providers for no reason.
+	s.ClearAllSkippedProviders()
 }
 
 // Start launches the background goroutine that prunes expired disables so the
@@ -1093,26 +1094,50 @@ func (s *Store) proxySafetyTimeoutDur() time.Duration {
 	return proxySafetyTimeout
 }
 
-// SetSkipManaged arms the latching "skip managed provider" flag (set by
-// OnUsage on a managed insufficient_quota 429 when skip_provider_on_429 is
-// enabled). The flag stays armed until cleared by any 200 response.
-func (s *Store) SetSkipManaged() {
-	s.skipManaged.Store(true)
+// SetSkipProvider adds a managed provider to the per-provider skip set
+// (called by OnUsage on a managed insufficient_quota 429 when
+// skip_provider_on_429 is enabled). The provider stays in the set until
+// cleared by any 200 or when all managed candidates are tried.
+func (s *Store) SetSkipProvider(provider string) {
+	if provider == "" {
+		return
+	}
+	s.skipMu.Lock()
+	defer s.skipMu.Unlock()
+	if s.skipProviders == nil {
+		s.skipProviders = make(map[string]struct{})
+	}
+	s.skipProviders[provider] = struct{}{}
 }
 
-// IsSkipManaged reports whether the latching skip-managed flag is armed.
-// Unlike a one-shot flag, this does NOT clear the flag — it stays armed
-// across multiple picks so non-managed providers are tried consecutively
-// without interleaving back to managed. Cleared by any 200 (OnUsage).
-func (s *Store) IsSkipManaged() bool {
-	return s.skipManaged.Load()
+// IsProviderSkipped reports whether the given provider is in the skip set.
+// Read-only: does NOT remove the entry. Called by SchedulerPick for each
+// managed candidate to filter out providers that recently returned
+// 429+insufficient_quota.
+func (s *Store) IsProviderSkipped(provider string) bool {
+	if provider == "" {
+		return false
+	}
+	s.skipMu.RLock()
+	defer s.skipMu.RUnlock()
+	_, ok := s.skipProviders[provider]
+	return ok
 }
 
-// ClearSkipManaged clears the latching skip-managed flag. Called by OnUsage
-// on any 200 response so the next request probes the managed (free) quota
-// again.
-func (s *Store) ClearSkipManaged() {
-	s.skipManaged.Store(false)
+// HasSkippedProviders reports whether the skip set is non-empty.
+func (s *Store) HasSkippedProviders() bool {
+	s.skipMu.RLock()
+	defer s.skipMu.RUnlock()
+	return len(s.skipProviders) > 0
+}
+
+// ClearAllSkippedProviders empties the per-provider skip set. Called by
+// OnUsage on any 200 response (so the next request probes the free managed
+// quota again) or by SchedulerPick when all managed candidates are tried.
+func (s *Store) ClearAllSkippedProviders() {
+	s.skipMu.Lock()
+	defer s.skipMu.Unlock()
+	s.skipProviders = make(map[string]struct{})
 }
 
 // cooldownWaitDuration returns the longest remaining insufficient_quota cooldown

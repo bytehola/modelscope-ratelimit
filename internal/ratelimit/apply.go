@@ -211,12 +211,12 @@ func (s *Store) OnUsage(rec UsageRecord) {
 		// succeeded, so the proxy is no longer needed.
 		s.HandleProxyOnSuccess()
 	}
-	// Clear the latching skip-managed flag on ANY 200 (managed or non-managed)
-	// so the next request probes the free managed quota again. This is the
+	// Clear the per-provider skip set on ANY 200 (managed or non-managed) so
+	// the next request probes the free managed quota again. This is the
 	// "prioritise free quota" strategy: every new request tries managed first,
 	// and only on a 429+insufficient_quota does it skip to non-managed.
 	if !rec.Failed {
-		s.ClearSkipManaged()
+		s.ClearAllSkippedProviders()
 	}
 
 	// 429 responses take the executor's error path (the host returns early and
@@ -238,17 +238,19 @@ func (s *Store) OnUsage(rec UsageRecord) {
 				return
 			}
 			// skip_provider_on_429 mode: on an insufficient_quota 429 from a
-			// managed provider, arm the latching flag so every subsequent
-			// SchedulerPick skips managed and picks non-managed. The flag is
-			// latching (not consumed): it stays armed across non-managed
-			// failures so all non-managed keys are tried consecutively before
-			// falling back to managed. Cleared by any 200 (OnUsage). Other 429
-			// types (exceeded-today, limit_burst_rate) fall through to normal
+			// managed provider, add it to the per-provider skip set so
+			// subsequent SchedulerPick calls filter out its candidates. Only
+			// the provider that 429'd is skipped; other managed providers
+			// remain available. Latching: the entry persists across
+			// non-managed failures and is cleared by any 200 (OnUsage) or
+			// when all managed candidates are tried. Other 429 types
+			// (exceeded-today, limit_burst_rate) fall through to normal
 			// daily-disable + cooldown handling.
 			if cfg.SkipProviderOn429 && isInsufficientQuota(rec.Failure.StatusCode, rec.Failure.Body) {
 				s.recordSeen([]string{rec.AuthID})
-				s.SetSkipManaged()
-				s.log.Printf("modelscope-ratelimit: managed 429, skip to next provider model=%s", s.displayName(model))
+				providerName := extractProviderName(rec.Provider)
+				s.SetSkipProvider(providerName)
+				s.log.Printf("modelscope-ratelimit: managed 429, skip provider %s model=%s", providerName, s.displayName(model))
 				return
 			}
 			// Proxy mode: on 429+insufficient_quota from a managed provider.

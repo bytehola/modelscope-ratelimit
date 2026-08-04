@@ -142,6 +142,12 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 		if s.isDisabled(c.ID, req.Model, now) {
 			continue
 		}
+		// skip_provider_on_429: filter out candidates from providers that
+		// recently returned 429+insufficient_quota. Per-provider: only the
+		// provider that 429'd is skipped, other managed providers remain.
+		if cfg.SkipProviderOn429 && s.IsProviderSkipped(extractProviderName(c.Provider)) {
+			continue
+		}
 		idx := cfg.ProviderIndex(c.Provider)
 		availableByProvider[idx] = append(availableByProvider[idx], c)
 		availableCount++
@@ -151,49 +157,22 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 	// No managed candidate => out of scope. Defer to the built-in scheduler.
 	if managed == 0 {
 		// All managed candidates are tried/unavailable for this managed
-		// model. If the skip flag is still armed (no 200 cleared it), clear
-		// it so the next request starts fresh — managed may have recovered.
-		// This prevents the flag from getting stuck true when every candidate
-		// (managed + non-managed) fails: the host returns an error without
-		// calling the plugin, so this is the last chance to clear.
-		if s.IsSkipManaged() {
-			s.ClearSkipManaged()
+		// model. If any provider is still in the skip set (no 200 cleared
+		// it), clear the set so the next request starts fresh — managed
+		// may have recovered. This prevents the set from getting stuck when
+		// every candidate (managed + non-managed) fails: the host returns an
+		// error without calling the plugin, so this is the last chance to
+		// clear.
+		if s.HasSkippedProviders() {
+			s.ClearAllSkippedProviders()
 		}
 		return SchedulerPickResponse{Handled: false}, nil
 	}
 
-	// skip_provider_on_429: a latching flag set by OnUsage on a managed
-	// insufficient_quota 429. While armed, skip ALL managed candidates and
-	// pick non-managed so the request gets a fast response without waiting for
-	// the managed 429 backoff. Latching: the flag is NOT consumed — it stays
-	// armed across non-managed failures so all non-managed keys are tried
-	// consecutively before falling back to managed. Cleared by any 200
-	// (OnUsage), so the next request probes the free managed quota again.
-	if cfg.SkipProviderOn429 && s.IsSkipManaged() {
-		if group := highestPriorityGroup(nonManaged); len(group) > 0 {
-			picked, _ := s.pickByStrategy(group, s.hostStrategy())
-			s.log.Printf("modelscope-ratelimit: skip managed on 429, fallback model=%s -> %s",
-				s.displayName(req.Model), picked.ID)
-			return SchedulerPickResponse{AuthID: picked.ID, Handled: true}, nil
-		}
-		// No non-managed candidate visible. If the route accepts non-managed
-		// providers, defer to the host built-in rotation so it can reach
-		// lower-priority non-managed candidates.
-		if routeHasNonManagedProvider(req.Providers, cfg) {
-			return SchedulerPickResponse{Handled: false}, nil
-		}
-		// No non-managed provider at all: insufficient_quota is pool-level,
-		// so remaining managed keys will also 429. Fail fast to avoid wasting
-		// requests, and clear the flag so the next request probes managed again.
-		s.ClearSkipManaged()
-		s.log.Printf("modelscope-ratelimit: skip managed on 429, no fallback model=%s", s.displayName(req.Model))
-		return SchedulerPickResponse{}, fmt.Errorf("%w: model=%q (insufficient_quota, no non-managed fallback)", ErrAllCredentialsDisabled, s.displayName(req.Model))
-	}
-
 	disabled := managed - availableCount
 	if availableCount == 0 {
-		// All managed candidates are disabled. Try a non-managed fallback before
-		// hard-blocking the request.
+		// All managed candidates are disabled or skipped. Try a non-managed
+		// fallback before hard-blocking the request.
 
 		// Case 1: non-managed candidates are visible. Pick among the
 		// highest-priority group using the host's own routing strategy (fetched
@@ -215,6 +194,15 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 		}
 
 		// Case 3: no non-managed provider exists at all. Fail explicitly.
+		// When skip_provider_on_429 is active and some managed providers are
+		// in the skip set, clear the set before failing so the next request
+		// probes managed again (insufficient_quota is pool-level; the rate
+		// window may have recovered).
+		if s.HasSkippedProviders() {
+			s.ClearAllSkippedProviders()
+			s.log.Printf("modelscope-ratelimit: skip managed on 429, no fallback model=%s", s.displayName(req.Model))
+			return SchedulerPickResponse{}, fmt.Errorf("%w: model=%q (insufficient_quota, no non-managed fallback)", ErrAllCredentialsDisabled, s.displayName(req.Model))
+		}
 		s.log.Printf("modelscope-ratelimit: all disabled model=%s 已限: %d/ 可用: %d / 总共: %d",
 			s.displayName(req.Model), disabled, 0, managed)
 		return SchedulerPickResponse{}, fmt.Errorf("%w: model=%q", ErrAllCredentialsDisabled, s.displayName(req.Model))
