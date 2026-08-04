@@ -211,9 +211,13 @@ func (s *Store) OnUsage(rec UsageRecord) {
 		// succeeded, so the proxy is no longer needed.
 		s.HandleProxyOnSuccess()
 	}
-	// Clear the one-shot skip-managed flag: a managed 200 means the provider
-	// recovered, so the next pick should try managed again (not skip it).
-	s.skipManagedOnce.Store(false)
+	// Clear the latching skip-managed flag on ANY 200 (managed or non-managed)
+	// so the next request probes the free managed quota again. This is the
+	// "prioritise free quota" strategy: every new request tries managed first,
+	// and only on a 429+insufficient_quota does it skip to non-managed.
+	if !rec.Failed {
+		s.ClearSkipManaged()
+	}
 
 	// 429 responses take the executor's error path (the host returns early and
 	// never calls the response interceptor), so OnUsage is the authoritative
@@ -233,15 +237,17 @@ func (s *Store) OnUsage(rec UsageRecord) {
 				s.disableUnauthorized(rec.AuthID, now)
 				return
 			}
-			// skip_provider_on_429 mode: on any 429 from a managed provider,
-			// arm the one-shot flag so the next SchedulerPick jumps straight to
-			// a non-managed provider. No cooldown, no proxy, no daily disable.
-			// Only insufficient_quota 429s trigger the skip (pool-level rate
-			// window). Other 429s (exceeded-today, limit_burst_rate) fall
-			// through to normal daily-disable + cooldown handling.
+			// skip_provider_on_429 mode: on an insufficient_quota 429 from a
+			// managed provider, arm the latching flag so every subsequent
+			// SchedulerPick skips managed and picks non-managed. The flag is
+			// latching (not consumed): it stays armed across non-managed
+			// failures so all non-managed keys are tried consecutively before
+			// falling back to managed. Cleared by any 200 (OnUsage). Other 429
+			// types (exceeded-today, limit_burst_rate) fall through to normal
+			// daily-disable + cooldown handling.
 			if cfg.SkipProviderOn429 && isInsufficientQuota(rec.Failure.StatusCode, rec.Failure.Body) {
 				s.recordSeen([]string{rec.AuthID})
-				s.SetSkipManagedOnce()
+				s.SetSkipManaged()
 				s.log.Printf("modelscope-ratelimit: managed 429, skip to next provider model=%s", s.displayName(model))
 				return
 			}

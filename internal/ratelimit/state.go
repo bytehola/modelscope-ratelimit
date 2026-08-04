@@ -168,11 +168,14 @@ type Store struct {
 	// created with and only calls disableProxy if it matches the current
 	// value — a stale callback from a superseded timer is silently dropped.
 	proxyGeneration atomic.Int64
-	// skipManagedOnce is the one-shot flag for skip_provider_on_429 mode: set
-	// by OnUsage on a managed 429, consumed (read+clear) by the next
-	// SchedulerPick, which skips managed candidates and picks a non-managed
-	// provider. One-shot: a single pick consumes it.
-	skipManagedOnce atomic.Bool
+	// skipManaged is the latching flag for skip_provider_on_429 mode: set by
+	// OnUsage on a managed insufficient_quota 429, read (not consumed) by every
+	// SchedulerPick. While true, all managed candidates are skipped in favour
+	// of non-managed providers. Cleared by ANY 200 response (so the next request
+	// probes the free managed quota again). Latching: the flag persists across
+	// non-managed failures, preventing the managed↔non-managed interleaving
+	// that a one-shot flag caused.
+	skipManaged atomic.Bool
 
 	clock func() time.Time // injectable for tests; defaults to time.Now
 
@@ -499,9 +502,9 @@ func (s *Store) Reconfigure(cfg *Config) {
 	s.cooldownLevelAt = time.Time{}
 	s.cooldownExpiresAt = time.Time{}
 	s.backoffMu.Unlock()
-	// Clear the one-shot skip-managed flag: a stale flag from a previous
-	// config would make the next pick skip managed for no reason.
-	s.skipManagedOnce.Store(false)
+	// Clear the skip-managed flag: a stale flag from a previous config would
+	// make the next pick skip managed for no reason.
+	s.skipManaged.Store(false)
 }
 
 // Start launches the background goroutine that prunes expired disables so the
@@ -1090,17 +1093,26 @@ func (s *Store) proxySafetyTimeoutDur() time.Duration {
 	return proxySafetyTimeout
 }
 
-// SetSkipManagedOnce arms the one-shot "skip managed provider" flag (set by
-// OnUsage on a managed 429 when skip_provider_on_429 is enabled).
-func (s *Store) SetSkipManagedOnce() {
-	s.skipManagedOnce.Store(true)
+// SetSkipManaged arms the latching "skip managed provider" flag (set by
+// OnUsage on a managed insufficient_quota 429 when skip_provider_on_429 is
+// enabled). The flag stays armed until cleared by any 200 response.
+func (s *Store) SetSkipManaged() {
+	s.skipManaged.Store(true)
 }
 
-// ConsumeSkipManagedOnce atomically reads and clears the one-shot flag.
-// Returns true exactly once per SetSkipManagedOnce call (the pick that should
-// skip managed). Used by SchedulerPick.
-func (s *Store) ConsumeSkipManagedOnce() bool {
-	return s.skipManagedOnce.CompareAndSwap(true, false)
+// IsSkipManaged reports whether the latching skip-managed flag is armed.
+// Unlike a one-shot flag, this does NOT clear the flag — it stays armed
+// across multiple picks so non-managed providers are tried consecutively
+// without interleaving back to managed. Cleared by any 200 (OnUsage).
+func (s *Store) IsSkipManaged() bool {
+	return s.skipManaged.Load()
+}
+
+// ClearSkipManaged clears the latching skip-managed flag. Called by OnUsage
+// on any 200 response so the next request probes the managed (free) quota
+// again.
+func (s *Store) ClearSkipManaged() {
+	s.skipManaged.Store(false)
 }
 
 // cooldownWaitDuration returns the longest remaining insufficient_quota cooldown
