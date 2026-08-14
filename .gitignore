@@ -8,3 +8,5 @@ cmd/plugin/*.h
 cmd/plugin/*.so
 cmd/plugin/modelscope-ratelimit
 preview*.html
+/plugin
+*.so.bak

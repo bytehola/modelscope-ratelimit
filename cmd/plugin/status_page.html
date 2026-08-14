@@ -1,0 +1,1952 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Modelscope 限流管理后台</title>
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      html {
+        overflow-y: scroll;
+        scrollbar-gutter: stable;
+      }
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text",
+          "Helvetica Neue", Helvetica, Arial, "PingFang SC", sans-serif;
+        background: #fbfbfd;
+        color: #1d1d1f;
+        -webkit-font-smoothing: antialiased;
+        padding: 24px 16px 56px;
+      }
+      .wrap {
+        max-width: 1040px;
+        margin: 0 auto;
+      }
+      .title {
+        font-size: 28px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        margin-bottom: 4px;
+      }
+      .sub {
+        font-size: 13px;
+        color: #86868b;
+        line-height: 1.6;
+        margin-bottom: 16px;
+      }
+      .sub b {
+        color: #1d1d1f;
+        font-weight: 600;
+      }
+      .toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-bottom: 20px;
+      }
+      .refresh-bar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 11px;
+        color: #86868b;
+      }
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 13px;
+        font-weight: 600;
+        padding: 8px 16px;
+        border-radius: 980px;
+        border: none;
+        cursor: pointer;
+        transition:
+          opacity 0.15s,
+          transform 0.1s;
+        white-space: nowrap;
+      }
+      .btn:active {
+        transform: scale(0.97);
+      }
+      .btn-primary {
+        background: #0071e3;
+        color: #fff;
+      }
+      .btn-primary:hover {
+        background: #0077ed;
+      }
+      .btn-primary:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      .btn-outline {
+        background: #fff;
+        color: #0071e3;
+        border: 1px solid #0071e3;
+      }
+      .btn-outline:hover {
+        background: #f0f7ff;
+      }
+      .btn-outline:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      @keyframes pulse {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.3;
+        }
+      }
+      .dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: #1a7f37;
+      }
+      .dot.on {
+        animation: pulse 2s ease-in-out infinite;
+      }
+      .spinner {
+        display: inline-block;
+        width: 14px;
+        height: 14px;
+        border: 2px solid #0071e3;
+        border-top-color: transparent;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+        vertical-align: -2px;
+      }
+      /* loading overlay */
+      .overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(251, 251, 253, 0.9);
+        display: none;
+        align-items: center;
+        justify-content: center;
+        z-index: 998;
+        flex-direction: column;
+        gap: 14px;
+      }
+      .overlay.show {
+        display: flex;
+      }
+      .progress-track {
+        width: 240px;
+        height: 6px;
+        background: #e8e8ed;
+        border-radius: 3px;
+        overflow: hidden;
+      }
+      .progress-fill {
+        height: 100%;
+        background: #0071e3;
+        border-radius: 3px;
+        transition: width 0.3s ease;
+        width: 0;
+      }
+      /* tabs */
+      .tabs {
+        display: flex;
+        gap: 0;
+        border-bottom: 1px solid #e8e8ed;
+        margin-bottom: 20px;
+      }
+      .tab {
+        padding: 9px 20px;
+        font-size: 14px;
+        font-weight: 600;
+        color: #86868b;
+        cursor: pointer;
+        border-bottom: 2px solid transparent;
+        transition:
+          color 0.15s,
+          border-color 0.15s;
+        user-select: none;
+      }
+      .tab:hover {
+        color: #1d1d1f;
+      }
+      .tab.active {
+        color: #0071e3;
+        border-bottom-color: #0071e3;
+      }
+      .tab-panel {
+        display: none;
+      }
+      .tab-panel.active {
+        display: block;
+      }
+      .section {
+        font-size: 17px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        margin: 24px 0 10px;
+      }
+      .section .hint {
+        font-size: 11px;
+        color: #86868b;
+        font-weight: 400;
+        margin-left: 8px;
+      }
+      .cards {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      .card {
+        background: #fff;
+        border-radius: 14px;
+        padding: 14px 16px;
+        box-shadow:
+          0 1px 3px rgba(0, 0, 0, 0.04),
+          0 6px 16px rgba(0, 0, 0, 0.03);
+        min-width: 140px;
+        flex: 1;
+      }
+      .card .k {
+        font-size: 11px;
+        color: #86868b;
+        margin-bottom: 5px;
+      }
+      .card .v {
+        font-size: 24px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        font-variant-numeric: tabular-nums;
+      }
+      .card .sub-v {
+        font-size: 10px;
+        color: #86868b;
+        margin-top: 3px;
+      }
+      .v.green {
+        color: #1a7f37;
+      }
+      .v.red {
+        color: #bf0711;
+      }
+      .v.blue {
+        color: #0066cc;
+      }
+      .v.orange {
+        color: #b25000;
+      }
+      .mcard {
+        background: #fff;
+        border-radius: 12px;
+        padding: 12px 14px;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+        min-width: 160px;
+        flex: 1;
+      }
+      .mcard .mn {
+        font-size: 11px;
+        color: #86868b;
+        margin-bottom: 5px;
+        word-break: break-all;
+      }
+      .mcard .ma {
+        font-size: 20px;
+        font-weight: 600;
+        color: #1a7f37;
+        letter-spacing: -0.01em;
+      }
+      .mcard .mk {
+        font-size: 11px;
+        color: #86868b;
+        margin-top: 3px;
+      }
+      /* table */
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        background: #fff;
+        border-radius: 14px;
+        overflow: hidden;
+        box-shadow:
+          0 1px 3px rgba(0, 0, 0, 0.04),
+          0 6px 16px rgba(0, 0, 0, 0.03);
+      }
+      th {
+        text-align: left;
+        font-size: 11px;
+        font-weight: 400;
+        color: #86868b;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        padding: 12px 14px;
+        border-bottom: 1px solid #e8e8ed;
+        background: #fafafa;
+        cursor: pointer;
+        user-select: none;
+        position: relative;
+        transition: color 0.15s;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      th:hover {
+        color: #1d1d1f;
+      }
+      th.nosort {
+        cursor: default;
+      }
+      th.nosort:hover {
+        color: #86868b;
+      }
+      td {
+        padding: 12px 14px;
+        border-bottom: 1px solid #f0f0f3;
+        font-size: 13px;
+        vertical-align: middle;
+        overflow: hidden;
+      }
+      tr:last-child td {
+        border-bottom: none;
+      }
+      tbody tr:hover td {
+        background: #f8f8fa;
+      }
+      tbody tr.expanded td {
+        background: #f0f7ff;
+      }
+      .acct-cell {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        cursor: pointer;
+        overflow: hidden;
+      }
+      .expand-arrow {
+        display: inline-block;
+        width: 8px;
+        font-size: 10px;
+        color: #86868b;
+        transition: transform 0.2s;
+        flex-shrink: 0;
+      }
+      tr.expanded .expand-arrow {
+        transform: rotate(90deg);
+      }
+      .acct-name {
+        font-size: 13px;
+        font-weight: 600;
+        flex-shrink: 0;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      .prov {
+        display: inline-block;
+        font-size: 10px;
+        font-weight: 600;
+        color: #86868b;
+        background: #f0f0f3;
+        border-radius: 980px;
+        padding: 1px 7px;
+        margin-left: 3px;
+        flex-shrink: 0;
+      }
+      .badge {
+        display: inline-block;
+        font-size: 11px;
+        font-weight: 600;
+        padding: 2px 9px;
+        border-radius: 980px;
+        white-space: nowrap;
+      }
+      .b-ok {
+        background: #e8f5e9;
+        color: #1a7f37;
+      }
+      .b-glob {
+        background: #fdecec;
+        color: #bf0711;
+      }
+      .b-frozen {
+        background: #e8eaf6;
+        color: #3949ab;
+      }
+      .b-aliyun {
+        background: #e3f2fd;
+        color: #0d47a1;
+      }
+      .when {
+        display: block;
+        font-size: 10px;
+        color: #86868b;
+        margin-top: 2px;
+      }
+      .bv {
+        font-size: 12px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+      .bv.r {
+        color: #bf0711;
+      }
+      .bv.a {
+        color: #b25000;
+      }
+      .bv.g {
+        color: #1a7f37;
+      }
+      .track {
+        height: 5px;
+        background: #f0f0f3;
+        border-radius: 980px;
+        overflow: hidden;
+        min-width: 60px;
+        margin-top: 3px;
+      }
+      .fill {
+        display: block;
+        height: 100%;
+        border-radius: 980px;
+      }
+      .fill.g {
+        background: #1a7f37;
+      }
+      .fill.a {
+        background: #b25000;
+      }
+      .fill.r {
+        background: #bf0711;
+      }
+      .tb {
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
+        min-width: 0;
+      }
+      .dash {
+        color: #86868b;
+      }
+      .cons-link {
+        color: #0071e3;
+        cursor: pointer;
+        font-weight: 600;
+        font-size: 12px;
+      }
+      .search-row {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        margin-bottom: 10px;
+      }
+      .search-input {
+        font-size: 13px;
+        padding: 6px 12px;
+        border-radius: 8px;
+        border: 1px solid #e8e8ed;
+        width: 280px;
+        outline: none;
+        transition: border-color 0.15s;
+      }
+      .search-input:focus {
+        border-color: #0071e3;
+      }
+      .search-count {
+        font-size: 11px;
+        color: #86868b;
+      }
+      /* detail */
+      .detail-row td {
+        padding: 0 !important;
+        background: #fafbfc !important;
+        border-bottom: 1px solid #f0f0f3;
+      }
+      .detail-panel {
+        padding: 12px 18px;
+      }
+      .dp-section {
+        margin-bottom: 12px;
+      }
+      .dp-section:last-child {
+        margin-bottom: 0;
+      }
+      .dp-title {
+        font-size: 10px;
+        font-weight: 600;
+        color: #86868b;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        margin-bottom: 6px;
+      }
+      .dp-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+        gap: 3px 16px;
+      }
+      .dp-item {
+        font-size: 12px;
+        display: flex;
+        align-items: baseline;
+        gap: 6px;
+      }
+      .dp-item .dk {
+        color: #86868b;
+        min-width: 68px;
+        flex-shrink: 0;
+      }
+      .dp-item .dv {
+        color: #1d1d1f;
+        font-weight: 500;
+        word-break: break-all;
+      }
+      .dp-tokens {
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+      }
+      .dp-token {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 11px;
+        padding: 5px 10px;
+        background: #fff;
+        border-radius: 8px;
+        border: 1px solid #f0f0f3;
+      }
+      .dp-token .dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        flex-shrink: 0;
+      }
+      .dp-token .dot.g {
+        background: #1a7f37;
+      }
+      .dp-token .dot.r {
+        background: #bf0711;
+      }
+      .dp-token .t-name {
+        font-weight: 600;
+        color: #424245;
+        min-width: 70px;
+      }
+      .dp-token .t-val {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 10.5px;
+        color: #86868b;
+      }
+      .dp-token .t-meta {
+        font-size: 10px;
+        color: #86868b;
+        margin-left: auto;
+      }
+      /* checkin */
+      .checkin-grid {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      .ci-card {
+        background: #fff;
+        border-radius: 10px;
+        padding: 9px 13px;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+        min-width: 150px;
+        flex: 1;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        border: 1px solid transparent;
+        cursor: pointer;
+        transition: border-color 0.2s;
+      }
+      .ci-card.signed {
+        border-color: #c6e8c5;
+      }
+      .ci-card.unsigned {
+        border-color: #f5cdc8;
+      }
+      .ci-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        flex-shrink: 0;
+      }
+      .ci-dot.ok {
+        background: #1a7f37;
+      }
+      .ci-dot.no {
+        background: #bf0711;
+      }
+      .ci-body {
+        min-width: 0;
+        flex: 1;
+      }
+      .ci-name {
+        font-size: 12px;
+        font-weight: 600;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .ci-status {
+        font-size: 10px;
+        color: #86868b;
+        margin-top: 1px;
+      }
+      /* transactions */
+      .tx-toolbar {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+        margin-bottom: 12px;
+      }
+      .tx-filters {
+        display: flex;
+        gap: 4px;
+      }
+      .tx-filter {
+        font-size: 12px;
+        font-weight: 600;
+        padding: 5px 14px;
+        border-radius: 980px;
+        border: 1px solid #e8e8ed;
+        background: #fff;
+        color: #86868b;
+        cursor: pointer;
+        transition: all 0.15s;
+      }
+      .tx-filter:hover {
+        border-color: #0071e3;
+        color: #0071e3;
+      }
+      .tx-filter.active {
+        background: #0071e3;
+        border-color: #0071e3;
+        color: #fff;
+      }
+      .balance-bar {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        margin-bottom: 12px;
+        padding: 12px 16px;
+        background: #fff;
+        border-radius: 14px;
+        box-shadow:
+          0 1px 3px rgba(0, 0, 0, 0.04),
+          0 6px 16px rgba(0, 0, 0, 0.03);
+      }
+      .balance-bar .label {
+        font-size: 12px;
+        color: #86868b;
+      }
+      .balance-bar .value {
+        font-size: 22px;
+        font-weight: 700;
+        color: #1a7f37;
+        font-variant-numeric: tabular-nums;
+      }
+      .tx-pagination {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-top: 14px;
+        font-size: 12px;
+        color: #86868b;
+      }
+      .tx-page-btn {
+        font-size: 12px;
+        padding: 5px 14px;
+        border-radius: 8px;
+        border: 1px solid #e8e8ed;
+        background: #fff;
+        color: #1d1d1f;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      .tx-page-btn:hover:not(:disabled) {
+        border-color: #0071e3;
+        color: #0071e3;
+      }
+      .tx-page-btn:disabled {
+        opacity: 0.4;
+        cursor: default;
+      }
+      .type-badge {
+        font-size: 10px;
+        font-weight: 600;
+        padding: 2px 8px;
+        border-radius: 980px;
+        white-space: nowrap;
+      }
+      .tb-earn {
+        background: #e8f5e9;
+        color: #1a7f37;
+      }
+      .tb-spend {
+        background: #fff4e0;
+        color: #b25000;
+      }
+      .tb-expire {
+        background: #f0f0f3;
+        color: #86868b;
+      }
+      .tier-badge {
+        font-size: 10px;
+        font-weight: 600;
+        padding: 1px 7px;
+        border-radius: 980px;
+      }
+      .tier-lite {
+        background: #e8f5e9;
+        color: #1a7f37;
+      }
+      .tier-standard {
+        background: #e3f2fd;
+        color: #0d47a1;
+      }
+      .tier-ultra {
+        background: #fff4e0;
+        color: #b25000;
+      }
+      .tx-amount {
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+      }
+      .tx-amount.earn {
+        color: #1a7f37;
+      }
+      .tx-amount.spend {
+        color: #b25000;
+      }
+      .tx-amount.expire {
+        color: #86868b;
+        text-decoration: line-through;
+      }
+      /* toast */
+      .toast {
+        position: fixed;
+        bottom: 24px;
+        left: 50%;
+        transform: translateX(-50%) translateY(20px);
+        background: #1d1d1f;
+        color: #fff;
+        font-size: 12px;
+        padding: 9px 18px;
+        border-radius: 980px;
+        box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+        opacity: 0;
+        pointer-events: none;
+        transition:
+          opacity 0.25s,
+          transform 0.25s;
+        z-index: 999;
+      }
+      .toast.show {
+        opacity: 1;
+        transform: translateX(-50%) translateY(0);
+      }
+      @media (max-width: 700px) {
+        .wrap {
+          padding: 0 4px;
+        }
+        .cards .card,
+        .checkin-grid .ci-card {
+          min-width: calc(50% - 4px);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="overlay" id="overlay">
+      <div class="progress-track">
+        <div class="progress-fill" id="progress-fill"></div>
+      </div>
+      <span id="progress-text" style="font-size: 12px; color: #86868b"
+        >加载中</span
+      >
+    </div>
+    <div class="wrap">
+      <div class="title">Modelscope 限流管理后台</div>
+      <div class="sub" id="subtitle">
+        <span class="spinner"></span> 连接服务器中
+      </div>
+      <div class="toolbar">
+        <div class="refresh-bar">
+          <span class="dot on" id="ping"></span
+          ><span id="ping-text">连接中</span>
+        </div>
+        <button
+          class="btn btn-primary"
+          id="toolbar-btn"
+          onclick="toolbarAction()"
+          disabled
+        >
+          一键签到
+        </button>
+      </div>
+      <div class="tabs">
+        <div
+          class="tab active"
+          data-tab="overview"
+          onclick="switchTab('overview')"
+        >
+          总览
+        </div>
+        <div class="tab" data-tab="accounts" onclick="switchTab('accounts')">
+          账号管理
+        </div>
+        <div
+          class="tab"
+          data-tab="transactions"
+          onclick="switchTab('transactions')"
+        >
+          魔粒记录
+        </div>
+        <div class="tab" data-tab="checkin" onclick="switchTab('checkin')">
+          每日签到
+        </div>
+      </div>
+
+      <div class="tab-panel active" data-tab="overview">
+        <div class="section">魔粒数据看板</div>
+        <div class="cards" id="cube-cards">
+          <div style="color: #86868b; padding: 20px">
+            <span class="spinner"></span> 加载中
+          </div>
+        </div>
+        <div class="section">请求统计</div>
+        <div class="cards" id="stats-cards">
+          <div style="color: #86868b; padding: 20px">
+            <span class="spinner"></span> 加载中
+          </div>
+        </div>
+        <div class="section">凭据汇总 · 按模型已用请求</div>
+        <div class="cards" id="model-cards">
+          <div style="color: #86868b; padding: 20px">
+            <span class="spinner"></span> 加载中
+          </div>
+        </div>
+      </div>
+
+      <div class="tab-panel" data-tab="accounts">
+        <div class="section">
+          账号与 Token 管理<span class="hint">点击行展开详情</span>
+        </div>
+        <div class="search-row">
+          <input
+            type="text"
+            class="search-input"
+            id="acct-search"
+            placeholder="搜索 Token / 用户名 / 邮箱 / 手机号"
+            oninput="filterAccounts()"
+          />
+          <span class="search-count" id="acct-count"></span>
+        </div>
+        <div style="display: flex; gap: 8px; margin-bottom: 10px">
+          <button class="btn btn-outline" onclick="expandAll()">
+            全部展开
+          </button>
+          <button class="btn btn-outline" onclick="collapseAll()">
+            全部折叠
+          </button>
+        </div>
+        <table id="rl-keys">
+          <thead>
+            <tr>
+              <th>账号</th>
+              <th>签到状态</th>
+              <th>可用魔粒</th>
+              <th>今日消耗</th>
+              <th>平台侧调用量</th>
+              <th>调度状态</th>
+              <th class="nosort">消耗记录</th>
+            </tr>
+          </thead>
+          <tbody id="rl-tbody">
+            <tr>
+              <td
+                colspan="7"
+                style="text-align: center; color: #86868b; padding: 20px"
+              >
+                <span class="spinner"></span> 加载中
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="tab-panel" data-tab="transactions">
+        <div class="section">魔粒记录</div>
+        <div
+          id="tx-account-display"
+          style="
+            font-size: 13px;
+            color: #1d1d1f;
+            font-weight: 600;
+            margin-bottom: 10px;
+          "
+        ></div>
+        <div class="balance-bar">
+          <span class="label">可用魔粒</span>
+          <span class="value" id="tx-balance">—</span>
+          <button
+            class="btn btn-primary"
+            id="tx-refresh-btn"
+            onclick="refreshTxData()"
+            style="font-size: 12px; padding: 5px 14px; margin-left: auto"
+          >
+            刷新记录
+          </button>
+        </div>
+        <div class="tx-toolbar">
+          <div class="tx-filters">
+            <button
+              class="tx-filter active"
+              data-type="all"
+              onclick="setTxFilter('type', 'all')"
+            >
+              全部
+            </button>
+            <button
+              class="tx-filter"
+              data-type="EARN"
+              onclick="setTxFilter('type', 'EARN')"
+            >
+              发放
+            </button>
+            <button
+              class="tx-filter"
+              data-type="SPEND_CONFIRM"
+              onclick="setTxFilter('type', 'SPEND_CONFIRM')"
+            >
+              消耗
+            </button>
+            <button
+              class="tx-filter"
+              data-type="EXPIRE"
+              onclick="setTxFilter('type', 'EXPIRE')"
+            >
+              过期
+            </button>
+          </div>
+        </div>
+        <table id="tx-table">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>类型</th>
+              <th>账号</th>
+              <th>来源</th>
+              <th>模型等级</th>
+              <th>次数</th>
+              <th>金额</th>
+              <th>过期信息</th>
+            </tr>
+          </thead>
+          <tbody id="tx-tbody">
+            <tr>
+              <td
+                colspan="8"
+                style="text-align: center; color: #86868b; padding: 20px"
+              >
+                请选择账号
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="tx-pagination">
+          <span id="tx-page-info"></span>
+          <button
+            class="tx-page-btn"
+            id="tx-prev"
+            onclick="txChangePage(-1)"
+            disabled
+          >
+            上一页
+          </button>
+          <button
+            class="tx-page-btn"
+            id="tx-next"
+            onclick="txChangePage(1)"
+            disabled
+          >
+            下一页
+          </button>
+        </div>
+      </div>
+
+      <div class="tab-panel" data-tab="checkin">
+        <div class="section">每日签到状态看板</div>
+        <div class="checkin-grid" id="checkin-grid">
+          <div style="color: #86868b; padding: 20px">
+            <span class="spinner"></span> 加载中
+          </div>
+        </div>
+      </div>
+    </div>
+    <div
+      style="
+        text-align: center;
+        padding: 20px 0 0;
+        font-size: 11px;
+        color: #86868b;
+      "
+    >
+      Modelscope 限流管理后台插件 v2.2.1 · 构建于 2026-08-15 07:51:09 CST
+    </div>
+    <div class="toast" id="toast"></div>
+    <script>
+      var SCHED = {
+        normal: ["b-ok", "正常调度"],
+        exhausted: ["b-glob", "魔粒耗尽禁用"],
+        unauthorized: ["b-frozen", "密钥失效"],
+        error: ["b-frozen", "请求失败"],
+      };
+      var TIER_LABEL = { lite: "轻量", standard: "主流", ultra: "旗舰" };
+      var RULE_LABEL = {
+        daily_active: "注册并登录",
+        aliyun_bindlogin: "绑定阿里云账号",
+        api_inference: "API 推理",
+        expire: "魔粒过期",
+      };
+      var ACCOUNTS = [];
+      var STATS = {
+        successCount: 0,
+        cooldownCount: 0,
+        cooldownWait: 0,
+        totalKeys: 0,
+      };
+      var signedInToday = false;
+      var lastRefreshTime = "—";
+      var nextRefreshCountdown = "—";
+      var cacheTTLms = 5 * 60 * 1000;
+      var lastRefreshAtMs = 0;
+      var expandedIdxs = [];
+      var detailJSCache = {};
+      var acctSearchTerm = "";
+      var sortState = { col: 2, dir: -1 };
+      var txType = "all",
+        txAccount = "all",
+        txPage = 1,
+        txPageSize = 50,
+        txRecords = [];
+
+      function xhr(method, url, cb) {
+        var x = new XMLHttpRequest();
+        x.open(method, url, true);
+        x.onreadystatechange = function () {
+          if (x.readyState === 4) {
+            var d = null;
+            try {
+              d = x.responseText ? JSON.parse(x.responseText) : null;
+            } catch (e) {
+              d = null;
+            }
+            cb(x.status, d);
+          }
+        };
+        x.send(null);
+      }
+      var toastTimer = null;
+      function toast(msg) {
+        var el = document.getElementById("toast");
+        el.textContent = msg;
+        el.classList.add("show");
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(function () {
+          el.classList.remove("show");
+        }, 2400);
+      }
+      function switchTab(name) {
+        document.querySelectorAll(".tab").forEach(function (t) {
+          t.classList.toggle("active", t.dataset.tab === name);
+        });
+        document.querySelectorAll(".tab-panel").forEach(function (p) {
+          p.classList.toggle("active", p.dataset.tab === name);
+        });
+        var tb = document.querySelector(".tabs");
+        if (tb) {
+          var top = tb.getBoundingClientRect().top + window.scrollY - 12;
+          if (window.scrollY > top) {
+            window.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
+          }
+        }
+      }
+
+      function updateCountdown() {
+        if (lastRefreshAtMs > 0) {
+          var remain = cacheTTLms - (Date.now() - lastRefreshAtMs);
+          if (remain <= 0) {
+            nextRefreshCountdown = "刷新中";
+          } else {
+            var m = Math.floor(remain / 60000);
+            var s = Math.floor((remain % 60000) / 1000);
+            nextRefreshCountdown = m + ":" + String(s).padStart(2, "0");
+          }
+        }
+        var el = document.getElementById("subtitle");
+        if (el && el.innerHTML.indexOf("下次刷新") >= 0) {
+          renderSubtitle();
+          renderCubeCards();
+        }
+      }
+      setInterval(updateCountdown, 1000);
+      function maskToken(t) {
+        if (!t || t.length <= 12) return t;
+        return t.slice(0, 6) + "..." + t.slice(-4);
+      }
+
+      // Stale-while-revalidate: keep old data visible during refetch
+      var staleAccounts = null;
+
+      var overlayTimer = null;
+      var overlayStart = 0;
+      function showOverlay(text) {
+        var ov = document.getElementById("overlay");
+        ov.classList.add("show");
+        document.getElementById("progress-text").textContent = text || "加载中";
+        document.getElementById("progress-fill").style.width = "5%";
+        overlayStart = Date.now();
+        clearInterval(overlayTimer);
+        overlayTimer = setInterval(function () {
+          var elapsed = Date.now() - overlayStart;
+          var pct = 5 + Math.min(85, elapsed / 100);
+          document.getElementById("progress-fill").style.width = pct + "%";
+          document.getElementById("progress-text").textContent =
+            "正在获取账号数据... " + Math.floor(pct) + "%";
+        }, 200);
+      }
+      function hideOverlay() {
+        clearInterval(overlayTimer);
+        document.getElementById("progress-fill").style.width = "100%";
+        setTimeout(function () {
+          document.getElementById("overlay").classList.remove("show");
+        }, 200);
+      }
+
+      function renderSubtitle() {
+        var c = ACCOUNTS.filter(function (a) {
+          return a.checkedIn;
+        }).length;
+        var e = ACCOUNTS.filter(function (a) {
+          return a.schedule === "exhausted";
+        }).length;
+        var u = ACCOUNTS.filter(function (a) {
+          return a.schedule === "unauthorized";
+        }).length;
+        var nextDate = new Date();
+        nextDate.setDate(nextDate.getDate() + 1);
+        nextDate.setHours(0, 0, 0, 0);
+        var dateStr =
+          nextDate.getFullYear() +
+          "-" +
+          String(nextDate.getMonth() + 1).padStart(2, "0") +
+          "-" +
+          String(nextDate.getDate()).padStart(2, "0");
+        var refreshStr =
+          lastRefreshTime !== "—"
+            ? " · 上次刷新 " +
+              lastRefreshTime +
+              " · 下次刷新 " +
+              nextRefreshCountdown
+            : "";
+        document.getElementById("subtitle").innerHTML =
+          "共 <b>" +
+          ACCOUNTS.length +
+          "</b> 个账号 · 已签到 <b>" +
+          c +
+          "</b> · 魔粒耗尽 <b>" +
+          e +
+          "</b> · 密钥失效 <b>" +
+          u +
+          "</b> · 下次签到 <b>" +
+          dateStr +
+          " 00:00:00 CST</b>" +
+          refreshStr;
+      }
+
+      function renderCubeCards() {
+        var avail = 0,
+          consumed = 0,
+          checkedCount = 0,
+          platformUsage = 0;
+        ACCOUNTS.forEach(function (a) {
+          if (a.balance) avail += a.balance.available;
+          consumed += a.todayConsumed || 0;
+          if (a.checkedIn) checkedCount++;
+          platformUsage += a.usagePerDay || 0;
+        });
+        document.getElementById("cube-cards").innerHTML =
+          '<div class="card"><div class="k">可用魔粒总额</div><div class="v green">' +
+          avail.toLocaleString() +
+          '</div><div class="sub-v">含短期+长期魔粒</div></div>' +
+          '<div class="card"><div class="k">今日已消耗</div><div class="v orange">' +
+          consumed.toLocaleString() +
+          '</div><div class="sub-v">平台累计数据</div></div>' +
+          '<div class="card"><div class="k">今日签到账号</div><div class="v blue">' +
+          checkedCount +
+          '</div><div class="sub-v">共 ' +
+          ACCOUNTS.length +
+          " 个账号</div></div>" +
+          '<div class="card"><div class="k">平台侧今日调用量</div><div class="v">' +
+          platformUsage.toLocaleString() +
+          '</div><div class="sub-v">更新于 ' +
+          lastRefreshTime +
+          "</div></div>";
+      }
+
+      function fetchStats(cb) {
+        xhr("GET", "?api=stats", function (sc, d) {
+          if (sc === 200 && d) {
+            STATS = d;
+          } else {
+            STATS = {
+              successCount: 0,
+              cooldownCount: 0,
+              cooldownWait: 0,
+              totalKeys: ACCOUNTS.length || 0,
+            };
+          }
+          renderStats();
+          renderModels();
+          if (cb) cb();
+        });
+      }
+      function renderStats() {
+        document.getElementById("stats-cards").innerHTML =
+          '<div class="card"><div class="k">请求成功</div><div class="v green">' +
+          (STATS.successCount || 0) +
+          '</div><div class="sub-v">托管 Provider 合计</div></div>' +
+          '<div class="card"><div class="k">退避触发</div><div class="v">' +
+          (STATS.cooldownCount || 0) +
+          " 次</div></div>" +
+          '<div class="card"><div class="k">累计等待</div><div class="v">' +
+          (STATS.cooldownWait || 0).toFixed(1) +
+          "s</div></div>";
+      }
+      function renderModels() {
+        var mu = STATS.modelUsage || {};
+        var modelNames = Object.keys(mu).sort();
+        var modelHtml = "";
+        if (modelNames.length) {
+          modelNames.forEach(function (m) {
+            modelHtml +=
+              '<div class="mcard"><div class="mn">' +
+              m +
+              '</div><div class="ma">' +
+              mu[m] +
+              '</div><div class="mk">请求次数</div></div>';
+          });
+        } else {
+          modelHtml =
+            '<div style="color:#86868b;padding:20px">暂无模型调用记录</div>';
+        }
+        document.getElementById("model-cards").innerHTML = modelHtml;
+      }
+
+      function renderCheckinGrid() {
+        var html = "";
+        ACCOUNTS.forEach(function (a, i) {
+          if (acctSearchTerm) {
+            var hay = (
+              (a.maskedKey || "") +
+              " " +
+              (a.name || "") +
+              " " +
+              (a.email || "") +
+              " " +
+              (a.phone || "")
+            ).toLowerCase();
+            if (hay.indexOf(acctSearchTerm) < 0) return;
+          }
+          var cls, dot, st;
+          if (a.checkedIn) {
+            cls = "signed";
+            dot = "ok";
+            st = "已签到 " + (a.lastCheckIn || "").slice(11, 16);
+          } else {
+            cls = "unsigned";
+            dot = "no";
+            st =
+              a.schedule === "unauthorized" ? "签到失败 · 密钥失效" : "未签到";
+          }
+          html +=
+            '<div class="ci-card ' +
+            cls +
+            '" onclick="goAccountTx(' +
+            i +
+            ')"><span class="ci-dot ' +
+            dot +
+            '"></span><div class="ci-body"><div class="ci-name" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
+            (a.email || a.maskedKey) +
+            '</div><div class="ci-status">' +
+            st +
+            "</div></div></div>";
+        });
+        document.getElementById("checkin-grid").innerHTML =
+          html || '<div style="color:#86868b;padding:20px">无匹配</div>';
+      }
+
+      function filterAccounts() {
+        acctSearchTerm = (document.getElementById("acct-search").value || "")
+          .toLowerCase()
+          .trim();
+        renderTable();
+        renderCheckinGrid();
+      }
+
+      function renderTable() {
+        var html = "";
+        var count = 0;
+        ACCOUNTS.forEach(function (a, i) {
+          if (acctSearchTerm) {
+            var hay = (
+              (a.maskedKey || "") +
+              " " +
+              (a.name || "") +
+              " " +
+              (a.email || "") +
+              " " +
+              (a.phone || "")
+            ).toLowerCase();
+            if (hay.indexOf(acctSearchTerm) < 0) return;
+          }
+          count++;
+          var sched = SCHED[a.schedule] || SCHED.error;
+          var acctHtml =
+            '<div class="acct-cell" title="' +
+            (a.name || "") +
+            " · " +
+            (a.email || "") +
+            '"><span class="expand-arrow">&#9654;</span><span class="acct-name">' +
+            a.maskedKey +
+            '</span><span class="prov">' +
+            (a.site === "ai" ? "国际" : "国内") +
+            "</span></div>";
+          var ciHtml = a.checkedIn
+            ? '<span class="badge b-ok">已签到</span><span class="when">' +
+              (a.lastCheckIn || "").slice(11) +
+              "</span>"
+            : '<span class="badge b-glob">未签到</span>';
+          var bal = a.balance || { total: 0, available: 0 };
+          var consumed = a.todayConsumed || 0;
+          var displayTotal = bal.available + consumed;
+          var ratio =
+            displayTotal > 0
+              ? Math.round((bal.available / displayTotal) * 100)
+              : 0;
+          var fc = ratio > 50 ? "g" : ratio > 0 ? "a" : "r";
+          var cubeHtml =
+            '<div class="tb"><span class="bv ' +
+            (bal.available > 0 ? "g" : "r") +
+            '">' +
+            bal.available +
+            " / " +
+            displayTotal +
+            '</span><div class="track"><i class="fill ' +
+            fc +
+            '" style="width:' +
+            ratio +
+            '%"></i></div></div>';
+          var consHtml =
+            '<span class="cons-link" onclick="event.stopPropagation();goAccountTx(' +
+            i +
+            ')">' +
+            consumed +
+            " 魔粒</span>";
+          var sHtml =
+            '<span class="badge ' + sched[0] + '">' + sched[1] + "</span>";
+          if (a.error) sHtml += '<span class="when">' + a.error + "</span>";
+          html +=
+            '<tr onclick="toggleExpand(' +
+            i +
+            ')" data-idx="' +
+            i +
+            '">' +
+            '<td data-sort="' +
+            a.maskedKey +
+            '">' +
+            acctHtml +
+            "</td>" +
+            '<td data-sort="' +
+            (a.checkedIn ? 1 : 0) +
+            '">' +
+            ciHtml +
+            "</td>" +
+            '<td data-sort="' +
+            bal.available +
+            '">' +
+            cubeHtml +
+            "</td>" +
+            '<td data-sort="' +
+            consumed +
+            '">' +
+            consHtml +
+            "</td>" +
+            '<td data-sort="' +
+            (a.usagePerDay || 0) +
+            '" style="font-size:12px">' +
+            (a.usagePerDay || 0) +
+            "</td>" +
+            '<td data-sort="' +
+            ["normal", "exhausted", "unauthorized", "error"].indexOf(
+              a.schedule,
+            ) +
+            '">' +
+            sHtml +
+            "</td>" +
+            '<td class="nosort"><span class="cons-link" onclick="event.stopPropagation();goAccountTx(' +
+            i +
+            ')">查看</span></td>' +
+            "</tr>";
+        });
+        document.getElementById("acct-count").textContent =
+          count > 0 ? count + " / " + ACCOUNTS.length + " 个" : "无匹配";
+        document.getElementById("rl-tbody").innerHTML =
+          html ||
+          '<tr><td colspan="7" style="text-align:center;color:#86868b;padding:20px">无匹配</td></tr>';
+       // Auto-expand all matching rows when searching
+       if (acctSearchTerm && count > 0) {
+         ACCOUNTS.forEach(function (a, i) {
+           var hay = (
+             (a.maskedKey || "") +
+             " " +
+             (a.name || "") +
+             " " +
+             (a.email || "") +
+             " " +
+             (a.phone || "")
+           ).toLowerCase();
+           if (
+             hay.indexOf(acctSearchTerm) >= 0 &&
+             expandedIdxs.indexOf(i) < 0 && detailJSCache[a.maskedKey]
+           ) {
+             expandDetail(i);
+           }
+         });
+       }
+        applySort();
+      }
+
+      function renderDetailPanel(d, idx) {
+        var p =
+          '<div class="detail-panel">' +
+          '<div class="dp-section"><div class="dp-title">个人信息</div><div class="dp-grid">' +
+          '<div class="dp-item"><span class="dk">用户名</span><span class="dv">' +
+          (d.name || "—") +
+          "</span></div>" +
+          '<div class="dp-item"><span class="dk">昵称</span><span class="dv">' +
+          (d.nickName || "—") +
+          "</span></div>" +
+          '<div class="dp-item"><span class="dk">邮箱</span><span class="dv">' +
+          (d.email || "—") +
+          "</span></div>" +
+          '<div class="dp-item"><span class="dk">手机号</span><span class="dv">' +
+          (d.phone || "—") +
+          "</span></div>" +
+          '<div class="dp-item"><span class="dk">Havana ID</span><span class="dv">' +
+          (d.havanaId || "—") +
+          "</span></div>" +
+          '<div class="dp-item"><span class="dk">来源站点</span><span class="dv">' +
+          (d.fromSite || "—") +
+          "</span></div>" +
+          '<div class="dp-item"><span class="dk">站点</span><span class="dv">' +
+          (d.site === "ai" ? "国际站" : "国内站") +
+          "</span></div>" +
+          '<div class="dp-item"><span class="dk">实名认证</span><span class="dv">' +
+          (d.isRealName ? "已认证" : "未认证") +
+          "</span></div>" +
+          '<div class="dp-item"><span class="dk">阿里云绑定</span><span class="dv">' +
+          (d.aliyunBound ? "已绑定 (" + (d.aliyunNick || "") + ")" : "未绑定") +
+          "</span></div>" +
+         '<div class="dp-item"><span class="dk">平台调用量</span><span class="dv">' +
+          (idx != null && ACCOUNTS[idx]
+            ? ACCOUNTS[idx].usagePerDay || 0
+            : d.usagePerDay || 0) +
+         " 次/日</span></div>" +
+          '<div class="dp-item"><span class="dk">SDK Token</span><span class="dv" style="font-family:ui-monospace,monospace;font-size:10.5px">' +
+          (d.sdkToken ? maskToken(d.sdkToken) : "—") +
+          "</span></div>" +
+          "</div></div>" +
+          '<div class="dp-section"><div class="dp-title">Token 列表</div><div class="dp-tokens">';
+        if (d.tokens && d.tokens.length) {
+          d.tokens.forEach(function (t) {
+            p +=
+              '<div class="dp-token"><span class="dot ' +
+              (t.valid ? "g" : "r") +
+              '"></span><span class="t-name">' +
+              t.name +
+              '</span><span class="t-val">' +
+              maskToken(t.token) +
+              '</span><span class="t-meta">' +
+              (t.valid ? "有效" : "已失效") +
+              "</span></div>";
+          });
+        } else {
+          p += '<div style="color:#86868b;font-size:11px">无 Token</div>';
+        }
+        p += "</div></div></div>";
+        return p;
+      }
+
+      function expandDetail(idx) {
+        var tbody = document.getElementById("rl-tbody");
+        var row = tbody.querySelector('tr[data-idx="' + idx + '"]');
+        if (!row || expandedIdxs.indexOf(idx) >= 0) return;
+        var dr = document.createElement("tr");
+        dr.className = "detail-row";
+        row.parentNode.insertBefore(dr, row.nextSibling);
+        row.classList.add("expanded");
+        expandedIdxs.push(idx);
+        var mk = ACCOUNTS[idx].maskedKey;
+       if (detailJSCache[mk]) {
+         dr.innerHTML =
+            '<td colspan="7">' + renderDetailPanel(detailJSCache[mk], idx) + "</td>";
+         return;
+       }
+        dr.innerHTML =
+          '<td colspan="7"><div class="detail-panel" style="color:#86868b;padding:14px 18px"><span class="spinner"></span> 加载中</div></td>';
+        xhr(
+          "GET",
+          "?api=account&key=" + ACCOUNTS[idx].maskedKey,
+          function (sc, d) {
+            if (sc === 200 && d) {
+             detailJSCache[ACCOUNTS[idx].maskedKey] = d;
+             dr.innerHTML =
+                '<td colspan="7">' + renderDetailPanel(d, idx) + "</td>";
+            } else {
+              dr.innerHTML =
+                '<td colspan="7"><div class="detail-panel" style="color:#bf0711;padding:14px 18px">加载失败: ' +
+                (sc || "") +
+                "</div></td>";
+            }
+          },
+        );
+      }
+      function collapseDetail(idx) {
+        var tbody = document.getElementById("rl-tbody");
+        var row = tbody.querySelector('tr[data-idx="' + idx + '"]');
+        if (!row) return;
+        var dr = row.nextElementSibling;
+        if (dr && dr.classList.contains("detail-row")) dr.remove();
+        row.classList.remove("expanded");
+        expandedIdxs = expandedIdxs.filter(function (x) {
+          return x !== idx;
+        });
+      }
+      function toggleExpand(idx) {
+        if (expandedIdxs.indexOf(idx) >= 0) collapseDetail(idx);
+        else expandDetail(idx);
+      }
+      function expandAll() {
+        ACCOUNTS.forEach(function (_, i) {
+          if (expandedIdxs.indexOf(i) < 0) expandDetail(i);
+        });
+      }
+      function collapseAll() {
+        expandedIdxs.slice().forEach(collapseDetail);
+      }
+
+      function getFilteredTx() {
+        return txRecords.filter(function (r) {
+          if (txType !== "all" && r.type !== txType) return false;
+          return true;
+        });
+      }
+      function setTxFilter(key, val) {
+        if (key === "type") {
+          txType = val;
+          document.querySelectorAll(".tx-filter").forEach(function (b) {
+            if (b.dataset.type)
+              b.classList.toggle("active", b.dataset.type === val);
+          });
+        }
+        txPage = 1;
+        renderTransactions();
+      }
+      function goAccountTx(idx) {
+        txAccount = String(idx);
+        txType = "all";
+        txPage = 1;
+        document.querySelectorAll(".tx-filter").forEach(function (b) {
+          if (b.dataset.type)
+            b.classList.toggle("active", b.dataset.type === "all");
+        });
+        switchTab("transactions");
+        renderTxAccountDisplay(idx);
+        fetchTransactions(idx);
+      }
+      function txChangePage(delta) {
+        var total = Math.max(1, Math.ceil(txRecords.length / txPageSize));
+        txPage = Math.max(1, Math.min(total, txPage + delta));
+        renderTransactions();
+      }
+      function renderTxAccountDisplay(idx) {
+        var a = ACCOUNTS[idx];
+        if (!a) return;
+        var bal = a.balance;
+        var dTotal = bal
+          ? bal.total > 0
+            ? bal.total
+            : bal.available +
+              (ACCOUNTS[idx] ? ACCOUNTS[idx].todayConsumed || 0 : 0)
+          : 0;
+        document.getElementById("tx-balance").textContent = bal
+          ? bal.available
+          : "—";
+        document.getElementById("tx-account-display").innerHTML =
+          "当前账号：<b>" +
+          (a.name || a.maskedKey) +
+          "</b> · " +
+          (a.email || "—") +
+          " · Token " +
+          a.maskedKey;
+      }
+      function fetchTransactions(idx) {
+        document.getElementById("tx-tbody").innerHTML =
+          '<tr><td colspan="8" style="text-align:center;color:#86868b;padding:20px"><span class="spinner"></span> 加载中</td></tr>';
+        xhr(
+          "GET",
+          "?api=transactions&key=" +
+            ACCOUNTS[idx].maskedKey +
+            "&page=1&page_size=50",
+          function (sc, d) {
+            if (sc !== 200 || !d || d.error) {
+              document.getElementById("tx-tbody").innerHTML =
+                '<tr><td colspan="8" style="text-align:center;color:#86868b;padding:20px">' +
+                (d && d.error ? d.error : "加载失败") +
+                "</td></tr>";
+              txRecords = [];
+              return;
+            }
+            txRecords = d.records || [];
+            txPage = 1;
+            renderTransactions();
+          },
+        );
+      }
+      function renderTransactions() {
+        var filtered = getFilteredTx();
+        var total = Math.max(1, Math.ceil(filtered.length / txPageSize));
+        if (txPage > total) txPage = total;
+        var start = (txPage - 1) * txPageSize;
+        var pageRecords = filtered.slice(start, start + txPageSize);
+        var html = "";
+        pageRecords.forEach(function (r) {
+          var typeBadge =
+            r.type === "EARN"
+              ? '<span class="type-badge tb-earn">发放</span>'
+              : r.type === "SPEND_CONFIRM"
+                ? '<span class="type-badge tb-spend">消耗</span>'
+                : '<span class="type-badge tb-expire">过期</span>';
+          var source = r.title || RULE_LABEL[r.rule_key] || r.rule_key || "—";
+          var tierHtml = r.model_tier
+            ? '<span class="tier-badge tier-' +
+              r.model_tier +
+              '">' +
+              (TIER_LABEL[r.model_tier] || r.model_tier) +
+              "</span>"
+            : '<span class="dash">—</span>';
+          var amountClass =
+            r.type === "EARN"
+              ? "earn"
+              : r.type === "SPEND_CONFIRM"
+                ? "spend"
+                : "expire";
+          var amountSign = r.type === "EARN" ? "+" : "-";
+          var amountHtml =
+            '<span class="tx-amount ' +
+            amountClass +
+            '">' +
+            amountSign +
+            r.total_amount +
+            "</span>";
+          var expiryHtml = r.expire_at
+            ? '<span style="font-size:11px">' + r.expire_at + "</span>"
+            : '<span class="dash">—</span>';
+          html +=
+            '<tr><td style="font-size:11px;white-space:nowrap">' +
+            (r.gmt_created || "—") +
+            "</td><td>" +
+            typeBadge +
+            '</td><td style="font-size:12px;font-weight:600">' +
+            (r.account || "—") +
+            '</td><td style="font-size:12px">' +
+            source +
+            "</td><td>" +
+            tierHtml +
+            '</td><td style="font-size:12px">' +
+            (r.count || 0) +
+            "</td><td>" +
+            amountHtml +
+            "</td><td>" +
+            expiryHtml +
+            "</td></tr>";
+        });
+        if (!pageRecords.length)
+          html =
+            '<tr><td colspan="8" style="text-align:center;color:#86868b;padding:24px">无记录</td></tr>';
+        document.getElementById("tx-tbody").innerHTML = html;
+        document.getElementById("tx-page-info").textContent =
+          "共 " + filtered.length + " 条 · 第 " + txPage + "/" + total + " 页";
+        document.getElementById("tx-prev").disabled = txPage <= 1;
+        document.getElementById("tx-next").disabled = txPage >= total;
+      }
+      function refreshTxData() {
+        if (txAccount === "all") {
+          toast("请先选择账号");
+          return;
+        }
+        var idx = parseInt(txAccount);
+        var btn = document.getElementById("tx-refresh-btn");
+        btn.disabled = true;
+        btn.textContent = "刷新中…";
+        // Single request: balance + transactions in one API call pair
+        xhr(
+          "GET",
+          "?api=refresh-balance&key=" + ACCOUNTS[idx].maskedKey,
+          function (sc, d) {
+            btn.disabled = false;
+            btn.textContent = "刷新记录";
+            if (sc !== 200 || !d) {
+              toast("刷新失败");
+              return;
+            }
+            if (d.balance) {
+              ACCOUNTS[idx].balance = d.balance;
+            }
+            ACCOUNTS[idx].todayConsumed = d.todayConsumed || 0;
+            renderCubeCards();
+            renderTable();
+            renderTxAccountDisplay(idx);
+            // Use transaction records from same response (no separate fetchTransactions call)
+            txRecords = d.records || [];
+            txPage = 1;
+            renderTransactions();
+            toast("已刷新魔粒与交易记录");
+          },
+        );
+      }
+
+      function toolbarAction() {
+        var btn = document.getElementById("toolbar-btn");
+        btn.disabled = true;
+        btn.textContent = "处理中…";
+        if (!signedInToday) {
+          // 一键签到: sign-in all accounts, then force fresh data
+          xhr("GET", "?api=checkin-all", function (sc, d) {
+            signedInToday = true;
+            updateToolbarBtn();
+            var ok = (d || []).filter(function (r) {
+              return r.success;
+            }).length;
+            toast("一键签到完成：" + ok + " 个账号成功");
+            // Force backend to fetch fresh data (not cache)
+            staleAccounts = null;
+            detailJSCache = {};
+            showOverlay("正在获取账号数据");
+            fetchAccountsForce(function () {
+              btn.disabled = false;
+              hideOverlay();
+            });
+          });
+        } else {
+          // 一键刷新: force backend to fetch fresh data immediately
+          staleAccounts = null;
+          detailJSCache = {};
+          xhr("GET", "?api=accounts&refresh=1", function (sc, d) {
+            btn.disabled = false;
+            if (sc === 200 && d) {
+              toast("正在后台刷新数据…");
+            } else {
+              toast("刷新失败");
+            }
+          });
+        }
+        btn.textContent = "一键刷新";
+      }
+      function updateToolbarBtn() {
+        var btn = document.getElementById("toolbar-btn");
+        btn.textContent = signedInToday ? "一键刷新" : "一键签到";
+      }
+
+      function fetchAccountsForce(cb) {
+        fetchInProgress = true;
+        document.getElementById("ping-text").textContent = "刷新中";
+        showOverlay("正在获取账号数据");
+        xhr("GET", "?api=accounts&refresh=1", function (sc, d) {
+          fetchInProgress = false;
+          document.getElementById("ping").className = "dot";
+          document.getElementById("ping-text").textContent = "就绪";
+          hideOverlay();
+          if (sc !== 200 || !d) {
+            toast("刷新失败");
+            if (cb) cb();
+            return;
+          }
+          var accs = d.accounts || d;
+          staleAccounts = accs.slice();
+          ACCOUNTS = accs;
+          if (d.fetchedAt) {
+            lastRefreshTime = d.fetchedAt;
+            var parts = d.fetchedAt.split(":");
+            var d2 = new Date();
+            d2.setHours(
+              parseInt(parts[0]),
+              parseInt(parts[1]),
+              parseInt(parts[2]),
+              0,
+            );
+            lastRefreshAtMs = d2.getTime();
+          }
+          renderCubeCards();
+          renderCheckinGrid();
+          renderTable();
+          renderSubtitle();
+          toast("已获取最新数据");
+          if (cb) cb();
+        });
+      }
+      var lastFetchedAt = "";
+      var fetchInProgress = false;
+      function fetchAccounts(cb) {
+        if (fetchInProgress) {
+          if (cb) cb();
+          return;
+        }
+        fetchInProgress = true;
+        xhr("GET", "?api=accounts", function (sc, d) {
+          if (sc !== 200 || !d) {
+            fetchInProgress = false;
+            if (cb) cb();
+            return;
+          }
+          var accs = d.accounts || d;
+          // Only update UI if fetchedAt changed (backend refreshed data)
+          if (d.fetchedAt && d.fetchedAt === lastFetchedAt && staleAccounts) {
+            fetchInProgress = false;
+            if (cb) cb();
+            return;
+          }
+          if (d.fetchedAt) lastFetchedAt = d.fetchedAt;
+          staleAccounts = accs.slice();
+          ACCOUNTS = accs;
+          if (d.fetchedAt) {
+            lastRefreshTime = d.fetchedAt;
+            var parts = d.fetchedAt.split(":");
+            var d2 = new Date();
+            d2.setHours(
+              parseInt(parts[0]),
+              parseInt(parts[1]),
+              parseInt(parts[2]),
+              0,
+            );
+            lastRefreshAtMs = d2.getTime();
+          }
+          renderCubeCards();
+          renderCheckinGrid();
+          renderTable();
+          renderSubtitle();
+          document.getElementById("ping").className = "dot";
+          document.getElementById("ping-text").textContent = "就绪";
+          hideOverlay();
+          fetchInProgress = false;
+          if (cb) cb();
+        });
+      }
+
+      function applySort() {
+        var tb = document.getElementById("rl-tbody");
+        // Preserve expanded rows: remove detail rows but keep expandedIdxs
+        tb.querySelectorAll(".detail-row").forEach(function (r) {
+          r.remove();
+        });
+        // Re-expand previously expanded rows after sort
+        var kept = [];
+        expandedIdxs.forEach(function (idx) {
+          var row = tb.querySelector('tr[data-idx="' + idx + '"]');
+          if (row) {
+            row.classList.remove("expanded");
+            kept.push(idx);
+          }
+        });
+        expandedIdxs = kept;
+        kept.forEach(function (idx) {
+          expandDetail(idx);
+        });
+        var rows = Array.prototype.slice.call(tb.rows).filter(function (r) {
+          return !r.classList.contains("detail-row");
+        });
+        if (rows.length > 1) {
+          rows.sort(function (a, b) {
+            var va =
+              ((a.children[sortState.col] || {}).getAttribute &&
+                a.children[sortState.col].getAttribute("data-sort")) ||
+              "";
+            var vb =
+              ((b.children[sortState.col] || {}).getAttribute &&
+                b.children[sortState.col].getAttribute("data-sort")) ||
+              "";
+            var na = parseFloat(va),
+              nb = parseFloat(vb);
+            if (!isNaN(na) && !isNaN(nb)) return (na - nb) * sortState.dir;
+            return String(va).localeCompare(String(vb)) * sortState.dir;
+          });
+          var df = document.createDocumentFragment();
+          rows.forEach(function (r) {
+            df.appendChild(r);
+          });
+          tb.textContent = "";
+          tb.appendChild(df);
+        }
+      }
+      function setupSorting() {
+        document
+          .getElementById("rl-keys")
+          .querySelectorAll("th")
+          .forEach(function (th, i) {
+            th.onclick = function () {
+              if (th.classList.contains("nosort")) return;
+              sortState = {
+                col: i,
+                dir: sortState.col === i ? -sortState.dir : -1,
+              };
+              applySort();
+            };
+          });
+      }
+
+      // init
+      setupSorting();
+      updateToolbarBtn();
+      fetchStats();
+      // 5-second polling: fetch stats + accounts
+      setInterval(function () {
+        fetchStats();
+        fetchAccounts();
+      }, 5000);
+      fetchAccounts(function () {
+        signedInToday = ACCOUNTS.some(function (a) {
+          return a.checkedIn;
+        });
+        updateToolbarBtn();
+        document.getElementById("toolbar-btn").disabled = false;
+      });
+    </script>
+  </body>
+</html>

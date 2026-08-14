@@ -226,7 +226,7 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 	// to avoid noise on healthy traffic.
 	if disabled > 0 {
 		rem := s.ModelRemaining(req.Model, now)
-		s.log.Printf("modelscope-ratelimit: schedule model=%s 剩余请求次数: %d / 已限: %d/ 可用: %d / 总共: %d -> %s",
+		s.log.Printf("modelscope-ratelimit: schedule model=%s 可用魔粒: %d / 已限: %d/ 可用: %d / 总共: %d -> %s",
 			s.displayName(req.Model), rem, disabled, availableCount, managed, picked.ID)
 	}
 

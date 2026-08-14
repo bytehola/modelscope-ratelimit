@@ -24,18 +24,7 @@ type Config struct {
 	// Defaults to "Asia/Shanghai".
 	Timezone string `json:"timezone" yaml:"timezone"`
 
-	// Rate-limit response header names. Defaults target the Modelscope
-	// api-inference.modelscope.cn endpoint.
-	ModelLimitHeader     string `json:"model_limit_header" yaml:"model_limit_header"`
-	ModelRemainingHeader string `json:"model_remaining_header" yaml:"model_remaining_header"`
-	TotalLimitHeader     string `json:"total_limit_header" yaml:"total_limit_header"`
-	TotalRemainingHeader string `json:"total_remaining_header" yaml:"total_remaining_header"`
-
-	// DisableThreshold: a credential is disabled for the rest of the day when
-	// its remaining count is <= this value. Default 0 means "exhausted".
-	DisableThreshold int `json:"disable_threshold" yaml:"disable_threshold"`
-
-	// CredentialStrategy controls how the plugin picks among available managed
+// CredentialStrategy controls how the plugin picks among available managed
 	// keys within a provider: "round-robin" (default) spreads load; "fill-first"
 	// always uses the first key until disabled. Only applies to managed providers.
 	CredentialStrategy string `json:"credential_strategy" yaml:"credential_strategy"`
@@ -68,6 +57,11 @@ type Config struct {
 	// Empty means monitor every model served by the configured providers.
 	ManagedModels []string `json:"managed_models" yaml:"managed_models"`
 
+	// MsProxyURL, when set, routes all Modelscope API calls through this proxy.
+	// Used for debugging/traffic inspection (e.g. "http://127.0.0.1:8888").
+	// TODO: remove after debugging is complete.
+	MsProxyURL string `json:"ms_proxy_url" yaml:"ms_proxy_url"`
+
 	// HostBaseURL is the absolute base URL of the CLIProxyAPI management API
 	// (e.g. "http://127.0.0.1:8317"), used for server-side key resolution. When
 	// set together with ManagementKey, the plugin resolves masked api-keys and
@@ -89,13 +83,8 @@ func DefaultConfig() *Config {
 	return &Config{
 		HostBaseURL:               "http://127.0.0.1:8317",
 		Timezone:                  "Asia/Shanghai",
-		ModelLimitHeader:          "Modelscope-Ratelimit-Model-Requests-Limit",
-		ModelRemainingHeader:      "Modelscope-Ratelimit-Model-Requests-Remaining",
-		TotalLimitHeader:          "Modelscope-Ratelimit-Requests-Limit",
-		TotalRemainingHeader:      "Modelscope-Ratelimit-Requests-Remaining",
-		DisableThreshold:          0,
 		CredentialStrategy:        "round-robin",
-		InsufficientQuotaCooldown: 10,
+		InsufficientQuotaCooldown: 1,
 	}
 }
 
@@ -198,25 +187,6 @@ func ConfigFromMap(raw map[string]any) (*Config, error) {
 	if v, ok := raw["timezone"].(string); ok && v != "" {
 		cfg.Timezone = v
 	}
-	if v, ok := raw["model_limit_header"].(string); ok && v != "" {
-		cfg.ModelLimitHeader = v
-	}
-	if v, ok := raw["model_remaining_header"].(string); ok && v != "" {
-		cfg.ModelRemainingHeader = v
-	}
-	if v, ok := raw["total_limit_header"].(string); ok && v != "" {
-		cfg.TotalLimitHeader = v
-	}
-	if v, ok := raw["total_remaining_header"].(string); ok && v != "" {
-		cfg.TotalRemainingHeader = v
-	}
-	if v, ok := raw["disable_threshold"]; ok {
-		if n, err := toInt(v); err == nil {
-			cfg.DisableThreshold = n
-		} else {
-			return nil, fmt.Errorf("invalid disable_threshold: %w", err)
-		}
-	}
 	if v, ok := raw["credential_strategy"].(string); ok {
 		cfg.CredentialStrategy = strings.ToLower(strings.TrimSpace(v))
 	}
@@ -229,6 +199,9 @@ func ConfigFromMap(raw map[string]any) (*Config, error) {
 	}
 	if v, ok := raw["proxy_url"].(string); ok {
 		cfg.ProxyURL = strings.TrimSpace(v)
+	}
+	if v, ok := raw["ms_proxy_url"].(string); ok {
+		cfg.MsProxyURL = strings.TrimSpace(v)
 	}
 	if v, ok := raw["skip_provider_on_429"].(bool); ok {
 		cfg.SkipProviderOn429 = v

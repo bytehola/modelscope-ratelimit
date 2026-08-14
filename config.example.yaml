@@ -41,22 +41,19 @@ plugins:
         "round-robin" # 凭据选择策略（仅对监控的 provider 生效）：
         #   round-robin = 轮询（默认），按 config 中 api-key 顺序轮换
         #   fill-first  = 填充优先，始终用第一个 key 直到禁用或故障
-      insufficient_quota_cooldown:
-        10
-        # 冷却基准秒数（默认 10）。
-        # 连续失败按指数退避 ×2 递增（10→20→40→60），封顶 60 秒，
+      insufficient_quota_cooldown: 1
+        # 冷却基准秒数（默认 1）。
+        # 连续失败按指数退避 ×2 递增（1→2→4→8），封顶 60 秒，
         # 成功响应或次日 00:00 重置回基数。
       # proxy_url: "socks5://user:pass@127.0.0.1:1080"
       # 代理 URL（选填，留空 = 不启用代理模式）。
       # 配置后，托管 provider 收到任意 429 时才会开启，成功后关闭。
       # 支持格式：http://user:pass@host:port、socks5://user:pass@host:port
 
-      # ---- 每日限流（通常留空用默认即可）----
+      # ---- 每日重置 ----
       timezone: "Asia/Shanghai" # 每日 00:00 重置时区，默认 Asia/Shanghai
-      model_remaining_header: "Modelscope-Ratelimit-Model-Requests-Remaining" # 单模型剩余次数头名
-      total_remaining_header: "Modelscope-Ratelimit-Requests-Remaining" # 总剩余次数头名
-      disable_threshold: 0 # 剩余次数 ≤ 此值即当日禁用该 key/model，默认 0（耗尽）
 
 
       # ---- 可选 ----
+      # ms_proxy_url: "http://127.0.0.1:8888" # 调试用：Modelscope API 代理地址，留空=直连
       # managed_models: ["Qwen-72B"]         # 仅监控这些模型名（别名），留空 = 全部

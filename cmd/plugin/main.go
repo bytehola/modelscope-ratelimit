@@ -80,6 +80,7 @@ extern void cliproxyPluginShutdown(void);
 import "C"
 
 import (
+	_ "embed"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -89,6 +90,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sort"
 	"sync"
 	"time"
 	_ "time/tzdata"
@@ -104,7 +106,11 @@ import (
 // stderr logger; wire host.log in if your SDK exposes a convenient bridge.
 var store = modelscope.NewStore(stderrLogger{})
 
+//go:embed status_page.html
+var statusPageHTML []byte
+
 var (
+	refreshMu sync.Mutex
 	// pluginCfg is the last applied plugin config, used by the management
 	// resource page to decide server-side vs browser-side key resolution.
 	pluginCfg *modelscope.Config
@@ -135,6 +141,11 @@ type strategyEntry struct {
 
 type resolvedEntry struct {
 	masked        map[string]string
+	raw           map[string]string // authID -> raw API key (m_session_id cookie value)
+	maskToRaw     map[string]string // maskedKey -> raw API key (O(1) lookup)
+	maskToSite    map[string]string // maskedKey -> site base URL (O(1) lookup)
+	siteBase      map[string]string // authID -> Modelscope site base URL (cn/ai)
+	orderedAuthIDs []string // stable iteration order (deterministic idx)
 	providerOrder map[string][]string // provider name -> auth IDs in config.yaml api-key order
 	realTotal     int
 	unmatched     []string // configured providers not found upstream
@@ -256,6 +267,14 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			return nil, err
 		}
 		store.OnUsage(r)
+		// If the response was 429 + "insufficient balance", the account's
+		// magic cube is exhausted. Update the accounts cache immediately so
+		// the frontend reflects the real balance without waiting for refresh.
+		if r.Failed && r.Failure != nil && modelscope.IsInsufficientBalance(r.Failure.StatusCode, r.Failure.Body) {
+			if mk := maskKey(r.AuthID); mk != "" {
+				markAccountExhausted(mk)
+			}
+		}
 		return okEnvelope(struct{}{})
 
 	case pluginabi.MethodManagementRegister:
@@ -295,6 +314,8 @@ func configure(raw []byte) error {
 		return err
 	}
 	store.Reconfigure(cfg)
+	// TODO: remove after debugging. Routes Modelscope API calls through proxy.
+	SetMSProxy(cfg.MsProxyURL)
 	store.Start()
 	// Inject the host-strategy fetcher so non-managed fallback candidates use
 	// the host's own routing semantics (fetched via the management API).
@@ -381,6 +402,76 @@ func configure(raw []byte) error {
 		}
 		return strings.TrimSpace(result.ProxyURL), nil
 	})
+	// Inject the midnight auto sign-in function: at the daily boundary
+	// (PruneAll dayChanged), iterate all resolved auth IDs, call
+	// /api/v1/users/login/info for each (activates daily magic cube),
+	// then fetch balance and rate-limit to update core state.
+	mc := &msClient{}
+	store.SetMidnightSignInFunc(func() {
+		cfg := currentConfig()
+		if cfg == nil || len(cfg.Providers) == 0 || cfg.ManagementKey == "" {
+			return
+		}
+		// Force a fresh resolve so we have the latest raw keys + site base URLs.
+		resolveKeysCached(cfg.HostBaseURL, cfg.ManagementKey, cfg.Providers)
+		resolved := getResolved()
+		if resolved.raw == nil {
+			return
+		}
+		now := time.Now()
+		
+		var swg sync.WaitGroup
+		sem := make(chan struct{}, 20)
+		for _, authID := range resolved.orderedAuthIDs {
+			sessionID := resolved.raw[authID]
+			sb := resolved.siteBase[authID]
+			aid := authID
+			sid := sessionID
+			sbCopy := sb
+			swg.Add(1)
+			sem <- struct{}{}
+			go func() {
+				defer swg.Done()
+				defer func() { <-sem }()
+				sc, _, err := mc.getWithRetry(sbCopy, "/api/v1/users/login/info", sid)
+				if err != nil || sc != 200 {
+					return
+				}
+				store.RecordCheckIn(aid, now)
+				var bSc, rlSc int
+				var bRaw, rlRaw []byte
+				var bErr, rlErr error
+				var bWg sync.WaitGroup
+				bWg.Add(2)
+				go func() { defer bWg.Done(); bSc, bRaw, bErr = mc.getWithRetry(sbCopy, "/openapi/v1/magicubes/balance", sid) }()
+				go func() { defer bWg.Done(); rlSc, rlRaw, rlErr = mc.getWithRetry(sbCopy, "/api/v1/inference/rate-limit", sid) }()
+				bWg.Wait()
+				if bErr == nil && bSc == 200 {
+					var b modelscope.MagicCubeBalance
+					if json.Unmarshal(bRaw, &b) == nil {
+						store.RecordMagicCube(aid, b.AvailableBalance, b.TotalBalance, b.FrozenAmount, now)
+					}
+				}
+				if rlErr == nil && rlSc == 200 {
+					var rl modelscope.InferenceRateLimit
+					if json.Unmarshal(rlRaw, &rl) == nil {
+						store.RecordUsagePerDay(aid, rl.CurrentUsagePerDay)
+					}
+				}
+			}()
+		}
+		swg.Wait()
+		// Refresh the accounts cache so the first page load is instant.
+		go func() {
+				refreshMu.Lock()
+				defer refreshMu.Unlock()
+				accountsCacheMu.Lock()
+				refreshInProgress = true
+				accountsCacheMu.Unlock()
+				refreshAccountsCache(getResolved())
+				markRefreshDone()
+			}()
+	})
 	cfgMu.Lock()
 	pluginCfg = cfg
 	cfgMu.Unlock()
@@ -389,6 +480,7 @@ func configure(raw []byte) error {
 	resolvedMu.Lock()
 	resolvedCache = resolvedEntry{}
 	resolvedMu.Unlock()
+	clearAllCaches()
 	strategyMu.Lock()
 	strategyCache = strategyEntry{}
 	strategyMu.Unlock()
@@ -505,24 +597,24 @@ func (g *stableIDGen) Next(kind string, parts ...string) string {
 // each api-key with stableIDGen (the host's StableIDGenerator algorithm), so
 // no auth-files join is needed (auth-files omits config-based api-keys). The
 // management key stays server-side; nothing sensitive reaches the browser.
-func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string]string, providerOrder map[string][]string, realTotal int, unmatched []string, err error) {
+func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string]string, raw map[string]string, siteBase map[string]string, orderedAuthIDs []string, providerOrder map[string][]string, realTotal int, unmatched []string, err error) {
 	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if base == "" {
-		return nil, nil, 0, nil, errors.New("host_base_url is empty")
+		return nil, nil, nil, nil, nil, 0, nil, errors.New("host_base_url is empty")
 	}
 
 	sc, body, err := httpDo("GET", base+"/v0/management/openai-compatibility", mgmtKey)
 	if err != nil {
-		return nil, nil, 0, nil, err
+		return nil, nil, nil, nil, nil, 0, nil, err
 	}
 	if sc != 200 {
-		return nil, nil, 0, nil, fmt.Errorf("openai-compatibility: HTTP %d", sc)
+		return nil, nil, nil, nil, nil, 0, nil, fmt.Errorf("openai-compatibility: HTTP %d", sc)
 	}
 	var oc struct {
 		List []mgmtOpenAICompatEntry `json:"openai-compatibility"`
 	}
 	if err := json.Unmarshal(body, &oc); err != nil {
-		return nil, nil, 0, nil, fmt.Errorf("decode openai-compatibility: %w", err)
+		return nil, nil, nil, nil, nil, 0, nil, fmt.Errorf("decode openai-compatibility: %w", err)
 	}
 
 	want := make(map[string]bool, len(providers))
@@ -533,6 +625,9 @@ func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string
 	}
 
 	masked = make(map[string]string)
+	raw = make(map[string]string)
+	siteBase = make(map[string]string)
+	orderedAuthIDs = make([]string, 0)
 	providerOrder = make(map[string][]string)
 	realTotal = 0
 	matched := make(map[string]bool, len(providers))
@@ -562,6 +657,9 @@ func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string
 			}
 			authID := idGen.Next(idKind, k.APIKey, e.BaseURL, k.ProxyURL)
 			masked[authID] = maskKey(k.APIKey)
+			raw[authID] = k.APIKey
+			siteBase[authID] = siteBaseFromURL(e.BaseURL)
+			orderedAuthIDs = append(orderedAuthIDs, authID)
 			providerOrder[nm] = append(providerOrder[nm], authID)
 		}
 	}
@@ -572,7 +670,7 @@ func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string
 			unmatched = append(unmatched, p)
 		}
 	}
-	return masked, providerOrder, realTotal, unmatched, nil
+	return masked, raw, siteBase, orderedAuthIDs, providerOrder, realTotal, unmatched, nil
 }
 
 func resolveKeysCached(baseURL, mgmtKey string, providers []string) (map[string]string, map[string][]string, int, []string, error) {
@@ -588,11 +686,26 @@ func resolveKeysCached(baseURL, mgmtKey string, providers []string) (map[string]
 			return c.masked, c.providerOrder, c.realTotal, c.unmatched, c.err
 		}
 	}
-	masked, providerOrder, realTotal, unmatched, err := resolveKeys(baseURL, mgmtKey, providers)
+	masked, raw, siteBase, orderedAuthIDs, providerOrder, realTotal, unmatched, err := resolveKeys(baseURL, mgmtKey, providers)
+	// Build O(1) maskedKey -> raw key lookup
+	maskToRaw := make(map[string]string, len(raw))
+	maskToSite := make(map[string]string, len(raw))
+	for authID, sid := range raw {
+		mk := maskKey(sid)
+		maskToRaw[mk] = sid
+		maskToSite[mk] = siteBase[authID]
+	}
 	resolvedMu.Lock()
-	resolvedCache = resolvedEntry{masked: masked, providerOrder: providerOrder, realTotal: realTotal, unmatched: unmatched, err: err, at: time.Now()}
+	resolvedCache = resolvedEntry{masked: masked, raw: raw, maskToRaw: maskToRaw, maskToSite: maskToSite, siteBase: siteBase, orderedAuthIDs: orderedAuthIDs, providerOrder: providerOrder, realTotal: realTotal, unmatched: unmatched, err: err, at: time.Now()}
 	resolvedMu.Unlock()
 	return masked, providerOrder, realTotal, unmatched, err
+}
+
+// getResolved returns the cached resolved entry (raw keys + site base URLs).
+func getResolved() *resolvedEntry {
+	resolvedMu.Lock()
+	defer resolvedMu.Unlock()
+	return &resolvedCache
 }
 
 // fetchProviderOrderCached returns a map from provider name to auth IDs in
@@ -659,7 +772,7 @@ func pluginRegistration() any {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             "modelscope-ratelimit",
-			Version:          "1.6.0",
+			Version:          "2.2.1",
 			Author:           "k452b",
 			GitHubRepository: "https://github.com/bytehola/modelscope-ratelimit",
 			ConfigFields: []pluginapi.ConfigField{
@@ -667,14 +780,12 @@ func pluginRegistration() any {
 				{Name: "host_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "CPA 链接地址，默认 http://127.0.0.1:8317。"},
 				{Name: "management_key", Type: pluginapi.ConfigFieldTypeString, Description: "CPA 管理密钥。（必填）"},
 				{Name: "credential_strategy", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"round-robin", "fill-first"}, Description: "凭据选择策略（仅对监控的 provider 生效）：round-robin=轮询（默认），fill-first=填充优先"},
-				{Name: "insufficient_quota_cooldown", Type: pluginapi.ConfigFieldTypeInteger, Description: "冷却基准秒数，默认 10。连续失败指数退避×2递增，封顶 60 秒。"},
+				{Name: "insufficient_quota_cooldown", Type: pluginapi.ConfigFieldTypeInteger, Description: "冷却基准秒数，默认 1。连续失败指数退避×2递增，封顶 60 秒。"},
 				{Name: "proxy_url", Type: pluginapi.ConfigFieldTypeString, Description: "代理 URL（选填，留空=不启用）。只有在 429 时才会开启，成功后关闭。格式：socks5://user:pass@host:port"},
 				{Name: "skip_provider_on_429", Type: pluginapi.ConfigFieldTypeBoolean, Description: "开启后，托管 provider 一旦 429，下一次调度直接跳到非托管 provider（一次性，不等冷却）。默认 false。"},
 				{Name: "timezone", Type: pluginapi.ConfigFieldTypeString, Description: "每日 00:00 重置所用时区，默认 Asia/Shanghai。（留空即可）"},
-				{Name: "model_remaining_header", Type: pluginapi.ConfigFieldTypeString, Description: "单模型剩余次数响应头名。（留空即可）"},
-				{Name: "total_remaining_header", Type: pluginapi.ConfigFieldTypeString, Description: "总剩余次数响应头名。（留空即可）"},
-				{Name: "disable_threshold", Type: pluginapi.ConfigFieldTypeInteger, Description: "剩余次数 ≤ 此值即禁用，默认 0（耗尽）。"},
 				{Name: "managed_models", Type: pluginapi.ConfigFieldTypeArray, Description: "可选：仅监控这些模型名，留空=全部。"},
+				{Name: "ms_proxy_url", Type: pluginapi.ConfigFieldTypeString, Description: "调试用：Modelscope API 代理地址（如 http://127.0.0.1:8888），留空=直连。"},
 			},
 		},
 		Capabilities: registrationCapabilities{
@@ -781,30 +892,316 @@ func statusOrGuidance() string {
 // never reaches the browser and the page is immune to browser same-origin /
 // third-party port-mismatch issues.
 func handleManagement(r managementRequest) managementResponse {
-	if r.Method != "GET" || !strings.HasSuffix(r.Path, "/status") {
-		return managementResponse{
-			StatusCode: 404,
-			Headers:    map[string][]string{"content-type": {"text/plain; charset=utf-8"}},
-			Body:       []byte("not found"),
-		}
+	// Route API endpoints via query parameter: ?api=accounts|account|transactions|checkin-all
+	api := getQuery(r, "api")
+	if api != "" {
+		return handleStatusAPI(r, api)
+	}
+	// Serve the embedded status page HTML (no query → HTML shell)
+	path := r.Path
+	if r.Method != "GET" || !strings.HasSuffix(path, "/status") {
+		return managementResponse{StatusCode: 404, Headers: map[string][]string{"content-type": {"text/plain; charset=utf-8"}}, Body: []byte("not found")}
 	}
 	cfg := currentConfig()
-	// Not configured yet: guide the operator to set providers + management_key.
 	if cfg == nil || len(cfg.Providers) == 0 || cfg.ManagementKey == "" {
 		return mgmtHTML(modelscope.RenderGuidanceHTML(cfg, modelscope.GuidanceMissing, ""))
 	}
-	masked, _, realTotal, unmatched, err := resolveKeysCached(cfg.HostBaseURL, cfg.ManagementKey, cfg.Providers)
-	if err != nil {
-		// Wrong management_key or unreachable host_base_url: guide, don't 502.
-		log.Printf("modelscope-ratelimit: server-side key resolution failed: %v", err)
-		return mgmtHTML(modelscope.RenderGuidanceHTML(cfg, modelscope.GuidanceResolutionFailed, err.Error()))
+	resolved := getResolved()
+	if resolved.err != nil || resolved.at.IsZero() {
+		masked, _, _, unmatched, err := resolveKeysCached(cfg.HostBaseURL, cfg.ManagementKey, cfg.Providers)
+		if err != nil {
+			return mgmtHTML(modelscope.RenderGuidanceHTML(cfg, modelscope.GuidanceResolutionFailed, err.Error()))
+		}
+		if len(unmatched) > 0 {
+			return mgmtHTML(modelscope.RenderGuidanceHTML(cfg, modelscope.GuidanceProviderNotFound, strings.Join(unmatched, ", ")))
+		}
+		_ = masked
 	}
-	if len(unmatched) > 0 {
-		// Configured providers don't exist upstream.
-		log.Printf("modelscope-ratelimit: configured providers not found: %v", unmatched)
-		return mgmtHTML(modelscope.RenderGuidanceHTML(cfg, modelscope.GuidanceProviderNotFound, strings.Join(unmatched, ", ")))
+	if len(resolved.unmatched) > 0 {
+		return mgmtHTML(modelscope.RenderGuidanceHTML(cfg, modelscope.GuidanceProviderNotFound, strings.Join(resolved.unmatched, ", ")))
 	}
-	return mgmtHTML(store.RenderStatusHTMLFull(store.Now(), cfg, masked, realTotal))
+	return mgmtHTML(string(statusPageHTML))
+}
+
+func handleStatusAPI(r managementRequest, api string) managementResponse {
+	cfg := currentConfig()
+	if cfg == nil || len(cfg.Providers) == 0 || cfg.ManagementKey == "" {
+		return mgmtJSONError(403, "not configured")
+	}
+	resolved := getResolved()
+	if resolved.err != nil || resolved.at.IsZero() || resolved.raw == nil {
+		_, _, _, _, err := resolveKeysCached(cfg.HostBaseURL, cfg.ManagementKey, cfg.Providers)
+		if err != nil {
+			return mgmtJSONError(502, err.Error())
+		}
+		resolved = getResolved()
+	}
+	mc := &msClient{}
+	switch api {
+	case "accounts":
+		refresh := getQuery(r, "refresh")
+		if refresh == "1" {
+			// Force a background refresh and return stale data immediately.
+			// The frontend's 5s polling will pick up fresh data when ready.
+			if forceBackgroundRefresh() {
+				go func() {
+					refreshMu.Lock()
+					defer refreshMu.Unlock()
+					refreshAccountsCache(getResolved())
+					markRefreshDone()
+				}()
+			}
+			stale := getStaleAccountsCache()
+			if stale != nil {
+				return mgmtJSON(map[string]any{"accounts": stale, "fetchedAt": getAccountsCacheTime()})
+			}
+			// No cache at all (first load): fetch synchronously
+			fresh := refreshAccountsCache(resolved)
+			return mgmtJSON(map[string]any{"accounts": fresh, "fetchedAt": time.Now().Format("15:04:05")})
+		}
+		stale := getStaleAccountsCache()
+		if stale != nil {
+			// Return stale data immediately; trigger background refresh if expired
+			if shouldBackgroundRefresh() {
+				go func() {
+					refreshMu.Lock()
+					defer refreshMu.Unlock()
+					refreshAccountsCache(getResolved())
+					markRefreshDone()
+				}()
+			}
+			return mgmtJSON(map[string]any{"accounts": stale, "fetchedAt": getAccountsCacheTime()})
+		}
+		// No cache at all: fetch synchronously (first load only)
+		fresh := refreshAccountsCache(resolved)
+		return mgmtJSON(map[string]any{"accounts": fresh, "fetchedAt": time.Now().Format("15:04:05")})
+	case "account":
+		mk := getQuery(r, "key")
+		if mk == "" {
+			return mgmtJSONError(400, "missing key")
+		}
+		sessionID, sb := getKeysByMask(resolved, mk)
+		if sessionID == "" {
+			return mgmtJSONError(404, "key not found")
+		}
+		site := "cn"
+		if strings.Contains(sb, "modelscope.ai") {
+			site = "ai"
+		}
+		if d, ok := getCachedDetail(mk); ok {
+			return mgmtJSON(d)
+		}
+		// Look up the cached account summary to populate profile fields
+		// without calling users/info + login/info again.
+		var src *accountSummary
+		accountsCacheMu.Lock()
+		for i := range accountsCache.results {
+			if accountsCache.results[i].MaskedKey == mk {
+				s := accountsCache.results[i]
+				src = &s
+				break
+			}
+		}
+		accountsCacheMu.Unlock()
+		d := mc.fetchAccountDetailConcurrent(0, sessionID, sb, site, src)
+		setCachedDetail(mk, d)
+		return mgmtJSON(d)
+	case "transactions":
+		mk := getQuery(r, "key")
+		if mk == "" {
+			return mgmtJSONError(400, "missing key")
+		}
+		sessionID, sb := getKeysByMask(resolved, mk)
+		if sessionID == "" {
+			return mgmtJSONError(404, "key not found")
+		}
+		page := getQueryInt(r, "page")
+		if page <= 0 {
+			page = 1
+		}
+		pageSize := getQueryInt(r, "page_size")
+		if pageSize <= 0 {
+			pageSize = 50
+		}
+		data, err := mc.fetchTransactions(sb, sessionID, page, pageSize)
+		if err != nil {
+			return mgmtJSON(map[string]any{"error": err.Error(), "records": []any{}})
+		}
+		return mgmtJSONRaw(data)
+	case "checkin-all":
+		// Sign in all accounts (concurrent), then refresh the accounts cache
+		// so the next ?api=accounts call returns fresh data instantly.
+		type checkinResult struct {
+			idx int
+			ok  bool
+			sc  int
+		}
+	var (
+			cmu sync.Mutex
+			cwg sync.WaitGroup
+			cout = make([]checkinResult, 0, len(resolved.raw))
+			csem = make(chan struct{}, 20)
+		)
+		ci := 0
+		for _, authID := range resolved.orderedAuthIDs {
+			sessionID := resolved.raw[authID]
+			sb := resolved.siteBase[authID]
+			i := ci
+			sid := sessionID
+			sbCopy := sb
+			ci++
+			cwg.Add(1)
+			csem <- struct{}{}
+			go func() {
+				defer cwg.Done()
+				defer func() { <-csem }()
+				sc, _, err := mc.getWithRetry(sbCopy, "/api/v1/users/login/info", sid)
+				cmu.Lock()
+				cout = append(cout, checkinResult{i, err == nil && sc == 200, sc})
+				cmu.Unlock()
+			}()
+		}
+		cwg.Wait()
+		sort.Slice(cout, func(a, b int) bool { return cout[a].idx < cout[b].idx })
+		results := make([]map[string]any, len(cout))
+		ok := 0
+		for i, r := range cout {
+			results[i] = map[string]any{"success": r.ok, "status": r.sc}
+			if r.ok {
+				ok++
+			}
+		}
+		// Refresh the accounts cache so the next ?api=accounts is instant.
+		clearAllCaches()
+		if forceBackgroundRefresh() {
+			go func() {
+				refreshMu.Lock()
+				defer refreshMu.Unlock()
+				refreshAccountsCache(resolved)
+				markRefreshDone()
+			}()
+		}
+		return mgmtJSON(results)
+	case "refresh-balance":
+		mk := getQuery(r, "key")
+		if mk == "" {
+			return mgmtJSONError(400, "missing key")
+		}
+		sessionID, sb := getKeysByMask(resolved, mk)
+		if sessionID == "" {
+			return mgmtJSONError(404, "key not found")
+		}
+		mc := &msClient{}
+		// Fetch balance + transactions concurrently
+		var (
+			bSc, txSc   int
+			bRaw, txRaw []byte
+			bErr, txErr error
+			bwg         sync.WaitGroup
+		)
+		bwg.Add(2)
+		go func() { defer bwg.Done(); bSc, bRaw, bErr = mc.getWithRetry(sb, "/openapi/v1/magicubes/balance", sessionID) }()
+		go func() { defer bwg.Done(); txSc, txRaw, txErr = mc.getWithRetry(sb, "/openapi/v1/magicubes/transactions?page=1&page_size=50", sessionID) }()
+		bwg.Wait()
+	result := map[string]any{"balance": nil, "todayConsumed": 0, "records": []any{}}
+	if bErr == nil && bSc == 200 {
+		var b modelscope.MagicCubeBalance
+		if json.Unmarshal(bRaw, &b) == nil {
+			result["balance"] = map[string]any{"total": b.TotalBalance, "available": b.AvailableBalance, "frozen": b.FrozenAmount}
+			// Update the accounts cache so the next ?api=accounts
+			// reflects the real balance (fixes markAccountExhausted
+			// having set available=0 / schedule=exhausted).
+			accountsCacheMu.Lock()
+			for i := range accountsCache.results {
+				if accountsCache.results[i].MaskedKey == mk {
+					accountsCache.results[i].Balance = &balanceJSON{
+						Total: b.TotalBalance, Available: b.AvailableBalance, Frozen: b.FrozenAmount,
+					}
+					if b.AvailableBalance <= 0 {
+						accountsCache.results[i].Schedule = "exhausted"
+					} else {
+						accountsCache.results[i].Schedule = "normal"
+					}
+					break
+				}
+			}
+			accountsCacheMu.Unlock()
+		}
+	}
+		if txErr == nil && txSc == 200 {
+			var tx modelscope.TransactionsResp
+			if json.Unmarshal(txRaw, &tx) == nil {
+				// Calculate todayConsumed from SPEND_CONFIRM records
+				today := time.Now().Format("2006-01-02")
+				consumed := 0
+				for _, rec := range tx.Records {
+					if rec.GmtCreated == today && rec.Type == "SPEND_CONFIRM" {
+						consumed += rec.TotalAmount
+					}
+				}
+				result["todayConsumed"] = consumed
+				// Serialize tx.Records as []any for JSON response
+				recsJSON, _ := json.Marshal(tx.Records)
+				var recs []any
+				if json.Unmarshal(recsJSON, &recs) == nil {
+					result["records"] = recs
+				}
+				result["page"] = tx.Page
+				result["pageSize"] = tx.PageSize
+				result["total"] = tx.Total
+			}
+		}
+		return mgmtJSON(result)
+	case "stats":
+		cdCount, cdWait := store.CooldownStats()
+		return mgmtJSON(map[string]any{
+			"successCount": store.SuccessStats(),
+			"cooldownCount": cdCount,
+			"cooldownWait": cdWait.Seconds(),
+			"totalKeys":    len(resolved.raw),
+			"modelUsage":   store.ModelUsageStats(),
+		})
+	}
+	return mgmtJSONError(404, "unknown api: "+api)
+}
+
+// getQuery returns the first value of a query parameter.
+func getQuery(r managementRequest, key string) string {
+	if vals, ok := r.Query[key]; ok && len(vals) > 0 {
+		return vals[0]
+	}
+	return ""
+}
+
+// getQueryInt returns the first value of a query parameter as an int, or -1 if absent.
+func getQueryInt(r managementRequest, key string) int {
+	s := getQuery(r, key)
+	if s == "" {
+		return -1
+	}
+	var n int
+	fmt.Sscanf(s, "%d", &n)
+	return n
+}
+
+// getKeysByMask finds the raw session ID and site base by masked key (last 12 chars).
+// O(1) lookup using pre-built maskToRaw + maskToSite maps.
+func getKeysByMask(r *resolvedEntry, maskedKey string) (string, string) {
+	return r.maskToRaw[maskedKey], r.maskToSite[maskedKey]
+}
+
+func mgmtJSON(v any) managementResponse {
+	raw, _ := json.Marshal(v)
+	return managementResponse{StatusCode: 200, Headers: map[string][]string{"content-type": {"application/json; charset=utf-8"}}, Body: raw}
+}
+
+func mgmtJSONRaw(raw json.RawMessage) managementResponse {
+	return managementResponse{StatusCode: 200, Headers: map[string][]string{"content-type": {"application/json; charset=utf-8"}}, Body: raw}
+}
+
+func mgmtJSONError(code int, msg string) managementResponse {
+	raw, _ := json.Marshal(map[string]string{"error": msg})
+	return managementResponse{StatusCode: code, Headers: map[string][]string{"content-type": {"application/json; charset=utf-8"}}, Body: raw}
 }
 
 func mgmtHTML(html string) managementResponse {

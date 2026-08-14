@@ -116,9 +116,10 @@ func TestSkipProviderOn429Any429Body(t *testing.T) {
 	if s.HasSkippedProviders() {
 		t.Fatal("limit_burst_rate 429 must NOT add to skip set (only insufficient_quota does)")
 	}
-	// The limit_burst_rate key should be daily-disabled (normal handling).
-	if !s.isDisabled("m-2", "Qwen-72B", now) {
-		t.Fatal("limit_burst_rate 429 key must be daily-disabled (normal handling, not skip)")
+	// limit_burst_rate 429 must NOT daily-disable (only 429 + "insufficient balance"
+	// triggers the magic-cube-exhausted daily disable).
+	if s.isDisabled("m-2", "Qwen-72B", now) {
+		t.Fatal("limit_burst_rate 429 must not daily-disable")
 	}
 }
 

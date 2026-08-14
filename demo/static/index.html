@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Modelscope 魔粒限流 Demo</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html{overflow-y:scroll;scrollbar-gutter:stable}
+body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Helvetica Neue",Helvetica,Arial,"PingFang SC",sans-serif;background:#fbfbfd;color:#1d1d1f;-webkit-font-smoothing:antialiased;padding:24px 16px 56px}
+.wrap{max-width:1040px;margin:0 auto}
+.title{font-size:28px;font-weight:700;letter-spacing:-.02em;margin-bottom:4px}
+.sub{font-size:13px;color:#86868b;line-height:1.6;margin-bottom:16px}
+.sub b{color:#1d1d1f;font-weight:600}
+.toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:20px}
+.btn{display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:600;padding:8px 16px;border-radius:980px;border:none;cursor:pointer;transition:opacity .15s;white-space:nowrap}
+.btn:active{transform:scale(.97)}
+.btn-primary{background:#0071e3;color:#fff}
+.btn-primary:hover{background:#0077ed}
+.btn-primary:disabled{opacity:.5;cursor:default}
+.refresh-dot{width:6px;height:6px;border-radius:50%;background:#1a7f37}
+.refresh-dot.on{animation:pulse 2s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.tabs{display:flex;gap:0;border-bottom:1px solid #e8e8ed;margin-bottom:20px}
+.tab{padding:9px 20px;font-size:14px;font-weight:600;color:#86868b;cursor:pointer;border-bottom:2px solid transparent;transition:color .15s,border-color .15s;user-select:none}
+.tab:hover{color:#1d1d1f}
+.tab.active{color:#0071e3;border-bottom-color:#0071e3}
+.tab-panel{display:none}
+.tab-panel.active{display:block}
+.section{font-size:17px;font-weight:600;letter-spacing:-.01em;margin:24px 0 10px}
+.section .hint{font-size:11px;color:#86868b;font-weight:400;margin-left:8px}
+.cards{display:flex;gap:12px;flex-wrap:wrap}
+.card{background:#fff;border-radius:14px;padding:14px 16px;box-shadow:0 1px 3px rgba(0,0,0,.04),0 6px 16px rgba(0,0,0,.03);min-width:140px;flex:1}
+.card .k{font-size:11px;color:#86868b;margin-bottom:5px}
+.card .v{font-size:24px;font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.card .sub-v{font-size:10px;color:#86868b;margin-top:3px}
+.v.green{color:#1a7f37}.v.red{color:#bf0711}.v.blue{color:#0066cc}.v.orange{color:#b25000}
+.mcard{background:#fff;border-radius:12px;padding:12px 14px;box-shadow:0 1px 3px rgba(0,0,0,.04);min-width:160px;flex:1}
+.mcard .mn{font-size:11px;color:#86868b;margin-bottom:5px;word-break:break-all}
+.mcard .ma{font-size:20px;font-weight:600;color:#1a7f37;letter-spacing:-.01em}
+.mcard .mk{font-size:11px;color:#86868b;margin-top:3px}
+table{width:100%;border-collapse:collapse;background:#fff;border-radius:14px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.04),0 6px 16px rgba(0,0,0,.03)}
+#rl-keys{table-layout:fixed}
+#rl-keys th:nth-child(1),#rl-keys td:nth-child(1){width:32%}
+#rl-keys th:nth-child(2),#rl-keys td:nth-child(2){width:22%}
+#rl-keys th:nth-child(3),#rl-keys td:nth-child(3){width:18%}
+#rl-keys th:nth-child(4),#rl-keys td:nth-child(4){width:12%}
+#rl-keys th:nth-child(5),#rl-keys td:nth-child(5){width:16%}
+th{text-align:left;font-size:11px;font-weight:400;color:#86868b;text-transform:uppercase;letter-spacing:.04em;padding:12px 14px;border-bottom:1px solid #e8e8ed;background:#fafafa;cursor:pointer;user-select:none;position:relative;transition:color .15s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+th:hover{color:#1d1d1f}
+th::after{content:"";display:inline-block;width:5px;height:5px;border-radius:50%;background:#0071e3;opacity:0;transition:opacity .25s,transform .25s;margin-left:5px;vertical-align:middle}
+th.sort-asc::after{opacity:1;transform:translateY(2px)}
+th.sort-desc::after{opacity:1;transform:translateY(-4px)}
+td{padding:12px 14px;border-bottom:1px solid #f0f0f3;font-size:13px;vertical-align:middle;overflow:hidden}
+tr:last-child td{border-bottom:none}
+tbody tr:hover td{background:#f8f8fa}
+tbody tr.expanded td{background:#f0f7ff}
+.acct-cell{display:flex;align-items:center;gap:6px;cursor:pointer;overflow:hidden}
+.expand-arrow{display:inline-block;width:8px;font-size:10px;color:#86868b;transition:transform .2s;flex-shrink:0}
+tr.expanded .expand-arrow{transform:rotate(90deg)}
+.acct-name{font-size:13px;font-weight:600;flex-shrink:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.prov{display:inline-block;font-size:10px;font-weight:600;color:#86868b;background:#f0f0f3;border-radius:980px;padding:1px 7px;margin-left:3px;flex-shrink:0}
+.badge{display:inline-block;font-size:11px;font-weight:600;padding:2px 9px;border-radius:980px;white-space:nowrap}
+.b-ok{background:#e8f5e9;color:#1a7f37}.b-glob{background:#fdecec;color:#bf0711}.b-frozen{background:#e8eaf6;color:#3949ab}.b-aliyun{background:#e3f2fd;color:#0d47a1}
+.when{display:block;font-size:10px;color:#86868b;margin-top:2px}
+.bv{font-size:12px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap}
+.bv.r{color:#bf0711}.bv.a{color:#b25000}.bv.g{color:#1a7f37}
+.track{height:5px;background:#f0f0f3;border-radius:980px;overflow:hidden;min-width:60px;margin-top:3px}
+.fill{display:block;height:100%;border-radius:980px}
+.fill.g{background:#1a7f37}.fill.a{background:#b25000}.fill.r{background:#bf0711}
+.tb{display:flex;flex-direction:column;gap:1px;min-width:0}
+.dash{color:#86868b}
+.cons-link{color:#0071e3;cursor:pointer;font-weight:600;font-size:12px}
+.detail-row td{padding:0!important;background:#fafbfc!important;border-bottom:1px solid #f0f0f3}
+.detail-panel{padding:12px 18px}
+.dp-section{margin-bottom:12px}
+.dp-section:last-child{margin-bottom:0}
+.dp-title{font-size:10px;font-weight:600;color:#86868b;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px}
+.dp-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:3px 16px}
+.dp-item{font-size:12px;display:flex;align-items:baseline;gap:6px}
+.dp-item .dk{color:#86868b;min-width:68px;flex-shrink:0}
+.dp-item .dv{color:#1d1d1f;font-weight:500;word-break:break-all}
+.dp-tokens{display:flex;flex-direction:column;gap:5px}
+.dp-token{display:flex;align-items:center;gap:8px;font-size:11px;padding:5px 10px;background:#fff;border-radius:8px;border:1px solid #f0f0f3}
+.dp-token .dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+.dp-token .dot.g{background:#1a7f37}.dp-token .dot.r{background:#bf0711}
+.dp-token .t-name{font-weight:600;color:#424245;min-width:70px}
+.dp-token .t-val{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;color:#86868b}
+.dp-token .t-meta{font-size:10px;color:#86868b;margin-left:auto}
+.checkin-grid{display:flex;gap:8px;flex-wrap:wrap}
+.ci-card{background:#fff;border-radius:10px;padding:9px 13px;box-shadow:0 1px 3px rgba(0,0,0,.04);min-width:150px;flex:1;display:flex;align-items:center;gap:8px;border:1px solid transparent}
+.ci-card.signed{border-color:#c6e8c5}.ci-card.unsigned{border-color:#f5cdc8}
+.ci-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.ci-dot.ok{background:#1a7f37}.ci-dot.no{background:#bf0711}
+.ci-body{min-width:0;flex:1}
+.ci-name{font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ci-status{font-size:10px;color:#86868b;margin-top:1px}
+.tx-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+.tx-filters{display:flex;gap:4px}
+.tx-filter{font-size:12px;font-weight:600;padding:5px 14px;border-radius:980px;border:1px solid #e8e8ed;background:#fff;color:#86868b;cursor:pointer;transition:all .15s}
+.tx-filter:hover{border-color:#0071e3;color:#0071e3}
+.tx-filter.active{background:#0071e3;border-color:#0071e3;color:#fff}
+.tx-pagination{display:flex;align-items:center;gap:10px;margin-top:14px;font-size:12px;color:#86868b}
+.tx-page-btn{font-size:12px;padding:5px 14px;border-radius:8px;border:1px solid #e8e8ed;background:#fff;color:#1d1d1f;cursor:pointer;font-weight:600}
+.tx-page-btn:hover:not(:disabled){border-color:#0071e3;color:#0071e3}
+.tx-page-btn:disabled{opacity:.4;cursor:default}
+.type-badge{font-size:10px;font-weight:600;padding:2px 8px;border-radius:980px;white-space:nowrap}
+.tb-earn{background:#e8f5e9;color:#1a7f37}.tb-spend{background:#fff4e0;color:#b25000}.tb-expire{background:#f0f0f3;color:#86868b}
+.tier-badge{font-size:10px;font-weight:600;padding:1px 7px;border-radius:980px}
+.tier-lite{background:#e8f5e9;color:#1a7f37}.tier-standard{background:#e3f2fd;color:#0d47a1}.tier-ultra{background:#fff4e0;color:#b25000}
+.tx-amount{font-weight:700;font-variant-numeric:tabular-nums}
+.tx-amount.earn{color:#1a7f37}.tx-amount.spend{color:#b25000}.tx-amount.expire{color:#86868b;text-decoration:line-through}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(20px);background:#1d1d1f;color:#fff;font-size:12px;padding:9px 18px;border-radius:980px;box-shadow:0 4px 16px rgba(0,0,0,.2);opacity:0;pointer-events:none;transition:opacity .25s,transform .25s;z-index:999}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+@media(max-width:700px){.wrap{padding:0 4px}.cards .card,.checkin-grid .ci-card{min-width:calc(50% - 4px)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="title">Modelscope 魔粒限流 Demo</div>
+  <div class="sub" id="subtitle">连接服务器中…</div>
+  <div class="toolbar">
+    <div style="display:flex;align-items:center;gap:8px"><span class="refresh-dot on" id="ping"></span><span style="font-size:11px;color:#86868b" id="ping-text">连接中…</span></div>
+    <button class="btn btn-primary" id="toolbar-btn" onclick="toolbarAction()" disabled>一键签到</button>
+  </div>
+  <div class="tabs">
+    <div class="tab active" data-tab="overview" onclick="switchTab('overview')">总览</div>
+    <div class="tab" data-tab="accounts" onclick="switchTab('accounts')">账号管理</div>
+    <div class="tab" data-tab="transactions" onclick="switchTab('transactions')">魔粒记录</div>
+    <div class="tab" data-tab="checkin" onclick="switchTab('checkin')">每日签到</div>
+  </div>
+
+  <div class="tab-panel active" data-tab="overview">
+    <div class="section">魔粒数据看板</div>
+    <div class="cards" id="cube-cards"><div style="color:#86868b;padding:20px">加载中…</div></div>
+    <div class="section">请求统计</div>
+    <div class="cards" style="margin-bottom:20px">
+      <div class="card"><div class="k">请求成功</div><div class="v green">—</div></div>
+      <div class="card"><div class="k">退避触发</div><div class="v">—</div></div>
+      <div class="card"><div class="k">累计等待</div><div class="v">—</div></div>
+    </div>
+    <div class="section">按模型请求次数汇总</div>
+    <div class="cards">
+      <div class="mcard"><div class="mn">ZhipuAI/GLM-5.2</div><div class="ma">—</div><div class="mk">加载中</div></div>
+      <div class="mcard"><div class="mn">deepseek-ai/DeepSeek-V4-Pro</div><div class="ma">—</div><div class="mk">加载中</div></div>
+    </div>
+  </div>
+
+  <div class="tab-panel" data-tab="accounts">
+    <div class="section">账号与 Token 管理<span class="hint">点击账号行展开详情 · 点击消耗跳转魔粒记录</span></div>
+    <table id="rl-keys">
+      <thead><tr><th>账号</th><th>签到状态</th><th>可用魔粒</th><th>今日消耗</th><th>调度状态</th></tr></thead>
+      <tbody id="rl-tbody"><tr><td colspan="5" style="text-align:center;color:#86868b;padding:20px">加载中…</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="tab-panel" data-tab="transactions">
+    <div class="section">魔粒记录</div>
+    <div id="tx-account-display" style="font-size:13px;color:#1d1d1f;font-weight:600;margin-bottom:10px"></div>
+    <div class="tx-toolbar">
+      <div class="tx-filters">
+        <button class="tx-filter active" data-type="all" onclick="setTxFilter('type','all')">全部</button>
+        <button class="tx-filter" data-type="EARN" onclick="setTxFilter('type','EARN')">发放</button>
+        <button class="tx-filter" data-type="SPEND_CONFIRM" onclick="setTxFilter('type','SPEND_CONFIRM')">消耗</button>
+        <button class="tx-filter" data-type="EXPIRE" onclick="setTxFilter('type','EXPIRE')">过期</button>
+      </div>
+      <button class="tx-filter" id="tx-refresh-btn" onclick="refreshTxData()">刷新</button>
+    </div>
+    <table id="tx-table">
+      <thead><tr><th>时间</th><th>类型</th><th>账号</th><th>来源</th><th>模型等级</th><th>次数</th><th>金额</th><th>过期信息</th></tr></thead>
+      <tbody id="tx-tbody"><tr><td colspan="8" style="text-align:center;color:#86868b;padding:20px">请选择账号</td></tr></tbody>
+    </table>
+    <div class="tx-pagination">
+      <span id="tx-page-info"></span>
+      <button class="tx-page-btn" id="tx-prev" onclick="txChangePage(-1)" disabled>上一页</button>
+      <button class="tx-page-btn" id="tx-next" onclick="txChangePage(1)" disabled>下一页</button>
+    </div>
+  </div>
+
+  <div class="tab-panel" data-tab="checkin">
+    <div class="section">每日签到状态看板</div>
+    <div class="checkin-grid" id="checkin-grid"><div style="color:#86868b;padding:20px">加载中…</div></div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+var SCHED={normal:['b-ok','正常调度'],exhausted:['b-glob','魔粒耗尽禁用'],unauthorized:['b-frozen','密钥失效'],error:['b-frozen','请求失败']};
+var TIER_LABEL={lite:'轻量',standard:'主流',ultra:'旗舰'};
+var RULE_LABEL={daily_active:'注册并登录',aliyun_bindlogin:'绑定阿里云账号',api_inference:'API 推理',expire:'魔粒过期'};
+
+var ACCOUNTS=[];
+var signedInToday=false;
+var lastRefreshTime='—';
+var expandedIdxs=[];
+var sortState={col:2,dir:-1};
+
+var txType='all',txAccount='all',txPage=1,txPageSize=50,txRecords=[],txTotal=0;
+
+function xhr(method,url,body,cb){
+  var x=new XMLHttpRequest();
+  x.open(method,url,true);
+  if(body)x.setRequestHeader('Content-Type','application/json');
+  x.onreadystatechange=function(){
+    if(x.readyState===4){
+      var d=null;try{d=x.responseText?JSON.parse(x.responseText):null;}catch(e){d=null;}
+      cb(x.status,d);
+    }
+  };
+  x.send(body||null);
+}
+
+var toastTimer=null;
+function toast(msg){
+  var el=document.getElementById('toast');el.textContent=msg;el.classList.add('show');
+  clearTimeout(toastTimer);toastTimer=setTimeout(function(){el.classList.remove('show');},2400);
+}
+
+function switchTab(name){
+  document.querySelectorAll('.tab').forEach(function(t){t.classList.toggle('active',t.dataset.tab===name);});
+  document.querySelectorAll('.tab-panel').forEach(function(p){p.classList.toggle('active',p.dataset.tab===name);});
+}
+
+function renderSubtitle(baseURL,keyCount){
+  var site=baseURL.indexOf('modelscope.ai')>=0?'国际站 (modelscope.ai)':'国内站 (modelscope.cn)';
+  document.getElementById('subtitle').innerHTML='Base URL: <b>'+baseURL+'</b> · 站点: <b>'+site+'</b> · 密钥数: <b>'+keyCount+'</b>';
+}
+
+function renderCubeCards(){
+  var avail=0,consume=0,earn=0,platformUsage=0;
+  ACCOUNTS.forEach(function(a){
+    if(a.balance)avail+=a.balance.available;
+    platformUsage+=a.usagePerDay||0;
+  });
+  // consume & earn computed from today's transactions (loaded separately)
+  document.getElementById('cube-cards').innerHTML=
+    '<div class="card"><div class="k">可用魔粒总额</div><div class="v green">'+avail.toLocaleString()+'</div><div class="sub-v">含短期+长期魔粒</div></div>'
+   +'<div class="card"><div class="k">今日已消耗魔粒</div><div class="v orange">'+consume+'</div><div class="sub-v">SPEND_CONFIRM 累计</div></div>'
+   +'<div class="card"><div class="k">今日签到赠送魔粒</div><div class="v blue">+'+earn+'</div><div class="sub-v">'+ACCOUNTS.filter(function(a){return a.checkedIn;}).length+' 个账号已签到</div></div>'
+   +'<div class="card"><div class="k">平台侧今日调用量</div><div class="v">'+platformUsage.toLocaleString()+'</div><div class="sub-v">更新于 '+lastRefreshTime+'</div></div>';
+}
+
+function renderCheckinGrid(){
+  var html='';
+  ACCOUNTS.forEach(function(a,i){
+    var cls,dot,statusText;
+    if(a.checkedIn){cls='signed';dot='ok';statusText='已签到 '+(a.lastCheckIn||'').slice(11,16);}
+    else{cls='unsigned';dot='no';statusText=a.schedule==='unauthorized'?'签到失败 · 密钥失效':'未签到';}
+    html+='<div class="ci-card '+cls+'" style="cursor:pointer" onclick="goAccountTx('+i+')"><span class="ci-dot '+dot+'"></span><div class="ci-body"><div class="ci-name" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+(a.email||a.maskedKey)+'</div><div class="ci-status">'+statusText+'</div></div></div>';
+  });
+  document.getElementById('checkin-grid').innerHTML=html||'<div style="color:#86868b;padding:20px">无账号</div>';
+}
+
+function renderTable(){
+  var html='';
+  ACCOUNTS.forEach(function(a,i){
+    var sched=SCHED[a.schedule]||SCHED.error;
+    var acctHtml='<div class="acct-cell" title="'+(a.name||'')+' · '+(a.email||'')+'"><span class="expand-arrow">&#9654;</span><span class="acct-name">'+a.maskedKey+'</span><span class="prov">'+a.site+'</span></div>';
+    var ciHtml=a.checkedIn?'<span class="badge b-ok">已签到</span><span class="when">'+(a.lastCheckIn||'').slice(11)+'</span>':'<span class="badge b-glob">未签到</span><span class="when">'+(a.error||'')+'</span>';
+    var bal=a.balance||{total:0,available:0};
+    var ratio=bal.total>0?Math.round(bal.available/bal.total*100):0;
+    var fc=ratio>50?'g':(ratio>0?'a':'r');
+    var cubeHtml='<div class="tb"><span class="bv '+(bal.available>0?'g':'r')+'">'+bal.available+' / '+bal.total+'</span><div class="track"><i class="fill '+fc+'" style="width:'+ratio+'%"></i></div></div>';
+    var consHtml='<span class="cons-link" onclick="event.stopPropagation();goAccountTx('+i+')">查看</span>';
+    var sHtml='<span class="badge '+sched[0]+'">'+sched[1]+'</span>';
+    if(a.error)sHtml+='<span class="when">'+a.error+'</span>';
+    html+='<tr onclick="toggleExpand('+i+')" data-idx="'+i+'">'
+      +'<td data-sort="'+a.maskedKey+'">'+acctHtml+'</td>'
+      +'<td data-sort="'+(a.checkedIn?1:0)+'">'+ciHtml+'</td>'
+      +'<td data-sort="'+bal.available+'">'+cubeHtml+'</td>'
+      +'<td data-sort="0">'+consHtml+'</td>'
+      +'<td data-sort="'+(['normal','exhausted','unauthorized','error'].indexOf(a.schedule))+'">'+sHtml+'</td>'
+      +'</tr>';
+  });
+  document.getElementById('rl-tbody').innerHTML=html||'<tr><td colspan="5" style="text-align:center;color:#86868b;padding:20px">无账号</td></tr>';
+  applySort();
+}
+
+function renderDetailPanel(d){
+  var p='<div class="detail-panel">'
+    +'<div class="dp-section"><div class="dp-title">个人信息</div><div class="dp-grid">'
+    +'<div class="dp-item"><span class="dk">用户名</span><span class="dv">'+(d.name||'—')+'</span></div>'
+    +'<div class="dp-item"><span class="dk">昵称</span><span class="dv">'+(d.nickName||'—')+'</span></div>'
+    +'<div class="dp-item"><span class="dk">邮箱</span><span class="dv">'+(d.email||'—')+'</span></div>'
+    +'<div class="dp-item"><span class="dk">手机号</span><span class="dv">'+(d.phone||'—')+'</span></div>'
+    +'<div class="dp-item"><span class="dk">Havana ID</span><span class="dv">'+(d.havanaId||'—')+'</span></div>'
+    +'<div class="dp-item"><span class="dk">来源站点</span><span class="dv">'+(d.fromSite||'—')+'</span></div>'
+    +'<div class="dp-item"><span class="dk">站点</span><span class="dv">'+(d.site==='ai'?'国际站':'国内站')+'</span></div>'
+    +'<div class="dp-item"><span class="dk">实名认证</span><span class="dv">'+(d.isRealName?'已认证':'未认证')+'</span></div>'
+    +'<div class="dp-item"><span class="dk">阿里云绑定</span><span class="dv">'+(d.aliyunBound?'已绑定 ('+(d.aliyunNick||'')+')':'未绑定')+'</span></div>'
+    +'<div class="dp-item"><span class="dk">组织</span><span class="dv">'+(d.org||'—')+'</span></div>'
+    +'<div class="dp-item"><span class="dk">学校</span><span class="dv">'+(d.school||'—')+'</span></div>'
+    +'<div class="dp-item"><span class="dk">行业</span><span class="dv">'+(d.industry||'—')+'</span></div>'
+    +'<div class="dp-item"><span class="dk">魔粒等级</span><span class="dv">'+(d.level||'—')+'</span></div>'
+    +'<div class="dp-item"><span class="dk">最近过期</span><span class="dv">'+(d.expiryAt||'—')+(d.expiryAmt>0?' ('+d.expiryAmt+' 魔粒)':'')+'</span></div>'
+    +'<div class="dp-item"><span class="dk">平台调用量</span><span class="dv">'+(d.usagePerDay||0)+' 次/日</span></div>'
+    +'<div class="dp-item"><span class="dk">SDK Token</span><span class="dv" style="font-family:ui-monospace,monospace;font-size:10.5px">'+(d.sdkToken||'—')+'</span></div>'
+    +'</div></div>'
+    +'<div class="dp-section"><div class="dp-title">Token 列表</div><div class="dp-tokens">';
+  if(d.tokens&&d.tokens.length){
+    d.tokens.forEach(function(t){
+      p+='<div class="dp-token"><span class="dot '+(t.valid?'g':'r')+'"></span><span class="t-name">'+t.name+'</span><span class="t-val">'+t.token+'</span><span class="t-meta">'+(t.valid?'有效':'已失效')+'</span></div>';
+    });
+  }else{p+='<div style="color:#86868b;font-size:11px">无 Token</div>';}
+  p+='</div></div></div>';
+  return p;
+}
+
+function expandDetail(idx){
+  var tbody=document.getElementById('rl-tbody');
+  var row=tbody.querySelector('tr[data-idx="'+idx+'"]');
+  if(!row||expandedIdxs.indexOf(idx)>=0)return;
+  var dr=document.createElement('tr');
+  dr.className='detail-row';
+  dr.innerHTML='<td colspan="5"><div class="detail-panel" style="color:#86868b;padding:14px 18px">加载中…</div></td>';
+  row.parentNode.insertBefore(dr,row.nextSibling);
+  row.classList.add('expanded');
+  expandedIdxs.push(idx);
+  xhr('GET','/api/account/'+idx,null,function(sc,d){
+    if(sc===200&&d){dr.innerHTML='<td colspan="5">'+renderDetailPanel(d)+'</td>';}
+    else{dr.innerHTML='<td colspan="5"><div class="detail-panel" style="color:#bf0711;padding:14px 18px">加载失败: '+(sc||'')+'</div></td>';}
+  });
+}
+function collapseDetail(idx){
+  var tbody=document.getElementById('rl-tbody');
+  var row=tbody.querySelector('tr[data-idx="'+idx+'"]');
+  if(!row)return;
+  var dr=row.nextElementSibling;
+  if(dr&&dr.classList.contains('detail-row'))dr.remove();
+  row.classList.remove('expanded');
+  expandedIdxs=expandedIdxs.filter(function(x){return x!==idx;});
+}
+function toggleExpand(idx){
+  if(expandedIdxs.indexOf(idx)>=0)collapseDetail(idx);
+  else expandDetail(idx);
+}
+function expandAll(){ACCOUNTS.forEach(function(_,i){if(expandedIdxs.indexOf(i)<0)expandDetail(i);});}
+function collapseAll(){expandedIdxs.slice().forEach(collapseDetail);}
+
+function getFilteredTx(){
+  return txRecords.filter(function(r){
+    if(txType!=='all'&&r.type!==txType)return false;
+    return true;
+  });
+}
+function setTxFilter(key,val){
+  if(key==='type'){txType=val;document.querySelectorAll('.tx-filter').forEach(function(b){if(b.dataset.type)b.classList.toggle('active',b.dataset.type===val);});}
+  txPage=1;renderTransactions();
+}
+function goAccountTx(idx){
+  txAccount=String(idx);
+  txType='all';txPage=1;
+  document.querySelectorAll('.tx-filter').forEach(function(b){if(b.dataset.type)b.classList.toggle('active',b.dataset.type==='all');});
+  switchTab('transactions');
+  renderTxAccountDisplay(idx);
+  fetchTransactions(idx);
+}
+function txChangePage(delta){
+  var total=Math.max(1,Math.ceil(txRecords.length/txPageSize));
+  txPage=Math.max(1,Math.min(total,txPage+delta));
+  renderTransactions();
+}
+function renderTxAccountDisplay(idx){
+  var a=ACCOUNTS[idx];
+  if(!a)return;
+  document.getElementById('tx-account-display').innerHTML='当前账号：<b>'+(a.name||a.maskedKey)+'</b> · '+(a.email||'—')+' · Token '+a.maskedKey;
+}
+function fetchTransactions(idx){
+  document.getElementById('tx-tbody').innerHTML='<tr><td colspan="8" style="text-align:center;color:#86868b;padding:20px">加载中…</td></tr>';
+  xhr('GET','/api/account/'+idx+'/transactions?page=1&page_size=50',null,function(sc,d){
+    if(sc!==200||!d||d.error){
+      document.getElementById('tx-tbody').innerHTML='<tr><td colspan="8" style="text-align:center;color:#86868b;padding:20px">'+(d&&d.error?d.error:'加载失败')+'</td></tr>';
+      txRecords=[];return;
+    }
+    txRecords=d.records||[];
+    txPage=1;
+    renderTransactions();
+  });
+}
+function renderTransactions(){
+  var filtered=getFilteredTx();
+  var total=Math.max(1,Math.ceil(filtered.length/txPageSize));
+  if(txPage>total)txPage=total;
+  var start=(txPage-1)*txPageSize;
+  var pageRecords=filtered.slice(start,start+txPageSize);
+  var html='';
+  pageRecords.forEach(function(r){
+    var typeBadge=r.type==='EARN'?'<span class="type-badge tb-earn">发放</span>':r.type==='SPEND_CONFIRM'?'<span class="type-badge tb-spend">消耗</span>':'<span class="type-badge tb-expire">过期</span>';
+    var source=RULE_LABEL[r.rule_key]||r.rule_key||'—';
+    var tierHtml=r.model_tier?'<span class="tier-badge tier-'+r.model_tier+'">'+(TIER_LABEL[r.model_tier]||r.model_tier)+'</span>':'<span class="dash">—</span>';
+    var amountClass=r.type==='EARN'?'earn':r.type==='SPEND_CONFIRM'?'spend':'expire';
+    var amountSign=r.type==='EARN'?'+':'-';
+    var amountHtml='<span class="tx-amount '+amountClass+'">'+amountSign+r.total_amount+'</span>';
+    var expiryHtml=r.expire_at?'<span style="font-size:11px">'+r.expire_at+'</span>':'<span class="dash">—</span>';
+    html+='<tr><td style="font-size:11px;white-space:nowrap">'+(r.gmt_created||'—')+'</td><td>'+typeBadge+'</td><td style="font-size:12px;font-weight:600">'+(r.account||'—')+'</td><td style="font-size:12px">'+source+'</td><td>'+tierHtml+'</td><td style="font-size:12px">'+(r.count||0)+'</td><td>'+amountHtml+'</td><td>'+expiryHtml+'</td></tr>';
+  });
+  if(!pageRecords.length)html='<tr><td colspan="8" style="text-align:center;color:#86868b;padding:24px">无记录</td></tr>';
+  document.getElementById('tx-tbody').innerHTML=html;
+  document.getElementById('tx-page-info').textContent='共 '+filtered.length+' 条 · 第 '+txPage+'/'+total+' 页';
+  document.getElementById('tx-prev').disabled=txPage<=1;
+  document.getElementById('tx-next').disabled=txPage>=total;
+}
+function refreshTxData(){
+  if(txAccount==='all'){toast('请先选择账号');return;}
+  fetchTransactions(parseInt(txAccount));
+  toast('已刷新交易记录');
+}
+
+function toolbarAction(){
+  var btn=document.getElementById('toolbar-btn');
+  btn.disabled=true;btn.textContent='处理中…';
+  if(!signedInToday){
+    xhr('POST','/api/checkin-all',null,function(sc,d){
+      signedInToday=true;lastRefreshTime=new Date().toTimeString().slice(0,8);
+      updateToolbarBtn();btn.disabled=false;
+      var ok=(d||[]).filter(function(r){return r.success;}).length;
+      toast('一键签到完成：'+ok+' 个账号成功');
+      fetchAccounts();
+    });
+  }else{
+    fetchAccounts(function(){btn.disabled=false;lastRefreshTime=new Date().toTimeString().slice(0,8);});
+  }
+}
+function updateToolbarBtn(){
+  var btn=document.getElementById('toolbar-btn');
+  btn.textContent=signedInToday?'一键刷新':'一键签到';
+}
+
+function fetchAccounts(cb){
+  document.getElementById('ping-text').textContent='加载中…';
+  xhr('GET','/api/accounts',null,function(sc,d){
+    document.getElementById('ping').className='refresh-dot';
+    document.getElementById('ping-text').textContent='就绪';
+    if(sc!==200||!d){document.getElementById('rl-tbody').innerHTML='<tr><td colspan="5" style="color:#bf0711;padding:20px">加载失败</td></tr>';if(cb)cb();return;}
+    ACCOUNTS=d;
+    renderCubeCards();renderCheckinGrid();renderTable();renderSubtitle('—',d.length);
+    if(cb)cb();
+  });
+}
+
+function applySort(){
+  var tb=document.getElementById('rl-tbody');
+  tb.querySelectorAll('.detail-row').forEach(function(r){r.remove();});
+  expandedIdxs=[];
+  var rows=Array.prototype.slice.call(tb.rows).filter(function(r){return !r.classList.contains('detail-row');});
+  if(rows.length>1){
+    rows.sort(function(a,b){
+      var va=(a.children[sortState.col]||{}).getAttribute&&a.children[sortState.col].getAttribute('data-sort')||'';
+      var vb=(b.children[sortState.col]||{}).getAttribute&&b.children[sortState.col].getAttribute('data-sort')||'';
+      var na=parseFloat(va),nb=parseFloat(vb);
+      if(!isNaN(na)&&!isNaN(nb))return(na-nb)*sortState.dir;
+      return String(va).localeCompare(String(vb))*sortState.dir;
+    });
+    var df=document.createDocumentFragment();
+    rows.forEach(function(r){df.appendChild(r);});
+    tb.textContent='';tb.appendChild(df);
+  }
+}
+
+function setupSorting(){
+  document.getElementById('rl-keys').querySelectorAll('th').forEach(function(th,i){
+    th.onclick=function(){
+      sortState={col:i,dir:(sortState.col===i?-sortState.dir:-1)};
+      applySort();
+    };
+  });
+}
+
+// init
+setupSorting();
+updateToolbarBtn();
+xhr('GET','/api/accounts',null,function(sc,d){
+  document.getElementById('ping').className='refresh-dot';
+  document.getElementById('ping-text').textContent='就绪';
+  if(sc===200&&d){
+    ACCOUNTS=d;
+    signedInToday=d.some(function(a){return a.checkedIn;});
+    if(signedInToday)lastRefreshTime=new Date().toTimeString().slice(0,8);
+    updateToolbarBtn();
+    document.getElementById('toolbar-btn').disabled=false;
+    renderSubtitle('—',d.length);
+    renderCubeCards();renderCheckinGrid();renderTable();
+    toast('已加载 '+d.length+' 个账号');
+  }else{
+    document.getElementById('subtitle').textContent='连接服务器失败';
+    document.getElementById('rl-tbody').innerHTML='<tr><td colspan="5" style="color:#bf0711;padding:20px">加载失败</td></tr>';
+  }
+});
+</script>
+</body>
+</html>

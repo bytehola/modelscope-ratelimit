@@ -23,26 +23,20 @@ func (NoopLogger) Printf(string, ...any) {}
 //
 // A disable is always "for the rest of the current calendar day" in the
 // configured timezone. The recorded time is when the exhaustion was observed.
-// rateData is the last-seen rate-limit snapshot for a (key, model) or a key's
-// total quota, day-bounded by "at" so values from a previous day are pruned
-// at the midnight reset (the upstream daily quota resets then too).
-type rateData struct {
-	remaining int
-	limit     int
-	hasRem    bool
-	hasLim    bool
-	at        time.Time
-}
 
 type keyState struct {
 	mu           sync.RWMutex
 	global       *time.Time           // global (all-model) disable time, nil if none
 	globalReason string               // "" = daily quota disable (resets midnight); "unauthorized" = 401 (until restart)
 	models       map[string]time.Time // disabled model -> disable time
-	modelData    map[string]*rateData // observed model -> last-seen rate-limit data
-	totalData    *rateData            // observed total rate-limit data
 	cooldown     *time.Time           // short-term global cooldown expiry (insufficient_quota), nil if none
 	successCount int                  // daily successful request count (reset at midnight)
+	magicCubeAvailable int       // available_balance from /openapi/v1/magicubes/balance
+	magicCubeTotal int           // total_balance
+	magicCubeFrozen int          // frozen_amount
+	usagePerDay int              // currentUsagePerDay from /api/v1/inference/rate-limit
+	checkedIn bool               // daily sign-in via /api/v1/users/login/info
+	lastCheckIn time.Time        // when the sign-in was performed
 }
 
 // Store is the concurrency-safe rate-limit state shared by all plugin hooks.
@@ -89,6 +83,10 @@ type Store struct {
 	aliasMu       sync.RWMutex
 	aliasUpstream map[string]string
 
+	// modelUsage tracks per-model daily request counts for the status page.
+	modelUsageMu sync.RWMutex
+	modelUsage   map[string]int // model name -> request count (reset at midnight)
+
 	// strategyFetcher returns the host's built-in routing strategy
 	// ("round-robin" or "fill-first"). Injected by the glue layer via the
 	// management API. When nil or returning empty, hostStrategy defaults to
@@ -101,6 +99,11 @@ type Store struct {
 	// full list and skips absent entries, so 429 retries and disabled keys don't
 	// corrupt the rotation order.
 	providerOrderFetcher atomic.Pointer[func() map[string][]string]
+	// Modelscope API fetchers (injected by glue layer, net/http direct, cookie auth)
+	loginInfoFetcher   atomic.Pointer[LoginInfoFetcher]
+	balanceFetcher     atomic.Pointer[BalanceFetcher]
+	rateLimitFetcher   atomic.Pointer[RateLimitFetcher]
+	midnightSignInFunc atomic.Pointer[MidnightSignInFunc]
 
 	// backoffMu guards the global insufficient_quota exponential-backoff
 	// level. Modelscope shares a quota across all keys, so the backoff is
@@ -197,6 +200,7 @@ func NewStore(log Logger) *Store {
 		keys:           make(map[string]*keyState),
 		seen:           make(map[string]struct{}),
 		aliasUpstream:  make(map[string]string),
+		modelUsage:     make(map[string]int),
 		managedCursors: make(map[string]uint64),
 		managedOrder:   make(map[string][]string),
 		clock:          time.Now,
@@ -593,7 +597,7 @@ func (s *Store) getOrCreateKey(authID string) *keyState {
 	if ks, ok = s.keys[authID]; ok {
 		return ks
 	}
-	ks = &keyState{models: make(map[string]time.Time), modelData: make(map[string]*rateData)}
+	ks = &keyState{models: make(map[string]time.Time)}
 	s.keys[authID] = ks
 	return ks
 }
@@ -601,45 +605,6 @@ func (s *Store) getOrCreateKey(authID string) *keyState {
 // recordRemaining stores the last-seen rate-limit numbers for a credential,
 // day-bounded so stale values clear at the midnight reset. It does not touch
 // disable state; ApplyRateLimit disables separately based on the threshold.
-func (s *Store) recordRemaining(authID, model string, now time.Time,
-	modelRem int, modelOK bool, modelLim int, modelLimOK bool,
-	totalRem int, totalOK bool, totalLim int, totalLimOK bool) {
-	ks := s.getOrCreateKey(authID)
-	ks.mu.Lock()
-	defer ks.mu.Unlock()
-	if modelOK || modelLimOK {
-		md := ks.modelData[model]
-		if md == nil {
-			md = &rateData{}
-			ks.modelData[model] = md
-		}
-		if modelOK {
-			md.remaining = modelRem
-			md.hasRem = true
-		}
-		if modelLimOK {
-			md.limit = modelLim
-			md.hasLim = true
-		}
-		md.at = now
-	}
-	if totalOK || totalLimOK {
-		td := ks.totalData
-		if td == nil {
-			td = &rateData{}
-			ks.totalData = td
-		}
-		if totalOK {
-			td.remaining = totalRem
-			td.hasRem = true
-		}
-		if totalLimOK {
-			td.limit = totalLim
-			td.hasLim = true
-		}
-		td.at = now
-	}
-}
 
 // deleteKey removes an empty keyState entry.
 func (s *Store) deleteKey(authID string) {
@@ -647,7 +612,7 @@ func (s *Store) deleteKey(authID string) {
 	defer s.mu.Unlock()
 	if ks, ok := s.keys[authID]; ok {
 		ks.mu.RLock()
-		empty := ks.global == nil && len(ks.models) == 0 && len(ks.modelData) == 0 && ks.totalData == nil && ks.cooldown == nil
+		empty := ks.global == nil && len(ks.models) == 0 && ks.cooldown == nil
 		ks.mu.RUnlock()
 		if empty {
 			delete(s.keys, authID)
@@ -733,6 +698,27 @@ func (s *Store) recordAlias(alias, upstream string) {
 	s.aliasMu.Unlock()
 }
 
+// recordModelUsage increments the daily per-model request counter.
+func (s *Store) recordModelUsage(model string) {
+	if model == "" {
+		return
+	}
+	s.modelUsageMu.Lock()
+	s.modelUsage[model]++
+	s.modelUsageMu.Unlock()
+}
+
+// ModelUsageStats returns the daily per-model request counts.
+func (s *Store) ModelUsageStats() map[string]int {
+	s.modelUsageMu.RLock()
+	defer s.modelUsageMu.RUnlock()
+	out := make(map[string]int, len(s.modelUsage))
+	for k, v := range s.modelUsage {
+		out[k] = v
+	}
+	return out
+}
+
 // displayName returns the upstream model name for an alias when known, else the
 // alias itself. Used only for display (logs, status page); the underlying
 // disable storage key is unchanged.
@@ -788,11 +774,9 @@ func (s *Store) Counts(model string, now time.Time) (disabled, available, total 
 	return
 }
 
-// ModelRemaining returns the sum of last-seen remaining requests for a model
-// across all keys that are currently active (neither globally nor per-model
-// disabled) at "now". Only keys with observed same-day rate-limit data
-// contribute; unobserved keys are excluded. Used by the disable log to report
-// how much model quota is left on the still-active keys.
+// MagicCubeRemaining returns the total available magic cube balance across
+// all active (non-disabled) keys. Used by the scheduler log to report how
+// much balance remains on still-active keys.
 func (s *Store) ModelRemaining(model string, now time.Time) int {
 	ids := s.seenIDs()
 	loc := s.location()
@@ -809,14 +793,10 @@ func (s *Store) ModelRemaining(model string, now time.Time) int {
 				skip = true
 			}
 		}
-		rem := 0
 		if !skip {
-			if md, ok := ks.modelData[model]; ok && sameDay(md.at, now, loc) && md.hasRem {
-				rem = md.remaining
-			}
+			total += ks.magicCubeAvailable
 		}
 		ks.mu.RUnlock()
-		total += rem
 	}
 	return total
 }
@@ -1270,18 +1250,37 @@ func (s *Store) PruneAll(now time.Time) {
 				delete(ks.models, m)
 			}
 		}
-		for m, md := range ks.modelData {
-			if !sameDay(md.at, now, loc) {
-				delete(ks.modelData, m)
-			}
-		}
-		if ks.totalData != nil && !sameDay(ks.totalData.at, now, loc) {
-			ks.totalData = nil
-		}
-		empty := ks.global == nil && len(ks.models) == 0 && len(ks.modelData) == 0 && ks.totalData == nil && ks.cooldown == nil
+		empty := ks.global == nil && len(ks.models) == 0 && ks.cooldown == nil
 		ks.mu.Unlock()
 		if empty {
 			s.deleteKey(id)
+		}
+	}
+
+	// At the daily boundary, clear check-in state so the plugin re-signs-in
+	// every account via /api/v1/users/login/info (the call also activates the
+	// daily magic cube quota).
+	if dayChanged {
+		for _, id := range ids {
+			ks := s.getKey(id)
+			if ks == nil {
+				continue
+			}
+			ks.mu.Lock()
+			ks.checkedIn = false
+			ks.lastCheckIn = time.Time{}
+			ks.magicCubeAvailable = 0
+			ks.magicCubeTotal = 0
+			ks.magicCubeFrozen = 0
+			ks.usagePerDay = 0
+			ks.mu.Unlock()
+		}
+		// Reset per-model usage counters at midnight
+		s.modelUsageMu.Lock()
+		s.modelUsage = make(map[string]int)
+		s.modelUsageMu.Unlock()
+		if fp := s.midnightSignInFunc.Load(); fp != nil && *fp != nil {
+			(*fp)()
 		}
 	}
 
@@ -1308,31 +1307,21 @@ func (s *Store) PruneAll(now time.Time) {
 
 // ModelView is a render-ready snapshot of one model's rate-limit state for a
 // key: last-seen remaining/limit (when known) and whether it is disabled.
-type ModelView struct {
-	Name       string
-	Disabled   bool
-	Since      time.Time
-	Remaining  int
-	Limit      int
-	HasRem     bool
-	HasLim     bool
-	ObservedAt time.Time
-}
-
 // KeyView is a render-ready snapshot of one credential's state.
 type KeyView struct {
-	AuthID         string
-	GlobalDisabled bool
-	GlobalSince    time.Time
-	GlobalReason   string
-	Cooldown       bool
-	CooldownUntil  time.Time
-	Models         []ModelView
-	TotalRemaining int
-	TotalLimit     int
-	HasTotalRem    bool
-	HasTotalLim    bool
-	SuccessCount   int
+	AuthID             string
+	GlobalDisabled     bool
+	GlobalSince        time.Time
+	GlobalReason       string
+	Cooldown           bool
+	CooldownUntil      time.Time
+	SuccessCount       int
+	MagicCubeAvailable int
+	MagicCubeTotal     int
+	MagicCubeFrozen    int
+	UsagePerDay        int
+	CheckedIn          bool
+	LastCheckIn        time.Time
 }
 
 // Snapshot returns a render-ready view of every observed credential's state at
@@ -1364,33 +1353,42 @@ func (s *Store) Snapshot(now time.Time) map[string]KeyView {
 			kv.GlobalSince = *ks.global
 			kv.GlobalReason = ks.globalReason
 		}
-		for m, md := range ks.modelData {
-			if !sameDay(md.at, now, loc) {
-				continue
-			}
-			mv := ModelView{
-				Name:       s.displayName(m),
-				Remaining:  md.remaining,
-				Limit:      md.limit,
-				HasRem:     md.hasRem,
-				HasLim:     md.hasLim,
-				ObservedAt: md.at,
-			}
-			if t, ok := ks.models[m]; ok && active(t, now, loc) {
-				mv.Disabled = true
-				mv.Since = t
-			}
-			kv.Models = append(kv.Models, mv)
-		}
-		if ks.totalData != nil && sameDay(ks.totalData.at, now, loc) {
-			kv.TotalRemaining = ks.totalData.remaining
-			kv.TotalLimit = ks.totalData.limit
-			kv.HasTotalRem = ks.totalData.hasRem
-			kv.HasTotalLim = ks.totalData.hasLim
-		}
 		kv.SuccessCount = ks.successCount
+		kv.MagicCubeAvailable = ks.magicCubeAvailable
+		kv.MagicCubeTotal = ks.magicCubeTotal
+		kv.MagicCubeFrozen = ks.magicCubeFrozen
+		kv.UsagePerDay = ks.usagePerDay
+		kv.CheckedIn = ks.checkedIn
+		kv.LastCheckIn = ks.lastCheckIn
 		ks.mu.RUnlock()
 		out[id] = kv
 	}
 	return out
+}
+
+// recordMagicCube stores the magic cube balance for a credential.
+func (s *Store) RecordMagicCube(authID string, available, total, frozen int, now time.Time) {
+	ks := s.getOrCreateKey(authID)
+	ks.mu.Lock()
+	ks.magicCubeAvailable = available
+	ks.magicCubeTotal = total
+	ks.magicCubeFrozen = frozen
+	ks.mu.Unlock()
+}
+
+// recordCheckIn marks a credential as signed in for the current day.
+func (s *Store) RecordCheckIn(authID string, now time.Time) {
+	ks := s.getOrCreateKey(authID)
+	ks.mu.Lock()
+	ks.checkedIn = true
+	ks.lastCheckIn = now
+	ks.mu.Unlock()
+}
+
+// recordUsagePerDay stores the platform-side daily usage count.
+func (s *Store) RecordUsagePerDay(authID string, usage int) {
+	ks := s.getOrCreateKey(authID)
+	ks.mu.Lock()
+	ks.usagePerDay = usage
+	ks.mu.Unlock()
 }

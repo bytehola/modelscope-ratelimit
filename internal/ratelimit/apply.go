@@ -1,52 +1,15 @@
 package ratelimit
 
 import (
-	"strconv"
 	"strings"
 	"time"
 )
 
-// headerInt returns the first integer value of the named header. Header
-// lookup is case-insensitive (HTTP headers are case-insensitive, and upstream
-// proxies may rewrite casing). present is false when the header is absent or
-// not a valid integer.
-func headerInt(headers map[string][]string, name string) (value int, present bool) {
-	if name == "" {
-		return 0, false
-	}
-	values := lookupHeader(headers, name)
-	if len(values) == 0 {
-		return 0, false
-	}
-	n, err := strconv.Atoi(strings.TrimSpace(values[0]))
-	if err != nil {
-		return 0, false
-	}
-	return n, true
-}
-
-// lookupHeader finds all values for a header name, case-insensitively.
-func lookupHeader(headers map[string][]string, name string) []string {
-	if len(headers) == 0 {
-		return nil
-	}
-	target := strings.ToLower(name)
-	for k, vs := range headers {
-		if strings.ToLower(k) == target {
-			return vs
-		}
-	}
-	return nil
-}
-
-// ApplyRateLimit inspects Modelscope rate-limit response headers and records
-// the appropriate disable. It is the single source of truth shared by the
-// response interceptor, the stream interceptor (header-init phase) and the
-// usage hook.
+// ApplyRateLimit inspects Modelscope API responses and records the appropriate
+// disable. It is the single source of truth shared by the response interceptor,
+// the stream interceptor (header-init phase) and the usage hook.
 //
-//   - No rate-limit headers present  => not a Modelscope response, no-op.
-//   - Total remaining exhausted      => global disable (all models).
-//   - Model remaining exhausted      => per-model disable only.
+//   - 429 + "insufficient balance"  => global disable (magic cube exhausted).
 func (s *Store) ApplyRateLimit(authID, model string, headers map[string][]string, statusCode int, body string, now time.Time) {
 	if authID == "" {
 		// Without an auth id we cannot attribute the disable; the usage hook
@@ -57,44 +20,18 @@ func (s *Store) ApplyRateLimit(authID, model string, headers map[string][]string
 	if !cfg.ManagesModel(model) {
 		return
 	}
-	modelRem, modelOK := headerInt(headers, cfg.ModelRemainingHeader)
-	totalRem, totalOK := headerInt(headers, cfg.TotalRemainingHeader)
-	modelLim, modelLimOK := headerInt(headers, cfg.ModelLimitHeader)
-	totalLim, totalLimOK := headerInt(headers, cfg.TotalLimitHeader)
-	if !modelOK && !totalOK {
-		return // not a rate-limited Modelscope response
+	// Daily-disable on 429 + "insufficient balance" (account balance
+	// exhausted — not a rate window, the key is genuinely unusable until
+	// the balance is topped up). Checked before rate-limit headers because
+	// insufficient balance responses may not carry rate-limit headers. Not
+	// gated by skip_provider_on_429: balance exhaustion is not a
+	// recoverable rate window, so the skip/proxy logic must not bypass the
+	// daily disable.
+	if IsInsufficientBalance(statusCode, body) {
+		s.recordSeen([]string{authID})
+		s.disableGlobal(authID, model, now)
+		return
 	}
-	// Presence of Modelscope rate-limit headers identifies a Modelscope
-	// response; record this credential so total/available counts stay
-	// accurate even when scheduler.pick does not fire for this provider.
-	s.recordSeen([]string{authID})
-	// Store the last-seen remaining/limit so the status page can show per-key
-	// and per-model availability (day-bounded; cleared at the midnight reset).
-	s.recordRemaining(authID, model, now,
-		modelRem, modelOK, modelLim, modelLimOK,
-		totalRem, totalOK, totalLim, totalLimOK)
-	// Global exhaustion takes precedence and covers every model.
-	// skip_provider_on_429 mode bypasses the daily disable ONLY for
-	// insufficient_quota 429s (pool-level rate window — the key recovers
-	// when the window slides). Other 429s (exceeded-today, limit_burst_rate)
-	// still get the daily disable (the key is genuinely exhausted for the
-	// day).
-	if !cfg.SkipProviderOn429 || !isInsufficientQuota(statusCode, body) {
-		if totalOK && totalRem <= cfg.DisableThreshold {
-			s.disableGlobal(authID, model, now)
-			return
-		}
-		if modelOK && modelRem <= cfg.DisableThreshold {
-			s.disableModel(authID, model, now)
-			return
-		}
-	}
-	// No disable triggered: remaining is above threshold. The backoff reset
-	// is NOT done here — a 429+insufficient_quota response can still carry
-	// rate-limit headers with remaining > 0 (normal per-request rate limiting
-	// vs. billing-quota exhaustion), which would erroneously reset the
-	// exponential backoff on every failure. The reset is gated on success
-	// (rec.Failed == false) in OnUsage instead.
 }
 
 // isInsufficientQuota reports whether the response is a 429 with an
@@ -103,6 +40,20 @@ func (s *Store) ApplyRateLimit(authID, model string, headers map[string][]string
 // avoid a full JSON parse in the hot path; the token is distinctive enough.
 func isInsufficientQuota(statusCode int, body string) bool {
 	return statusCode == 429 && strings.Contains(body, `"insufficient_quota"`)
+}
+
+// IsInsufficientBalance reports whether the response is a 429 with an
+// "insufficient balance" phrase in the body (account balance exhausted).
+// Unlike insufficient_quota (a pool-level rate window), insufficient balance
+// means the key is genuinely unusable until the balance is topped up, so it
+// always triggers a daily global disable regardless of skip_provider_on_429.
+// Detection is case-insensitive substring match on "insufficient balance"
+// (with a space, not underscore) to catch various JSON layouts.
+func IsInsufficientBalance(statusCode int, body string) bool {
+	if statusCode != 429 {
+		return false
+	}
+	return strings.Contains(strings.ToLower(body), "insufficient balance")
 }
 
 // ApplyInsufficientQuotaCooldown checks for a 429 + insufficient_quota response
@@ -207,6 +158,7 @@ func (s *Store) OnUsage(rec UsageRecord) {
 	if !rec.Failed && cfg.ManagesProvider(rec.Provider) {
 		s.resetCooldownBackoff()
 		s.recordSuccess(rec.AuthID)
+		s.recordModelUsage(s.displayName(model))
 		// Disable the global proxy if it was active — a managed provider
 		// succeeded, so the proxy is no longer needed.
 		s.HandleProxyOnSuccess()
@@ -246,12 +198,17 @@ func (s *Store) OnUsage(rec UsageRecord) {
 			// when all managed candidates are tried. Other 429 types
 			// (exceeded-today, limit_burst_rate) fall through to normal
 			// daily-disable + cooldown handling.
+			// When proxy_url is also configured, the skip and proxy modes
+			// complement each other: skip provides immediate relief (go to
+			// other providers), proxy provides different-IP retry when the
+			// skip is cleared (any 200). Both are armed on the same 429 —
+			// fall through to the proxy trigger below instead of returning.
 			if cfg.SkipProviderOn429 && isInsufficientQuota(rec.Failure.StatusCode, rec.Failure.Body) {
 				s.recordSeen([]string{rec.AuthID})
 				providerName := extractProviderName(rec.Provider)
 				s.SetSkipProvider(providerName)
 				s.log.Printf("modelscope-ratelimit: managed 429, skip provider %s model=%s", providerName, s.displayName(model))
-				return
+				// Fall through: also arm proxy trigger if configured.
 			}
 			// Proxy mode: on 429+insufficient_quota from a managed provider.
 			// When proxy_url is configured and the probe has NOT already
@@ -262,7 +219,12 @@ func (s *Store) OnUsage(rec UsageRecord) {
 				s.SetProxyTrigger(rec.AuthID, model)
 				return
 			}
-			s.ApplyInsufficientQuotaCooldown(rec.AuthID, model, rec.Failure.StatusCode, rec.Failure.Body, now)
+			// Cooldown fallback: only when skip mode is off (skip mode
+			// handles 429s via the skip set, not cooldowns). The cooldown
+			// block in SchedulerPick is also bypassed when skip mode is on.
+			if !cfg.SkipProviderOn429 {
+				s.ApplyInsufficientQuotaCooldown(rec.AuthID, model, rec.Failure.StatusCode, rec.Failure.Body, now)
+			}
 		}
 	}
 }

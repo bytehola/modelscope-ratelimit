@@ -35,6 +35,15 @@ NAME="modelscope-ratelimit"
 
 log() { printf '>> %s\n' "$*"; }
 
+update_build_time() {
+  local html="$SCRIPT_DIR/cmd/plugin/status_page.html"
+  local now=$(TZ=Asia/Shanghai date "+%Y-%m-%d %H:%M:%S")
+  if [ -f "$html" ]; then
+    sed -i "s|构建于.*CST|构建于 ${now} CST|g" "$html"
+    log "构建时间已更新: ${now} CST"
+  fi
+}
+
 build_native() {
   local ext
   case "$(go env GOOS)" in
@@ -45,6 +54,7 @@ build_native() {
   esac
   local out="$OUT_DIR/$NAME.$ext"
   log "编译原生动态库 ($(go env GOOS)/$(go env GOARCH)) -> $out"
+  update_build_time
   go build -buildmode=c-shared -trimpath -o "$out" "$PKG"
   log "完成: $out"
 }
@@ -66,6 +76,7 @@ build_windows() {
     exit 1
   }
   log "交叉编译 Windows/amd64 (zig=$zig) -> $out"
+  update_build_time
   GOOS=windows GOARCH=amd64 \
     CC="$zig cc -target x86_64-windows-gnu" \
     go build -buildmode=c-shared -trimpath -o "$out" "$PKG"

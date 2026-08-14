@@ -23,27 +23,21 @@ func cfgWith(providers ...string) *Config {
 	return c
 }
 
+// hdr returns nil (headers no longer used in magic cube design; kept for test compat).
 func hdr(remaining string) map[string][]string {
-	return map[string][]string{
-		"Modelscope-Ratelimit-Model-Requests-Limit":     {"100"},
-		"Modelscope-Ratelimit-Model-Requests-Remaining": {remaining},
-		"Modelscope-Ratelimit-Requests-Limit":           {"1000"},
-		"Modelscope-Ratelimit-Requests-Remaining":       {"500"},
-	}
+	return nil
 }
 
+// insufficientBalanceBody simulates a 429 + "insufficient balance" response
+// from the Modelscope inference API (magic cube exhausted).
+const insufficientBalanceBody = `{"error":{"message":"insufficient balance","request_id":"test"}}`
+
 func totalExhaustedHdr() map[string][]string {
-	return map[string][]string{
-		"Modelscope-Ratelimit-Model-Requests-Remaining": {"0"},
-		"Modelscope-Ratelimit-Requests-Remaining":       {"0"},
-	}
+	return nil
 }
 
 func modelExhaustedHdr() map[string][]string {
-	return map[string][]string{
-		"Modelscope-Ratelimit-Model-Requests-Remaining": {"0"},
-		"Modelscope-Ratelimit-Requests-Remaining":       {"500"},
-	}
+	return nil
 }
 
 func TestConfigFromMap(t *testing.T) {
@@ -55,11 +49,8 @@ func TestConfigFromMap(t *testing.T) {
 		if c.Timezone != "Asia/Shanghai" {
 			t.Fatalf("timezone = %q", c.Timezone)
 		}
-		if c.ModelRemainingHeader != "Modelscope-Ratelimit-Model-Requests-Remaining" {
-			t.Fatalf("header = %q", c.ModelRemainingHeader)
-		}
-		if c.DisableThreshold != 0 {
-			t.Fatalf("threshold = %d", c.DisableThreshold)
+		if c.InsufficientQuotaCooldown != 1 {
+			t.Fatalf("cooldown = %d", c.InsufficientQuotaCooldown)
 		}
 		if c.ManagesProvider("modelscope") {
 			t.Fatal("empty providers should manage nothing")
@@ -69,8 +60,7 @@ func TestConfigFromMap(t *testing.T) {
 		c, err := ConfigFromMap(map[string]any{
 			"providers":              []any{"ms", "ms2"},
 			"timezone":               "UTC",
-			"disable_threshold":      5,
-			"model_remaining_header": "X-Rem",
+			"insufficient_quota_cooldown": 3,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -81,40 +71,21 @@ func TestConfigFromMap(t *testing.T) {
 		if c.Timezone != "UTC" {
 			t.Fatalf("timezone = %q", c.Timezone)
 		}
-		if c.DisableThreshold != 5 {
-			t.Fatalf("threshold = %d", c.DisableThreshold)
-		}
-		if c.ModelRemainingHeader != "X-Rem" {
-			t.Fatalf("header = %q", c.ModelRemainingHeader)
+		if c.InsufficientQuotaCooldown != 3 {
+			t.Fatalf("cooldown = %d", c.InsufficientQuotaCooldown)
 		}
 	})
 }
 
-func TestModelOnlyDisable(t *testing.T) {
-	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
-	s, _ := newTestStore(now)
-	s.Reconfigure(cfgWith("modelscope"))
-
-	s.ApplyRateLimit("auth-1", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
-
-	if !s.isDisabled("auth-1", "Qwen-72B", now) {
-		t.Fatal("expected Qwen-72B disabled")
-	}
-	// Other models on the same key remain available.
-	if s.isDisabled("auth-1", "Qwen-7B", now) {
-		t.Fatal("Qwen-7B must not be disabled by a per-model exhaustion")
-	}
-	if s.isDisabled("auth-2", "Qwen-72B", now) {
-		t.Fatal("disable must be scoped to the owning key")
-	}
-}
+// TestModelOnlyDisable removed: no model-specific disable in magic cube design.
+// isInsufficientBalance always calls disableGlobal (all models).
 
 func TestGlobalDisable(t *testing.T) {
 	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
 	s, _ := newTestStore(now)
 	s.Reconfigure(cfgWith("modelscope"))
 
-	s.ApplyRateLimit("auth-1", "Qwen-72B", totalExhaustedHdr(), 0, "", now)
+	s.ApplyRateLimit("auth-1", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
 
 	// Global disable blocks every model on the key.
 	for _, m := range []string{"Qwen-72B", "Qwen-7B", "DeepSeek-V3"} {
@@ -144,7 +115,7 @@ func TestDailyReset(t *testing.T) {
 	s, cur := newTestStore(now)
 	s.Reconfigure(cfgWith("modelscope"))
 
-	s.ApplyRateLimit("auth-1", "Qwen-72B", modelExhaustedHdr(), 0, "", *cur)
+	s.ApplyRateLimit("auth-1", "Qwen-72B", nil, 429, insufficientBalanceBody, *cur)
 	if !s.isDisabled("auth-1", "Qwen-72B", *cur) {
 		t.Fatal("expected disabled before midnight")
 	}
@@ -168,30 +139,18 @@ func TestDisableKeepsEarliestTime(t *testing.T) {
 	s, cur := newTestStore(now)
 	s.Reconfigure(cfgWith("modelscope"))
 
-	s.ApplyRateLimit("auth-1", "Qwen-72B", modelExhaustedHdr(), 0, "", *cur)
+	s.ApplyRateLimit("auth-1", "Qwen-72B", nil, 429, insufficientBalanceBody, *cur)
 	first := *cur
 	*cur = now.Add(2 * time.Hour)
-	s.ApplyRateLimit("auth-1", "Qwen-72B", modelExhaustedHdr(), 0, "", *cur)
+	s.ApplyRateLimit("auth-1", "Qwen-72B", nil, 429, insufficientBalanceBody, *cur)
 
 	st := s.Status()
-	if len(st) != 1 || st[0].Models["Qwen-72B"] != first {
+	if len(st) != 1 || st[0].Global == nil || *st[0].Global != first {
 		t.Fatalf("expected earliest disable time kept, got %+v", st)
 	}
 }
 
-func TestThresholdProactive(t *testing.T) {
-	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
-	s, _ := newTestStore(now)
-	c := cfgWith("modelscope")
-	c.DisableThreshold = 5
-	s.Reconfigure(c)
-
-	// remaining == 5 hits the threshold.
-	s.ApplyRateLimit("auth-1", "Qwen-72B", hdr("5"), 0, "", now)
-	if !s.isDisabled("auth-1", "Qwen-72B", now) {
-		t.Fatal("expected disable at threshold boundary")
-	}
-}
+// TestThresholdProactive removed: no DisableThreshold in magic cube design.
 
 func TestSchedulerSkipsDisabledAndRotates(t *testing.T) {
 	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
@@ -199,7 +158,7 @@ func TestSchedulerSkipsDisabledAndRotates(t *testing.T) {
 	s.Reconfigure(cfgWith("modelscope"))
 
 	// Exhaust auth-1 for Qwen-72B only.
-	s.ApplyRateLimit("auth-1", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
+	s.ApplyRateLimit("auth-1", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
 
 	req := SchedulerPickRequest{
 		Provider: "modelscope",
@@ -246,8 +205,8 @@ func TestSchedulerAllDisabledError(t *testing.T) {
 	s, _ := newTestStore(now)
 	s.Reconfigure(cfgWith("modelscope"))
 
-	s.ApplyRateLimit("auth-1", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
-	s.ApplyRateLimit("auth-2", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
+	s.ApplyRateLimit("auth-1", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
+	s.ApplyRateLimit("auth-2", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
 
 	req := SchedulerPickRequest{
 		Provider: "modelscope",
@@ -311,7 +270,7 @@ func TestSchedulerMixedProviderSkipsDisabled(t *testing.T) {
 	s.Reconfigure(cfgWith("modelscope")) // provider configured as bare "modelscope"
 
 	// key-1 exhausted for the requested model; key-2 still healthy.
-	s.ApplyRateLimit("key-1", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
+	s.ApplyRateLimit("key-1", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
 
 	req := SchedulerPickRequest{
 		Provider: "", // mixed path: top-level provider is empty
@@ -347,8 +306,8 @@ func TestSchedulerMixedProviderAllDisabledError(t *testing.T) {
 	s, _ := newTestStore(now)
 	s.Reconfigure(cfgWith("modelscope"))
 
-	s.ApplyRateLimit("key-1", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
-	s.ApplyRateLimit("key-2", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
+	s.ApplyRateLimit("key-1", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
+	s.ApplyRateLimit("key-2", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
 
 	req := SchedulerPickRequest{
 		Provider: "",
@@ -399,8 +358,8 @@ func TestSchedulerAllDisabledFallbackToNonManagedCandidate(t *testing.T) {
 	s, _ := newTestStore(now)
 	s.Reconfigure(cfgWith("modelscope"))
 
-	s.ApplyRateLimit("ms-1", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
-	s.ApplyRateLimit("ms-2", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
+	s.ApplyRateLimit("ms-1", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
+	s.ApplyRateLimit("ms-2", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
 
 	req := SchedulerPickRequest{
 		Provider:  "",
@@ -435,8 +394,8 @@ func TestSchedulerAllManagedDisabledDefersToLowerPriorityNonManaged(t *testing.T
 	s, _ := newTestStore(now)
 	s.Reconfigure(cfgWith("modelscope"))
 
-	s.ApplyRateLimit("ms-1", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
-	s.ApplyRateLimit("ms-2", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
+	s.ApplyRateLimit("ms-1", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
+	s.ApplyRateLimit("ms-2", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
 
 	// Only managed candidates in the list (host filtered out lower-priority
 	// non-managed candidates), but req.Providers lists a non-managed provider.
@@ -465,7 +424,7 @@ func TestOnUsageApplies(t *testing.T) {
 
 	s.OnUsage(UsageRecord{
 		Provider: "modelscope", AuthID: "auth-1", Model: "Qwen-72B",
-		ResponseHeaders: totalExhaustedHdr(),
+		ResponseHeaders: nil, Failed: true, Failure: &UsageFailure{StatusCode: 429, Body: insufficientBalanceBody},
 	})
 	if !s.isDisabled("auth-1", "Qwen-7B", now) {
 		t.Fatal("usage handle with total exhaustion must globally disable")
@@ -491,7 +450,7 @@ func TestOnUsageAliasMatchesSchedulerModel(t *testing.T) {
 		AuthID:          "auth-1",
 		Model:           "ZhipuAI/GLM-5.2",
 		Alias:           "glm-5.2",
-		ResponseHeaders: modelExhaustedHdr(),
+		ResponseHeaders: nil, Failed: true, Failure: &UsageFailure{StatusCode: 429, Body: insufficientBalanceBody},
 	})
 	if !s.isDisabled("auth-1", "glm-5.2", now) {
 		t.Fatal("disable must be stored under the alias the scheduler checks")
@@ -522,7 +481,7 @@ func TestOnUsageDisplaysUpstreamModelName(t *testing.T) {
 		AuthID:          "auth-1",
 		Model:           "ZhipuAI/GLM-5.2",
 		Alias:           "glm-5.2",
-		ResponseHeaders: modelExhaustedHdr(),
+		ResponseHeaders: nil, Failed: true, Failure: &UsageFailure{StatusCode: 429, Body: insufficientBalanceBody},
 	})
 	// Storage stays under the alias (scheduler path).
 	if !s.isDisabled("auth-1", "glm-5.2", now) {
@@ -535,12 +494,10 @@ func TestOnUsageDisplaysUpstreamModelName(t *testing.T) {
 	// The status snapshot surfaces the upstream name, not the alias.
 	snap := s.Snapshot(now)
 	kv, ok := snap["auth-1"]
-	if !ok || len(kv.Models) == 0 {
-		t.Fatalf("no model view for auth-1: %+v", snap)
+	if !ok {
+		t.Fatalf("no snapshot for auth-1: %+v", snap)
 	}
-	if kv.Models[0].Name != "ZhipuAI/GLM-5.2" {
-		t.Fatalf("snapshot model name = %q, want ZhipuAI/GLM-5.2", kv.Models[0].Name)
-	}
+	_ = kv // model views removed in magic cube refactor
 }
 
 func TestOnResponseWithMetadataAuthID(t *testing.T) {
@@ -550,7 +507,7 @@ func TestOnResponseWithMetadataAuthID(t *testing.T) {
 
 	resp := s.OnResponse(ResponseInterceptRequest{
 		Model:           "Qwen-72B",
-		ResponseHeaders: modelExhaustedHdr(),
+		ResponseHeaders: nil, StatusCode: 429, Body: insufficientBalanceBody,
 		Metadata:        map[string]any{"auth_id": "auth-1"},
 	})
 	// Plugin must not rewrite the response.
@@ -567,17 +524,24 @@ func TestOnStreamChunkHeaderInit(t *testing.T) {
 	s, _ := newTestStore(now)
 	s.Reconfigure(cfgWith("modelscope"))
 
-	// Header-only init call (ChunkIndex == -1) carries the rate-limit headers.
+	// Stream header-init (ChunkIndex == -1) no longer parses headers.
+	// Insufficient balance is detected via OnUsage (429 + body).
 	r := s.OnStreamChunk(StreamChunkInterceptRequest{
 		ChunkIndex: -1, Model: "Qwen-72B",
-		ResponseHeaders: modelExhaustedHdr(),
+		ResponseHeaders: nil,
 		Metadata:        map[string]any{"AuthID": "auth-1"},
 	})
 	if r.DropChunk {
 		t.Fatal("header-init must not drop")
 	}
+	// Apply via OnUsage which carries statusCode + body.
+	s.OnUsage(UsageRecord{
+		Provider: "modelscope", AuthID: "auth-1", Model: "Qwen-72B", Alias: "Qwen-72B",
+		Failed:  true,
+		Failure: &UsageFailure{StatusCode: 429, Body: insufficientBalanceBody},
+	})
 	if !s.isDisabled("auth-1", "Qwen-72B", now) {
-		t.Fatal("stream header-init must apply disable")
+		t.Fatal("429 + insufficient balance must globally disable")
 	}
 
 	// Data chunk must not re-trigger or alter anything.
@@ -652,8 +616,8 @@ func TestSchedulerProviderOrderFallbackToSecond(t *testing.T) {
 	s.Reconfigure(cfgWith("moda", "modelscope"))
 
 	// Disable all moda keys.
-	s.ApplyRateLimit("moda-1", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
-	s.ApplyRateLimit("moda-2", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
+	s.ApplyRateLimit("moda-1", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
+	s.ApplyRateLimit("moda-2", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
 
 	req := SchedulerPickRequest{
 		Provider: "",
@@ -714,7 +678,7 @@ func TestFillFirstAlwaysPicksFirst(t *testing.T) {
 	}
 
 	// Disable auth-1 for the model; fill-first should then stick to auth-2.
-	s.ApplyRateLimit("auth-1", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
+	s.ApplyRateLimit("auth-1", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
 	for i := 0; i < 20; i++ {
 		resp, err := s.SchedulerPick(req)
 		if err != nil {
@@ -797,8 +761,8 @@ func TestFillFirstProviderOrder(t *testing.T) {
 	}
 
 	// Disable all moda keys: fill-first should fall through to modelscope-1.
-	s.ApplyRateLimit("moda-1", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
-	s.ApplyRateLimit("moda-2", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
+	s.ApplyRateLimit("moda-1", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
+	s.ApplyRateLimit("moda-2", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
 	for i := 0; i < 15; i++ {
 		resp, err := s.SchedulerPick(req)
 		if err != nil {
@@ -831,7 +795,7 @@ func TestNonManagedFallbackUsesHostStrategy(t *testing.T) {
 	// fill-first host strategy: always pick paid-1.
 	s, _ := newTestStore(now)
 	s.Reconfigure(cfgWith("moda"))
-	s.ApplyRateLimit("moda-1", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
+	s.ApplyRateLimit("moda-1", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
 	s.SetStrategyFetcher(func() string { return "fill-first" })
 	for i := 0; i < 10; i++ {
 		resp, err := s.SchedulerPick(req)
@@ -846,7 +810,7 @@ func TestNonManagedFallbackUsesHostStrategy(t *testing.T) {
 	// round-robin host strategy: rotate across paid-1 and paid-2.
 	s2, _ := newTestStore(now)
 	s2.Reconfigure(cfgWith("moda"))
-	s2.ApplyRateLimit("moda-1", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
+	s2.ApplyRateLimit("moda-1", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
 	s2.SetStrategyFetcher(func() string { return "round-robin" })
 	picks := map[string]int{}
 	for i := 0; i < 20; i++ {
@@ -874,7 +838,7 @@ func TestNonManagedFallbackNoFetcherDefaultsRoundRobin(t *testing.T) {
 	s, _ := newTestStore(now)
 	s.Reconfigure(cfgWith("moda"))
 	// No SetStrategyFetcher: should default to round-robin.
-	s.ApplyRateLimit("moda-1", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
+	s.ApplyRateLimit("moda-1", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
 
 	req := SchedulerPickRequest{
 		Provider:  "",
@@ -1074,7 +1038,7 @@ func TestRoundRobinRetryWithDisabledKey(t *testing.T) {
 		return map[string][]string{"modelscope": {"c-3", "a-1", "b-2"}}
 	})
 	// Disable a-1 for this model.
-	s.ApplyRateLimit("a-1", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
+	s.ApplyRateLimit("a-1", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
 
 	fullReq := SchedulerPickRequest{
 		Provider: "modelscope",
@@ -1119,9 +1083,9 @@ func TestPerProviderCursorIsolation(t *testing.T) {
 	})
 
 	// Exhaust all moda keys so the scheduler falls through to modelscope.
-	s.ApplyRateLimit("m-a", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
-	s.ApplyRateLimit("m-b", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
-	s.ApplyRateLimit("m-c", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
+	s.ApplyRateLimit("m-a", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
+	s.ApplyRateLimit("m-b", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
+	s.ApplyRateLimit("m-c", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
 
 	req := SchedulerPickRequest{
 		Provider: "",
@@ -1164,9 +1128,9 @@ func TestNonManagedCursorDoesNotCorruptManaged(t *testing.T) {
 	})
 
 	// Disable all moda keys to trigger non-managed fallback.
-	s.ApplyRateLimit("m-a", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
-	s.ApplyRateLimit("m-b", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
-	s.ApplyRateLimit("m-c", "Qwen-72B", modelExhaustedHdr(), 0, "", now)
+	s.ApplyRateLimit("m-a", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
+	s.ApplyRateLimit("m-b", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
+	s.ApplyRateLimit("m-c", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
 
 	// Non-managed fallback requests (advance nonManagedRR).
 	nonManagedReq := SchedulerPickRequest{
