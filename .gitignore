@@ -10,3 +10,7 @@ cmd/plugin/modelscope-ratelimit
 preview*.html
 /plugin
 *.so.bak
+魔粒体系说明.md
+提示词.md
+modelscope_api_merged.md
+抓包.txt

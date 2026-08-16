@@ -16,10 +16,6 @@ func (s *Store) ApplyRateLimit(authID, model string, headers map[string][]string
 		// (which always carries AuthID) will catch it.
 		return
 	}
-	cfg := s.config()
-	if !cfg.ManagesModel(model) {
-		return
-	}
 	// Daily-disable on 429 + "insufficient balance" (account balance
 	// exhausted — not a rate window, the key is genuinely unusable until
 	// the balance is topped up). Checked before rate-limit headers because
@@ -66,9 +62,6 @@ func (s *Store) ApplyInsufficientQuotaCooldown(authID, model string, statusCode 
 		return
 	}
 	cfg := s.config()
-	if !cfg.ManagesModel(model) {
-		return
-	}
 	if cfg.InsufficientQuotaCooldown <= 0 {
 		return
 	}
@@ -127,7 +120,7 @@ func (s *Store) OnStreamChunk(req StreamChunkInterceptRequest) StreamChunkInterc
 // checks (the alias) so isDisabled(id, alias) matches. Fall back to rec.Model
 // when no alias is configured (alias == upstream).
 func (s *Store) OnUsage(rec UsageRecord) {
-	// Record the alias -> upstream mapping first so disableModel's log (fired
+	// Record the alias -> upstream mapping first so the disable log (fired
 	// below via ApplyRateLimit) can display the upstream name.
 	s.recordAlias(rec.Alias, rec.Model)
 	model := strings.TrimSpace(rec.Alias)
@@ -181,6 +174,10 @@ func (s *Store) OnUsage(rec UsageRecord) {
 	// monitored providers are affected.
 	if rec.Failed && rec.Failure != nil {
 		if cfg.ManagesProvider(rec.Provider) {
+			// Record 429 from managed providers (daily counter for status page).
+			if rec.Failure.StatusCode == 429 {
+				s.recordRateLimit()
+			}
 			// 401 Unauthorized: the API key is invalid or expired. Disable the
 			// credential globally until plugin restart (not reset at midnight) so
 			// the scheduler skips it. The status page shows "密钥失效".

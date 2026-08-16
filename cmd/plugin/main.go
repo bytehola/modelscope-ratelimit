@@ -271,7 +271,12 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		// magic cube is exhausted. Update the accounts cache immediately so
 		// the frontend reflects the real balance without waiting for refresh.
 		if r.Failed && r.Failure != nil && modelscope.IsInsufficientBalance(r.Failure.StatusCode, r.Failure.Body) {
-			if mk := maskKey(r.AuthID); mk != "" {
+			// resolved.masked maps authID -> maskKey(apiKey), which is the
+			// same MaskedKey stored in accountsCache.results. Using
+			// maskKey(r.AuthID) directly would give the auth ID's 12-hex
+			// suffix, which never matches the API key's last 12 chars.
+			resolved := getResolved()
+			if mk, ok := resolved.masked[r.AuthID]; ok && mk != "" {
 				markAccountExhausted(mk)
 			}
 		}
@@ -419,7 +424,7 @@ func configure(raw []byte) error {
 			return
 		}
 		now := time.Now()
-		
+
 		var swg sync.WaitGroup
 		sem := make(chan struct{}, 20)
 		for _, authID := range resolved.orderedAuthIDs {
@@ -430,10 +435,15 @@ func configure(raw []byte) error {
 			sbCopy := sb
 			swg.Add(1)
 			sem <- struct{}{}
-			go func() {
-				defer swg.Done()
-				defer func() { <-sem }()
-				sc, _, err := mc.getWithRetry(sbCopy, "/api/v1/users/login/info", sid)
+		go func() {
+			defer swg.Done()
+			defer func() { <-sem }()
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("modelscope-ratelimit: recovered panic in sign-in worker: %v", rec)
+				}
+			}()
+			sc, _, err := mc.getWithRetry(sbCopy, "/api/v1/users/login/info", sid)
 				if err != nil || sc != 200 {
 					return
 				}
@@ -462,16 +472,22 @@ func configure(raw []byte) error {
 		}
 		swg.Wait()
 		// Refresh the accounts cache so the first page load is instant.
+		// Use forceBackgroundRefresh to avoid racing with an in-progress refresh.
 		go func() {
+				if !forceBackgroundRefresh() {
+					return
+				}
+				defer func() {
+					if rec := recover(); rec != nil {
+						log.Printf("modelscope-ratelimit: recovered panic in midnight refresh: %v", rec)
+					}
+					markRefreshDone()
+				}()
 				refreshMu.Lock()
 				defer refreshMu.Unlock()
-				accountsCacheMu.Lock()
-				refreshInProgress = true
-				accountsCacheMu.Unlock()
 				refreshAccountsCache(getResolved())
-				markRefreshDone()
 			}()
-	})
+		})
 	cfgMu.Lock()
 	pluginCfg = cfg
 	cfgMu.Unlock()
@@ -491,6 +507,25 @@ func configure(raw []byte) error {
 	if cfg.ProxyURL == "" {
 		store.DisableProxyOnReconfigure()
 	}
+	// 10s after startup: fetch login/info (daily sign-in) + balance for all
+	// accounts so the management page has data ready before first access.
+	// After this, refreshes only fetch balance + rate-limit (no login/info).
+	go func() {
+		time.Sleep(10 * time.Second)
+		if !forceBackgroundRefresh() {
+			return
+		}
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("modelscope-ratelimit: recovered panic in startup fetch: %v", rec)
+			}
+			markRefreshDone()
+		}()
+		refreshMu.Lock()
+		defer refreshMu.Unlock()
+		resolveKeysCached(cfg.HostBaseURL, cfg.ManagementKey, cfg.Providers)
+		refreshAccountsCache(getResolved())
+	}()
 	return nil
 }
 
@@ -540,6 +575,16 @@ func maskKey(k string) string {
 		return k
 	}
 	return k[len(k)-12:]
+}
+
+// maskToken masks a token for safe display: first 6 + "..." + last 4.
+// Used for SdkToken and Token fields in API responses to prevent
+// raw credential leakage to the unauthenticated status page.
+func maskToken(k string) string {
+	if len(k) <= 10 {
+		return k
+	}
+	return k[:6] + "..." + k[len(k)-4:]
 }
 
 type mgmtOpenAICompatEntry struct {
@@ -777,14 +822,13 @@ func pluginRegistration() any {
 			GitHubRepository: "https://github.com/bytehola/modelscope-ratelimit",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "providers", Type: pluginapi.ConfigFieldTypeArray, Description: "监控的提供商名称（必填）。填入顺序决定优先级：先填入的组额度耗尽之后，才能依次使用后面的"},
+				{Name: "skip_provider_on_429", Type: pluginapi.ConfigFieldTypeBoolean, Description: "开启后，一旦 429，立马使用非modelscope模型重试，避免因429限流等待时间过久。默认 false。"},
 				{Name: "host_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "CPA 链接地址，默认 http://127.0.0.1:8317。"},
 				{Name: "management_key", Type: pluginapi.ConfigFieldTypeString, Description: "CPA 管理密钥。（必填）"},
 				{Name: "credential_strategy", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"round-robin", "fill-first"}, Description: "凭据选择策略（仅对监控的 provider 生效）：round-robin=轮询（默认），fill-first=填充优先"},
-				{Name: "insufficient_quota_cooldown", Type: pluginapi.ConfigFieldTypeInteger, Description: "冷却基准秒数，默认 1。连续失败指数退避×2递增，封顶 60 秒。"},
+				{Name: "insufficient_quota_cooldown", Type: pluginapi.ConfigFieldTypeNumber, Description: "冷却基准秒数（支持小数），默认 0.1。连续失败指数退避×2递增，封顶 60 秒。"},
 				{Name: "proxy_url", Type: pluginapi.ConfigFieldTypeString, Description: "代理 URL（选填，留空=不启用）。只有在 429 时才会开启，成功后关闭。格式：socks5://user:pass@host:port"},
-				{Name: "skip_provider_on_429", Type: pluginapi.ConfigFieldTypeBoolean, Description: "开启后，托管 provider 一旦 429，下一次调度直接跳到非托管 provider（一次性，不等冷却）。默认 false。"},
 				{Name: "timezone", Type: pluginapi.ConfigFieldTypeString, Description: "每日 00:00 重置所用时区，默认 Asia/Shanghai。（留空即可）"},
-				{Name: "managed_models", Type: pluginapi.ConfigFieldTypeArray, Description: "可选：仅监控这些模型名，留空=全部。"},
 				{Name: "ms_proxy_url", Type: pluginapi.ConfigFieldTypeString, Description: "调试用：Modelscope API 代理地址（如 http://127.0.0.1:8888），留空=直连。"},
 			},
 		},
@@ -923,6 +967,29 @@ func handleManagement(r managementRequest) managementResponse {
 	return mgmtHTML(string(statusPageHTML))
 }
 
+// syncFetchAccounts fetches account data synchronously, guarding against
+// concurrent refreshes (e.g. the 10s startup goroutine). If another refresh
+// is already running, waits for it and returns the cache; otherwise acquires
+// refreshMu and does the fetch.
+func syncFetchAccounts(resolved *resolvedEntry) managementResponse {
+	if forceBackgroundRefresh() {
+		defer markRefreshDone()
+		refreshMu.Lock()
+		defer refreshMu.Unlock()
+		fresh := refreshAccountsCache(resolved)
+		return mgmtJSON(map[string]any{"accounts": fresh, "fetchedAt": time.Now().Format("15:04:05")})
+	}
+	// Another refresh is running. Wait for it to complete.
+	refreshMu.Lock()
+	refreshMu.Unlock()
+	if cached := getStaleAccountsCache(); cached != nil {
+		return mgmtJSON(map[string]any{"accounts": cached, "fetchedAt": getAccountsCacheTime()})
+	}
+	// Cache still empty after wait (other refresh failed) — direct fetch.
+	fresh := refreshAccountsCache(resolved)
+	return mgmtJSON(map[string]any{"accounts": fresh, "fetchedAt": time.Now().Format("15:04:05")})
+}
+
 func handleStatusAPI(r managementRequest, api string) managementResponse {
 	cfg := currentConfig()
 	if cfg == nil || len(cfg.Providers) == 0 || cfg.ManagementKey == "" {
@@ -943,38 +1010,47 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 		if refresh == "1" {
 			// Force a background refresh and return stale data immediately.
 			// The frontend's 5s polling will pick up fresh data when ready.
-			if forceBackgroundRefresh() {
-				go func() {
-					refreshMu.Lock()
-					defer refreshMu.Unlock()
-					refreshAccountsCache(getResolved())
-					markRefreshDone()
-				}()
-			}
 			stale := getStaleAccountsCache()
 			if stale != nil {
+				// Have stale data: return it immediately, refresh in background.
+				if forceBackgroundRefresh() {
+					go func() {
+						defer func() {
+							if rec := recover(); rec != nil {
+								log.Printf("modelscope-ratelimit: recovered panic in refresh: %v", rec)
+							}
+							markRefreshDone()
+						}()
+						refreshMu.Lock()
+						defer refreshMu.Unlock()
+						refreshAccountsCache(getResolved())
+					}()
+				}
 				return mgmtJSON(map[string]any{"accounts": stale, "fetchedAt": getAccountsCacheTime()})
 			}
-			// No cache at all (first load): fetch synchronously
-			fresh := refreshAccountsCache(resolved)
-			return mgmtJSON(map[string]any{"accounts": fresh, "fetchedAt": time.Now().Format("15:04:05")})
+			// No cache at all (first load): fetch synchronously with guard.
+			return syncFetchAccounts(resolved)
 		}
 		stale := getStaleAccountsCache()
 		if stale != nil {
 			// Return stale data immediately; trigger background refresh if expired
 			if shouldBackgroundRefresh() {
 				go func() {
+					defer func() {
+						if rec := recover(); rec != nil {
+							log.Printf("modelscope-ratelimit: recovered panic in refresh: %v", rec)
+						}
+						markRefreshDone()
+					}()
 					refreshMu.Lock()
 					defer refreshMu.Unlock()
 					refreshAccountsCache(getResolved())
-					markRefreshDone()
 				}()
 			}
 			return mgmtJSON(map[string]any{"accounts": stale, "fetchedAt": getAccountsCacheTime()})
 		}
-		// No cache at all: fetch synchronously (first load only)
-		fresh := refreshAccountsCache(resolved)
-		return mgmtJSON(map[string]any{"accounts": fresh, "fetchedAt": time.Now().Format("15:04:05")})
+		// No cache at all: fetch synchronously with guard.
+		return syncFetchAccounts(resolved)
 	case "account":
 		mk := getQuery(r, "key")
 		if mk == "" {
@@ -1055,6 +1131,11 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 			go func() {
 				defer cwg.Done()
 				defer func() { <-csem }()
+				defer func() {
+					if rec := recover(); rec != nil {
+						log.Printf("modelscope-ratelimit: recovered panic in checkin worker: %v", rec)
+					}
+				}()
 				sc, _, err := mc.getWithRetry(sbCopy, "/api/v1/users/login/info", sid)
 				cmu.Lock()
 				cout = append(cout, checkinResult{i, err == nil && sc == 200, sc})
@@ -1075,10 +1156,15 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 		clearAllCaches()
 		if forceBackgroundRefresh() {
 			go func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						log.Printf("modelscope-ratelimit: recovered panic in checkin refresh: %v", rec)
+					}
+					markRefreshDone()
+				}()
 				refreshMu.Lock()
 				defer refreshMu.Unlock()
 				refreshAccountsCache(resolved)
-				markRefreshDone()
 			}()
 		}
 		return mgmtJSON(results)
@@ -1140,6 +1226,16 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 					}
 				}
 				result["todayConsumed"] = consumed
+				// Update the accounts cache with today's consumed amount
+				// so the next ?api=accounts reflects the fresh value.
+				accountsCacheMu.Lock()
+				for i := range accountsCache.results {
+					if accountsCache.results[i].MaskedKey == mk {
+						accountsCache.results[i].TodayConsumed = consumed
+						break
+					}
+				}
+				accountsCacheMu.Unlock()
 				// Serialize tx.Records as []any for JSON response
 				recsJSON, _ := json.Marshal(tx.Records)
 				var recs []any
@@ -1155,11 +1251,12 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 	case "stats":
 		cdCount, cdWait := store.CooldownStats()
 		return mgmtJSON(map[string]any{
-			"successCount": store.SuccessStats(),
+			"successCount":  store.SuccessStats(),
+			"rateLimitCount": store.RateLimitCount(),
 			"cooldownCount": cdCount,
-			"cooldownWait": cdWait.Seconds(),
-			"totalKeys":    len(resolved.raw),
-			"modelUsage":   store.ModelUsageStats(),
+			"cooldownWait":  cdWait.Seconds(),
+			"totalKeys":     len(resolved.raw),
+			"modelUsage":    store.ModelUsageStats(),
 		})
 	}
 	return mgmtJSONError(404, "unknown api: "+api)

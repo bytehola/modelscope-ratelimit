@@ -28,7 +28,6 @@ type keyState struct {
 	mu           sync.RWMutex
 	global       *time.Time           // global (all-model) disable time, nil if none
 	globalReason string               // "" = daily quota disable (resets midnight); "unauthorized" = 401 (until restart)
-	models       map[string]time.Time // disabled model -> disable time
 	cooldown     *time.Time           // short-term global cooldown expiry (insufficient_quota), nil if none
 	successCount int                  // daily successful request count (reset at midnight)
 	magicCubeAvailable int       // available_balance from /openapi/v1/magicubes/balance
@@ -110,7 +109,7 @@ type Store struct {
 	// global (not per-key): each consecutive round of 429+insufficient_quota
 	// doubles the cooldown interval, capped at maxInsufficientQuotaCooldown.
 	backoffMu       sync.Mutex
-	cooldownLevel   int       // current backoff interval (seconds); 0 = idle
+	cooldownLevel   float64   // current backoff interval (seconds); 0 = idle
 	cooldownLevelAt time.Time // when the level was last advanced
 	// cooldownExpiresAt is when the current round's cooldown actually expires
 	// (level + the jitter used when the level was advanced). It anchors "same
@@ -129,6 +128,7 @@ type Store struct {
 	cooldownWaitNanos int64 // wall-clock nanoseconds any goroutine was blocking
 	cooldownStatsDay  time.Time
 	successCount      int64     // daily successful managed requests (status page)
+	rateLimitCount    int64     // daily 429 responses from managed providers
 	blockActive       int       // number of goroutines currently in a cooldown sleep
 	blockStart        time.Time // when the current block period started (blockActive 0→1)
 
@@ -597,7 +597,7 @@ func (s *Store) getOrCreateKey(authID string) *keyState {
 	if ks, ok = s.keys[authID]; ok {
 		return ks
 	}
-	ks = &keyState{models: make(map[string]time.Time)}
+	ks = &keyState{}
 	s.keys[authID] = ks
 	return ks
 }
@@ -612,7 +612,7 @@ func (s *Store) deleteKey(authID string) {
 	defer s.mu.Unlock()
 	if ks, ok := s.keys[authID]; ok {
 		ks.mu.RLock()
-		empty := ks.global == nil && len(ks.models) == 0 && ks.cooldown == nil
+		empty := ks.global == nil && ks.cooldown == nil
 		ks.mu.RUnlock()
 		if empty {
 			delete(s.keys, authID)
@@ -640,9 +640,6 @@ func (s *Store) isDisabled(authID, model string, now time.Time) bool {
 	if ks.global != nil && (ks.globalReason == "unauthorized" || active(*ks.global, now, loc)) {
 		return true
 	}
-	if t, ok := ks.models[model]; ok && active(t, now, loc) {
-		return true
-	}
 	return false
 }
 
@@ -659,11 +656,6 @@ func (s *Store) hasAnyDisable(authID string, now time.Time, loc *time.Location) 
 	}
 	if ks.global != nil && (ks.globalReason == "unauthorized" || active(*ks.global, now, loc)) {
 		return true
-	}
-	for _, t := range ks.models {
-		if active(t, now, loc) {
-			return true
-		}
 	}
 	return false
 }
@@ -789,11 +781,6 @@ func (s *Store) ModelRemaining(model string, now time.Time) int {
 		ks.mu.RLock()
 		skip := ks.global != nil && active(*ks.global, now, loc)
 		if !skip {
-			if t, ok := ks.models[model]; ok && active(t, now, loc) {
-				skip = true
-			}
-		}
-		if !skip {
 			total += ks.magicCubeAvailable
 		}
 		ks.mu.RUnlock()
@@ -838,21 +825,6 @@ func (s *Store) disableUnauthorized(authID string, now time.Time) {
 	s.log.Printf("modelscope-ratelimit: key %s disabled (unauthorized: secret may be invalid)", authID)
 }
 
-// disableModel marks (authID, model) as disabled for the rest of the day.
-// The earliest observation time is kept.
-func (s *Store) disableModel(authID, model string, now time.Time) {
-	ks := s.getOrCreateKey(authID)
-	loc := s.location()
-	ks.mu.Lock()
-	if t, ok := ks.models[model]; ok && active(t, now, loc) {
-		ks.mu.Unlock()
-		return // already disabled today; keep earliest time
-	}
-	ks.models[model] = now
-	ks.mu.Unlock()
-	s.log.Printf("modelscope-ratelimit: key %s model %s disabled",
-		authID, s.displayName(model))
-}
 
 // maxInsufficientQuotaCooldown is the ceiling for a single insufficient_quota
 // cooldown interval (seconds). Exponential backoff doubles each consecutive
@@ -874,7 +846,7 @@ const maxInsufficientQuotaCooldown = 60
 //
 // The level resets to the base on a healthy response (quota recovered, see
 // ApplyRateLimit) and at the midnight daily boundary (PruneAll).
-func (s *Store) setCooldown(authID string, base int, now time.Time) {
+func (s *Store) setCooldown(authID string, base float64, now time.Time) {
 	if authID == "" || base <= 0 {
 		return
 	}
@@ -910,7 +882,7 @@ func (s *Store) setCooldown(authID string, base int, now time.Time) {
 	if advanced {
 		s.cooldownLevel = level
 		s.cooldownLevelAt = now
-		expiry := time.Duration(level)*time.Second + jitter
+		expiry := time.Duration(level * float64(time.Second)) + jitter
 		if expiry > maxInsufficientQuotaCooldown*time.Second {
 			expiry = maxInsufficientQuotaCooldown * time.Second
 		}
@@ -920,7 +892,7 @@ func (s *Store) setCooldown(authID string, base int, now time.Time) {
 
 	// Add the precomputed jitter so retries against a shared exhausted quota
 	// don't all wake simultaneously, then cap at the maximum.
-	dur := time.Duration(level)*time.Second + jitter
+	dur := time.Duration(level * float64(time.Second)) + jitter
 	if dur > maxInsufficientQuotaCooldown*time.Second {
 		dur = maxInsufficientQuotaCooldown * time.Second
 	}
@@ -1002,6 +974,21 @@ func (s *Store) recordSuccess(authID string) {
 func (s *Store) SuccessStats() int {
 	s.cooldownStatsMu.Lock()
 	n := s.successCount
+	s.cooldownStatsMu.Unlock()
+	return int(n)
+}
+
+// recordRateLimit increments the daily 429 counter for managed providers.
+func (s *Store) recordRateLimit() {
+	s.cooldownStatsMu.Lock()
+	s.rateLimitCount++
+	s.cooldownStatsMu.Unlock()
+}
+
+// RateLimitCount returns the daily count of 429 responses from managed providers.
+func (s *Store) RateLimitCount() int {
+	s.cooldownStatsMu.Lock()
+	n := s.rateLimitCount
 	s.cooldownStatsMu.Unlock()
 	return int(n)
 }
@@ -1158,9 +1145,8 @@ func (s *Store) cooldownWaitDuration(now time.Time) time.Duration {
 
 // DisableStatus is a snapshot of a key's disable state, for diagnostics.
 type DisableStatus struct {
-	AuthID string               `json:"auth_id"`
-	Global *time.Time           `json:"global_disabled_at,omitempty"`
-	Models map[string]time.Time `json:"models_disabled,omitempty"`
+	AuthID string     `json:"auth_id"`
+	Global *time.Time `json:"global_disabled_at,omitempty"`
 }
 
 // Status returns a snapshot of every key with any active disable.
@@ -1181,7 +1167,7 @@ func (s *Store) Status() []DisableStatus {
 			continue
 		}
 		ks.mu.RLock()
-		st := DisableStatus{AuthID: id, Models: map[string]time.Time{}}
+		st := DisableStatus{AuthID: id}
 		// A 401 (unauthorized) global disable persists across the midnight
 		// boundary (globalReason == "unauthorized"); a daily-quota global
 		// disable is only active on its own calendar day. Match isDisabled
@@ -1190,13 +1176,8 @@ func (s *Store) Status() []DisableStatus {
 			t := *ks.global
 			st.Global = &t
 		}
-		for m, t := range ks.models {
-			if active(t, now, loc) {
-				st.Models[m] = t
-			}
-		}
 		ks.mu.RUnlock()
-		if st.Global != nil || len(st.Models) > 0 {
+		if st.Global != nil {
 			out = append(out, st)
 		}
 	}
@@ -1217,6 +1198,7 @@ func (s *Store) PruneAll(now time.Time) {
 		s.cooldownCount = 0
 		s.cooldownWaitNanos = 0
 		s.successCount = 0
+		s.rateLimitCount = 0
 		s.blockActive = 0
 		s.blockStart = time.Time{}
 	}
@@ -1245,12 +1227,7 @@ func (s *Store) PruneAll(now time.Time) {
 			ks.global = nil
 			ks.globalReason = ""
 		}
-		for m, t := range ks.models {
-			if !active(t, now, loc) {
-				delete(ks.models, m)
-			}
-		}
-		empty := ks.global == nil && len(ks.models) == 0 && ks.cooldown == nil
+		empty := ks.global == nil && ks.cooldown == nil
 		ks.mu.Unlock()
 		if empty {
 			s.deleteKey(id)

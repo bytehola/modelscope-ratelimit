@@ -65,6 +65,57 @@ func TestNormalizeAPIResponseUnparseable(t *testing.T) {
 		t.Fatal("expected error for unparseable response")
 	}
 }
+ 
+// TestNormalizeAPIResponseMixedCase covers the mixed envelope where
+// "Code" is CamelCase but "data" is lowercase — the format returned by
+// GET /api/v1/inference/rate-limit. This was the original bug where the
+// CamelCase parser matched "Code":200 and returned early with empty Data,
+// causing currentUsagePerDay to always decode as 0.
+func TestNormalizeAPIResponseMixedCase(t *testing.T) {
+	raw := []byte(`{"Code":200,"Data":{"currentUsagePerDay":6},"Message":"success","RequestId":"abc","Success":true}`)
+	resp, err := NormalizeAPIResponse(raw)
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if !resp.Success {
+		t.Fatal("expected success=true")
+	}
+	if resp.Code != 200 {
+		t.Fatalf("code = %d, want 200", resp.Code)
+	}
+	var rl InferenceRateLimit
+	if err := json.Unmarshal(resp.Data, &rl); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if rl.CurrentUsagePerDay != 6 {
+		t.Fatalf("currentUsagePerDay = %d, want 6", rl.CurrentUsagePerDay)
+	}
+ }
+ 
+// TestNormalizeAPIResponseLowerData covers the mixed envelope where "Code"
+// is CamelCase but "data" is fully lowercase — also seen on some /api/v1/*
+// endpoints. Go's case-insensitive json.Unmarshal should capture it in the
+// single-pass struct tagged "Data".
+func TestNormalizeAPIResponseLowerData(t *testing.T) {
+	raw := []byte(`{"Code":200,"data":{"currentUsagePerDay":42},"Message":"success","Success":true}`)
+	resp, err := NormalizeAPIResponse(raw)
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if !resp.Success {
+		t.Fatal("expected success=true")
+	}
+	if resp.Code != 200 {
+		t.Fatalf("code = %d, want 200", resp.Code)
+	}
+	var rl InferenceRateLimit
+	if err := json.Unmarshal(resp.Data, &rl); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if rl.CurrentUsagePerDay != 42 {
+		t.Fatalf("currentUsagePerDay = %d, want 42", rl.CurrentUsagePerDay)
+	}
+ }
 
 func TestTransactionRecordFields(t *testing.T) {
 	// Verify the JSON tags match the real API response

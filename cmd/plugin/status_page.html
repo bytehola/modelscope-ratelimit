@@ -783,7 +783,7 @@
     <div class="wrap">
       <div class="title">Modelscope 限流管理后台</div>
       <div class="sub" id="subtitle">
-        <span class="spinner"></span> 连接服务器中
+        <span class="spinner"></span> 服务器刷新数据中...
       </div>
       <div class="toolbar">
         <div class="refresh-bar">
@@ -1007,7 +1007,7 @@
         color: #86868b;
       "
     >
-      Modelscope 限流管理后台插件 v2.2.1 · 构建于 2026-08-15 07:51:09 CST
+      Modelscope 限流管理后台插件 v2.2.1 · 构建于 2026-08-16 15:33:01 CST
     </div>
     <div class="toast" id="toast"></div>
     <script>
@@ -1027,6 +1027,7 @@
       var ACCOUNTS = [];
       var STATS = {
         successCount: 0,
+        rateLimitCount: 0,
         cooldownCount: 0,
         cooldownWait: 0,
         totalKeys: 0,
@@ -1034,7 +1035,7 @@
       var signedInToday = false;
       var lastRefreshTime = "—";
       var nextRefreshCountdown = "—";
-      var cacheTTLms = 5 * 60 * 1000;
+      var cacheTTLms = 30 * 60 * 1000;
       var lastRefreshAtMs = 0;
       var expandedIdxs = [];
       var detailJSCache = {};
@@ -1106,10 +1107,6 @@
         }
       }
       setInterval(updateCountdown, 1000);
-      function maskToken(t) {
-        if (!t || t.length <= 12) return t;
-        return t.slice(0, 6) + "..." + t.slice(-4);
-      }
 
       // Stale-while-revalidate: keep old data visible during refetch
       var staleAccounts = null;
@@ -1217,6 +1214,7 @@
           } else {
             STATS = {
               successCount: 0,
+              rateLimitCount: 0,
               cooldownCount: 0,
               cooldownWait: 0,
               totalKeys: ACCOUNTS.length || 0,
@@ -1232,12 +1230,9 @@
           '<div class="card"><div class="k">请求成功</div><div class="v green">' +
           (STATS.successCount || 0) +
           '</div><div class="sub-v">托管 Provider 合计</div></div>' +
-          '<div class="card"><div class="k">退避触发</div><div class="v">' +
-          (STATS.cooldownCount || 0) +
-          " 次</div></div>" +
-          '<div class="card"><div class="k">累计等待</div><div class="v">' +
-          (STATS.cooldownWait || 0).toFixed(1) +
-          "s</div></div>";
+          '<div class="card"><div class="k">限流触发</div><div class="v">' +
+          (STATS.rateLimitCount || 0) +
+          " 次</div></div>";
       }
       function renderModels() {
         var mu = STATS.modelUsage || {};
@@ -1420,26 +1415,27 @@
         document.getElementById("rl-tbody").innerHTML =
           html ||
           '<tr><td colspan="7" style="text-align:center;color:#86868b;padding:20px">无匹配</td></tr>';
-       // Auto-expand all matching rows when searching
-       if (acctSearchTerm && count > 0) {
-         ACCOUNTS.forEach(function (a, i) {
-           var hay = (
-             (a.maskedKey || "") +
-             " " +
-             (a.name || "") +
-             " " +
-             (a.email || "") +
-             " " +
-             (a.phone || "")
-           ).toLowerCase();
-           if (
-             hay.indexOf(acctSearchTerm) >= 0 &&
-             expandedIdxs.indexOf(i) < 0 && detailJSCache[a.maskedKey]
-           ) {
-             expandDetail(i);
-           }
-         });
-       }
+        // Auto-expand all matching rows when searching
+        if (acctSearchTerm && count > 0) {
+          ACCOUNTS.forEach(function (a, i) {
+            var hay = (
+              (a.maskedKey || "") +
+              " " +
+              (a.name || "") +
+              " " +
+              (a.email || "") +
+              " " +
+              (a.phone || "")
+            ).toLowerCase();
+            if (
+              hay.indexOf(acctSearchTerm) >= 0 &&
+              expandedIdxs.indexOf(i) < 0 &&
+              detailJSCache[a.maskedKey]
+            ) {
+              expandDetail(i);
+            }
+          });
+        }
         applySort();
       }
 
@@ -1474,13 +1470,13 @@
           '<div class="dp-item"><span class="dk">阿里云绑定</span><span class="dv">' +
           (d.aliyunBound ? "已绑定 (" + (d.aliyunNick || "") + ")" : "未绑定") +
           "</span></div>" +
-         '<div class="dp-item"><span class="dk">平台调用量</span><span class="dv">' +
+          '<div class="dp-item"><span class="dk">平台调用量</span><span class="dv">' +
           (idx != null && ACCOUNTS[idx]
             ? ACCOUNTS[idx].usagePerDay || 0
             : d.usagePerDay || 0) +
-         " 次/日</span></div>" +
+          " 次/日</span></div>" +
           '<div class="dp-item"><span class="dk">SDK Token</span><span class="dv" style="font-family:ui-monospace,monospace;font-size:10.5px">' +
-          (d.sdkToken ? maskToken(d.sdkToken) : "—") +
+          (d.sdkToken ? d.sdkToken : "—") +
           "</span></div>" +
           "</div></div>" +
           '<div class="dp-section"><div class="dp-title">Token 列表</div><div class="dp-tokens">';
@@ -1492,7 +1488,7 @@
               '"></span><span class="t-name">' +
               t.name +
               '</span><span class="t-val">' +
-              maskToken(t.token) +
+              t.token +
               '</span><span class="t-meta">' +
               (t.valid ? "有效" : "已失效") +
               "</span></div>";
@@ -1514,11 +1510,13 @@
         row.classList.add("expanded");
         expandedIdxs.push(idx);
         var mk = ACCOUNTS[idx].maskedKey;
-       if (detailJSCache[mk]) {
-         dr.innerHTML =
-            '<td colspan="7">' + renderDetailPanel(detailJSCache[mk], idx) + "</td>";
-         return;
-       }
+        if (detailJSCache[mk]) {
+          dr.innerHTML =
+            '<td colspan="7">' +
+            renderDetailPanel(detailJSCache[mk], idx) +
+            "</td>";
+          return;
+        }
         dr.innerHTML =
           '<td colspan="7"><div class="detail-panel" style="color:#86868b;padding:14px 18px"><span class="spinner"></span> 加载中</div></td>';
         xhr(
@@ -1526,8 +1524,8 @@
           "?api=account&key=" + ACCOUNTS[idx].maskedKey,
           function (sc, d) {
             if (sc === 200 && d) {
-             detailJSCache[ACCOUNTS[idx].maskedKey] = d;
-             dr.innerHTML =
+              detailJSCache[ACCOUNTS[idx].maskedKey] = d;
+              dr.innerHTML =
                 '<td colspan="7">' + renderDetailPanel(d, idx) + "</td>";
             } else {
               dr.innerHTML =

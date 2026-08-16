@@ -20,6 +20,13 @@ type Config struct {
 	// fall through to the next provider in the list.
 	Providers []string `json:"providers" yaml:"providers"`
 
+	// SkipProviderOn429 activates "skip-provider-on-429" mode: on any 429 from
+	// a managed provider, the next scheduler pick jumps straight to a
+	// non-managed provider (one-shot, no cooldown, no proxy, no daily
+	// disable), so the request gets a fast response instead of waiting for
+	// the managed 429 backoff. Default false.
+	SkipProviderOn429 bool `json:"skip_provider_on_429" yaml:"skip_provider_on_429"`
+
 	// Timezone is the IANA timezone used for the daily 00:00 reset boundary.
 	// Defaults to "Asia/Shanghai".
 	Timezone string `json:"timezone" yaml:"timezone"`
@@ -31,10 +38,10 @@ type Config struct {
 
 	// InsufficientQuotaCooldown is the number of seconds to temporarily cool
 	// down (skip) a managed key after it returns HTTP 429 with an
-	// "insufficient_quota" error body (e.g. Aliyun Model Studio quota
-	// exhaustion). During the cooldown the scheduler picks a different key;
-	// after it expires the key becomes available again. Default 10 seconds.
-	InsufficientQuotaCooldown int `json:"insufficient_quota_cooldown" yaml:"insufficient_quota_cooldown"`
+	// "insufficient_quota" error body. During the cooldown the scheduler
+	// picks a different key; after it expires the key becomes available
+	// again. Supports fractional seconds (e.g. 0.1). Default 0.1.
+	InsufficientQuotaCooldown float64 `json:"insufficient_quota_cooldown" yaml:"insufficient_quota_cooldown"`
 
 	// ProxyURL, when non-empty, activates proxy mode: on the first 429 from a
 	// managed provider, the plugin waits 2s, probes the proxy by requesting
@@ -46,16 +53,6 @@ type Config struct {
 	// as "socks5://user:pass@host:port" or "http://host:port".
 	ProxyURL string `json:"proxy_url" yaml:"proxy_url"`
 
-	// SkipProviderOn429 activates "skip-provider-on-429" mode: on any 429 from
-	// a managed provider, the next scheduler pick jumps straight to a
-	// non-managed provider (one-shot, no cooldown, no proxy, no daily
-	// disable), so the request gets a fast response instead of waiting for
-	// the managed 429 backoff. Default false.
-	SkipProviderOn429 bool `json:"skip_provider_on_429" yaml:"skip_provider_on_429"`
-
-	// ManagedModels, if non-empty, restricts monitoring to these model names.
-	// Empty means monitor every model served by the configured providers.
-	ManagedModels []string `json:"managed_models" yaml:"managed_models"`
 
 	// MsProxyURL, when set, routes all Modelscope API calls through this proxy.
 	// Used for debugging/traffic inspection (e.g. "http://127.0.0.1:8888").
@@ -84,7 +81,7 @@ func DefaultConfig() *Config {
 		HostBaseURL:               "http://127.0.0.1:8317",
 		Timezone:                  "Asia/Shanghai",
 		CredentialStrategy:        "round-robin",
-		InsufficientQuotaCooldown: 1,
+		InsufficientQuotaCooldown: 0.1,
 	}
 }
 
@@ -150,19 +147,6 @@ func (c *Config) ManagesProvider(provider string) bool {
 	return c.ProviderIndex(provider) >= 0
 }
 
-// ManagesModel reports whether the given model is in scope. When ManagedModels
-// is empty every model is in scope.
-func (c *Config) ManagesModel(model string) bool {
-	if len(c.ManagedModels) == 0 {
-		return true
-	}
-	for _, m := range c.ManagedModels {
-		if m == model {
-			return true
-		}
-	}
-	return false
-}
 
 // ConfigFromMap builds a Config from a generic map (the glue parses the host
 // YAML into a map and delegates here). Missing or zero-value fields fall back
@@ -175,14 +159,14 @@ func ConfigFromMap(raw map[string]any) (*Config, error) {
 	if v, ok := raw["providers"]; ok {
 		cfg.Providers = toStringSlice(v)
 	}
+	if v, ok := raw["skip_provider_on_429"].(bool); ok {
+		cfg.SkipProviderOn429 = v
+	}
 	if v, ok := raw["host_base_url"].(string); ok && strings.TrimSpace(v) != "" {
 		cfg.HostBaseURL = strings.TrimSpace(v)
 	}
 	if v, ok := raw["management_key"].(string); ok {
 		cfg.ManagementKey = strings.TrimSpace(v)
-	}
-	if v, ok := raw["managed_models"]; ok {
-		cfg.ManagedModels = toStringSlice(v)
 	}
 	if v, ok := raw["timezone"].(string); ok && v != "" {
 		cfg.Timezone = v
@@ -191,7 +175,7 @@ func ConfigFromMap(raw map[string]any) (*Config, error) {
 		cfg.CredentialStrategy = strings.ToLower(strings.TrimSpace(v))
 	}
 	if v, ok := raw["insufficient_quota_cooldown"]; ok {
-		if n, err := toInt(v); err == nil {
+		if n, err := toFloat64(v); err == nil {
 			cfg.InsufficientQuotaCooldown = n
 		} else {
 			return nil, fmt.Errorf("invalid insufficient_quota_cooldown: %w", err)
@@ -202,9 +186,6 @@ func ConfigFromMap(raw map[string]any) (*Config, error) {
 	}
 	if v, ok := raw["ms_proxy_url"].(string); ok {
 		cfg.MsProxyURL = strings.TrimSpace(v)
-	}
-	if v, ok := raw["skip_provider_on_429"].(bool); ok {
-		cfg.SkipProviderOn429 = v
 	}
 	return cfg, nil
 }
@@ -234,18 +215,18 @@ func toStringSlice(v any) []string {
 	}
 }
 
-// toInt coerces common YAML/JSON numeric representations into an int.
-func toInt(v any) (int, error) {
+// toFloat64 coerces common YAML/JSON numeric representations into a float64.
+func toFloat64(v any) (float64, error) {
 	switch n := v.(type) {
 	case int:
-		return n, nil
+		return float64(n), nil
 	case int64:
-		return int(n), nil
+		return float64(n), nil
 	case float64:
-		return int(n), nil
+		return n, nil
 	case string:
-		var x int
-		_, err := fmt.Sscanf(n, "%d", &x)
+		var x float64
+		_, err := fmt.Sscanf(n, "%f", &x)
 		return x, err
 	default:
 		return 0, fmt.Errorf("unsupported numeric type %T", v)

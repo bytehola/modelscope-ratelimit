@@ -45,11 +45,6 @@ var ErrAllCredentialsDisabled = errors.New("all credentials disabled for model (
 // on disabled managed keys.
 func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, error) {
 	cfg := s.config()
-
-	if !cfg.ManagesModel(req.Model) {
-		return SchedulerPickResponse{Handled: false}, nil
-	}
-
 	now := s.now()
 
 	// Pre-scan: are there any managed candidates in this request? When all

@@ -49,8 +49,8 @@ func TestConfigFromMap(t *testing.T) {
 		if c.Timezone != "Asia/Shanghai" {
 			t.Fatalf("timezone = %q", c.Timezone)
 		}
-		if c.InsufficientQuotaCooldown != 1 {
-			t.Fatalf("cooldown = %d", c.InsufficientQuotaCooldown)
+		if c.InsufficientQuotaCooldown != 0.1 {
+			t.Fatalf("cooldown = %v", c.InsufficientQuotaCooldown)
 		}
 		if c.ManagesProvider("modelscope") {
 			t.Fatal("empty providers should manage nothing")
@@ -72,7 +72,7 @@ func TestConfigFromMap(t *testing.T) {
 			t.Fatalf("timezone = %q", c.Timezone)
 		}
 		if c.InsufficientQuotaCooldown != 3 {
-			t.Fatalf("cooldown = %d", c.InsufficientQuotaCooldown)
+			t.Fatalf("cooldown = %v", c.InsufficientQuotaCooldown)
 		}
 	})
 }
@@ -1349,7 +1349,7 @@ func TestInsufficientQuotaNonManagedNoCooldown(t *testing.T) {
 	s.Reconfigure(cfg)
 
 	// A non-managed provider (e.g. Aliyun) returns 429 + insufficient_quota for a
-	// model that IS monitored (ManagedModels is empty => all models monitored).
+	// model that IS monitored (all models are monitored by default).
 	s.OnUsage(UsageRecord{
 		AuthID:   "auth-aliyun",
 		Provider: "openai-compatible-aliyun",

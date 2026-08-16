@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"math/rand"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"strings"
 	"time"
 
@@ -21,24 +23,47 @@ type msClient struct {
 	httpClient *http.Client
 }
 
-var msHTTPClient = &http.Client{Timeout: 15 * time.Second}
+var msHTTPClient atomic.Pointer[http.Client]
+
+func init() {
+	msHTTPClient.Store(&http.Client{
+		Timeout:   15 * time.Second,
+		Transport: newMSTransport(nil),
+	})
+}
+
+// newMSTransport builds an http.Transport with sensible connection-pool
+// settings. Under high concurrency (20 workers × 3 goroutines = 60 requests),
+// Go's default MaxIdleConnsPerHost=2 causes excessive TCP churn that can
+// overwhelm a debug proxy (ms_proxy_url). 30 concurrent connections per host
+// is enough for the semaphore-limited workers without exhausting ephemeral
+// ports through a proxy.
+func newMSTransport(proxy func(*http.Request) (*url.URL, error)) *http.Transport {
+	return &http.Transport{
+		Proxy:               proxy,
+		MaxIdleConnsPerHost: 30,
+		MaxConnsPerHost:     30,
+	}
+}
 
 // SetMSProxy reconfigures the Modelscope API HTTP client to use a proxy.
 // Called from configure() when ms_proxy_url is set in config.
-// TODO: remove after debugging is complete.
 func SetMSProxy(proxyURL string) {
 	if proxyURL == "" {
-		msHTTPClient = &http.Client{Timeout: 15 * time.Second}
+		msHTTPClient.Store(&http.Client{
+			Timeout:   15 * time.Second,
+			Transport: newMSTransport(nil),
+		})
 		return
 	}
 	u, err := url.Parse(proxyURL)
 	if err != nil {
 		return
 	}
-	msHTTPClient = &http.Client{
+	msHTTPClient.Store(&http.Client{
 		Timeout: 15 * time.Second,
-		Transport: &http.Transport{Proxy: http.ProxyURL(u)},
-	}
+		Transport: newMSTransport(http.ProxyURL(u)),
+	})
 }
 
 // siteBaseFromURL derives the Modelscope site base URL from the provider's
@@ -50,17 +75,25 @@ func siteBaseFromURL(baseURL string) string {
 	return "https://modelscope.cn"
 }
 
-// apiGet calls a Modelscope API endpoint and normalizes the dual response
-// format (/api/v1/* CamelCase, /openapi/v1/* snake_case).
-// getWithRetry calls get() and retries on 429 (Too Many Requests).
+// getWithRetry calls get() and retries on 429 (Too Many Requests) and on
+// network errors. The retry budget is 5 attempts with jittered backoff.
+// Network errors (err != nil, sc == 0) use a shorter backoff (0.5-1s) than
+// 429 rate-limit responses (2-5s), because connection failures through a
+// proxy tend to be transient and resolve quickly.
 func (c *msClient) getWithRetry(siteBase, path, sessionID string) (int, json.RawMessage, error) {
 	for attempt := 0; attempt < 5; attempt++ {
 		sc, data, err := c.get(siteBase, path, sessionID)
-		if sc != 429 {
+		// Success: return immediately.
+		if err == nil && sc != 429 {
 			return sc, data, err
 		}
-		// 429: random wait 2-5s then retry
-		delay := time.Duration(2+rand.Intn(4)) * time.Second
+		// Backoff: longer for 429 (server-enforced), shorter for network errors.
+		var delay time.Duration
+		if sc == 429 {
+			delay = time.Duration(2+rand.Intn(4)) * time.Second
+		} else {
+			delay = time.Duration(500+rand.Intn(500)) * time.Millisecond
+		}
 		time.Sleep(delay)
 	}
 	// Final attempt without retry
@@ -74,7 +107,7 @@ func (c *msClient) get(siteBase, path, sessionID string) (int, json.RawMessage, 
 	}
 	req.Header.Set("Cookie", "m_session_id="+sessionID)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := msHTTPClient.Do(req)
+	resp, err := msHTTPClient.Load().Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -189,11 +222,14 @@ type tokenJSON struct {
 	Expires string `json:"expires"`
 }
 
-// fetchAccountSummary calls login/info + balance + rate-limit for one key.
-func (c *msClient) fetchAccountSummary(idx int, sessionID, siteBase, site string) accountSummary {
+// fetchLoginInfo calls login/info (daily sign-in) + users/info (phone).
+// Returns a partially populated accountSummary with profile data only.
+// Balance/rate-limit/transactions are fetched separately in phase 2
+// so that sign-in completes for ALL accounts before any balance read.
+func (c *msClient) fetchLoginInfo(idx int, sessionID, siteBase, site string) accountSummary {
 	a := accountSummary{Index: idx, MaskedKey: maskKey(sessionID), Site: site, Schedule: "normal"}
 
-	// 1. login/info (also performs daily sign-in) + users/info (for phone) — concurrent
+	// login/info + users/info — concurrent
 	var (
 		liSc, uiSc     int
 		liRaw, uiRaw   []byte
@@ -221,7 +257,7 @@ func (c *msClient) fetchAccountSummary(idx int, sessionID, siteBase, site string
 			a.FromSite = li.FromSite
 			a.IsRealName = li.IsRealName
 			a.CheckedIn = true
-			a.LastCheckIn = time.Now().Format("2006-01-02 15:04:05")
+		a.LastCheckIn = time.Now().Format("2006-01-02 15:04:05")
 		}
 	} else if liSc == 401 || liSc == 403 {
 		a.Schedule = "unauthorized"
@@ -229,7 +265,7 @@ func (c *msClient) fetchAccountSummary(idx int, sessionID, siteBase, site string
 		return a
 	}
 
-	// Populate phone from users/info (if available)
+	// Populate phone from users/info
 	if uiErr == nil && uiSc == 200 {
 		var ui ratelimit.UserInfo
 		if json.Unmarshal(uiRaw, &ui) == nil {
@@ -237,26 +273,24 @@ func (c *msClient) fetchAccountSummary(idx int, sessionID, siteBase, site string
 		}
 	}
 
-	// 2. balance
-	sc, data, err := c.getWithRetry(siteBase, "/openapi/v1/magicubes/balance", sessionID)
-	if err == nil && sc == 200 {
-		var b ratelimit.MagicCubeBalance
-		if json.Unmarshal(data, &b) == nil {
-			a.Balance = &balanceJSON{Total: b.TotalBalance, Available: b.AvailableBalance, Frozen: b.FrozenAmount}
-			if b.AvailableBalance <= 0 {
-				a.Schedule = "exhausted"
-			}
-		}
-	}
-
-	// 3. rate-limit + 4. transactions (concurrent)
+	return a
+}
+ 
+// fetchBalanceData fetches balance + rate-limit + transactions concurrently
+// for a single account. Called in phase 2 after ALL accounts have completed
+// login/info (sign-in) so balance reflects the updated magic cube quota.
+func (c *msClient) fetchBalanceData(a *accountSummary, sessionID, siteBase string) {
 	var (
-		rlSc, txSc     int
-		rlRaw, txRaw   []byte
-		rlErr, txErr   error
-		wg             sync.WaitGroup
+		bSc, rlSc, txSc int
+		bRaw, rlRaw, txRaw []byte
+		bErr, rlErr, txErr error
+		wg sync.WaitGroup
 	)
-	wg.Add(2)
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		bSc, bRaw, bErr = c.getWithRetry(siteBase, "/openapi/v1/magicubes/balance", sessionID)
+	}()
 	go func() {
 		defer wg.Done()
 		rlSc, rlRaw, rlErr = c.getWithRetry(siteBase, "/api/v1/inference/rate-limit", sessionID)
@@ -266,7 +300,14 @@ func (c *msClient) fetchAccountSummary(idx int, sessionID, siteBase, site string
 		txSc, txRaw, txErr = c.getWithRetry(siteBase, "/openapi/v1/magicubes/transactions?type=SPEND_CONFIRM&page=1&page_size=50", sessionID)
 	}()
 	wg.Wait()
-
+ 
+	// Process balance
+	if bErr == nil && bSc == 200 {
+		var b ratelimit.MagicCubeBalance
+		if json.Unmarshal(bRaw, &b) == nil {
+			a.Balance = &balanceJSON{Total: b.TotalBalance, Available: b.AvailableBalance, Frozen: b.FrozenAmount}
+		}
+	}
 	// Process rate-limit
 	if rlErr == nil && rlSc == 200 {
 		var rl ratelimit.InferenceRateLimit
@@ -274,7 +315,6 @@ func (c *msClient) fetchAccountSummary(idx int, sessionID, siteBase, site string
 			a.UsagePerDay = rl.CurrentUsagePerDay
 		}
 	}
-
 	// Process transactions: sum today's SPEND_CONFIRM total_amount
 	if txErr == nil && txSc == 200 {
 		var tx ratelimit.TransactionsResp
@@ -287,24 +327,15 @@ func (c *msClient) fetchAccountSummary(idx int, sessionID, siteBase, site string
 			}
 		}
 	}
-
-	// Post-processing: fix balance and schedule
-	// Only mark as exhausted when the balance API actually returned
-	// available <= 0. If the API call failed (nil), we don't know the
-	// real balance — keep schedule "normal" and leave balance nil so
-	// the frontend shows "—" instead of a misleading 0.
+	// Post-processing: set schedule based on actual balance
 	if a.Balance == nil {
-		// Balance API failed: do NOT assume available=0 or exhausted.
-		// The real balance is unknown; next refresh will populate it.
+		// Balance API failed: keep schedule as-is (normal)
 	} else if a.Balance.Available <= 0 {
 		a.Schedule = "exhausted"
-		// If total is 0 but we consumed some today, total should reflect consumed
 		if a.Balance.Total == 0 && a.TodayConsumed > 0 {
 			a.Balance.Total = a.TodayConsumed
 		}
 	}
-
-	return a
 }
 
 // fetchTransactions calls /openapi/v1/magicubes/transactions.
@@ -322,7 +353,7 @@ func (c *msClient) fetchTransactions(siteBase, sessionID string, page, pageSize 
 // explicit "一键刷新"). Only the first load (or after cache clear) triggers
 // fresh API calls for all accounts.
 
-const accountsCacheTTL = 5 * time.Minute
+const accountsCacheTTL = 30 * time.Minute
 
 type accountsCacheEntry struct {
 	results        []accountSummary
@@ -422,7 +453,8 @@ func refreshAccountsCache(resolved *resolvedEntry) []accountSummary {
 		sem = make(chan struct{}, 20)
 	)
 	idx := 0
-	for authID, sessionID := range resolved.raw {
+	for _, authID := range resolved.orderedAuthIDs {
+		sessionID := resolved.raw[authID]
 		sb := resolved.siteBase[authID]
 		site := "cn"
 		if strings.Contains(sb, "modelscope.ai") {
@@ -439,16 +471,21 @@ func refreshAccountsCache(resolved *resolvedEntry) []accountSummary {
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("modelscope-ratelimit: recovered panic in account worker: %v", rec)
+				}
+			}()
 			var s accountSummary
 			if isRefresh {
 				ex, ok := existingByMask[mk]
 				if ok {
 					s = mc.fetchAccountBalanceOnly(i, sid, sbCopy, siteCopy, ex)
 				} else {
-					s = mc.fetchAccountSummary(i, sid, sbCopy, siteCopy)
+					s = mc.fetchLoginInfo(i, sid, sbCopy, siteCopy)
 				}
 			} else {
-				s = mc.fetchAccountSummary(i, sid, sbCopy, siteCopy)
+				s = mc.fetchLoginInfo(i, sid, sbCopy, siteCopy)
 			}
 			mu.Lock()
 			out = append(out, indexedResult{i, s})
@@ -460,6 +497,34 @@ func refreshAccountsCache(resolved *resolvedEntry) []accountSummary {
 	results := make([]accountSummary, len(out))
 	for i, r := range out {
 		results[i] = r.sum
+	}
+
+	// Phase 2 (first load only): ALL accounts have completed login/info (sign-in).
+	// Now fetch balance + rate-limit + transactions concurrently for each account.
+	// This ensures balance reflects the magic cubes activated by the sign-in.
+	if !isRefresh {
+		var wg2 sync.WaitGroup
+		sem2 := make(chan struct{}, 20)
+		for i := range results {
+			if results[i].Schedule == "unauthorized" {
+				continue
+			}
+			sid := resolved.maskToRaw[results[i].MaskedKey]
+			sbCopy := resolved.maskToSite[results[i].MaskedKey]
+			wg2.Add(1)
+			sem2 <- struct{}{}
+			go func(idx int, sessionID, siteBase string) {
+				defer wg2.Done()
+				defer func() { <-sem2 }()
+				defer func() {
+					if rec := recover(); rec != nil {
+						log.Printf("modelscope-ratelimit: recovered panic in balance worker: %v", rec)
+					}
+				}()
+				mc.fetchBalanceData(&results[idx], sessionID, siteBase)
+			}(i, sid, sbCopy)
+		}
+		wg2.Wait()
 	}
  
 	// Enrich phone from detail cache for accounts missing it
@@ -574,11 +639,11 @@ func (c *msClient) fetchAccountDetailConcurrent(idx int, sessionID, siteBase, si
 	d.AliyunNick = bc.YunInfo.NickName
 	for _, t := range tl.SdkTokens {
 		d.Tokens = append(d.Tokens, tokenJSON{
-			ID: t.Id, Name: t.SdkTokenName, Token: t.SdkToken,
+			ID: t.Id, Name: t.SdkTokenName, Token: maskToken(t.SdkToken),
 			Valid: t.Valid == "1", Expires: t.ExpiresAt,
 		})
 	}
-	d.SdkToken = sessionID
+	d.SdkToken = maskToken(sessionID)
 	return d
 }
 
