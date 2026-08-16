@@ -1,11 +1,12 @@
 # 🛡️ modelscope-ratelimit
 
-> CLIProxyAPI 的 Modelscope 限流插件：限额账号智能禁用、分组凭据智能调度、指数退避避流重试。
+> CLIProxyAPI 的 Modelscope 限流插件：限额账号智能禁用、分组凭据智能调度、魔粒余额监控与自动签到。
 
 ![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go&logoColor=white)
 ![CLIProxyAPI](https://img.shields.io/badge/CLIProxyAPI-v7.2.51+-blue)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
 ![Build](https://img.shields.io/badge/build-c--shared-black)
+![Version](https://img.shields.io/badge/version-2.2.1-green)
 
 ## 📖 About
 
@@ -13,23 +14,15 @@ Modelscope 免费额度采用**共享配额**机制——多个 key、多个托�
 
 ### ✨ 核心特性
 
-- 🔴 **限额账号智能禁用**：实时解析响应头剩余次数，单模型耗尽仅禁该模型、总额度耗尽全局禁用该 key，次日 00:00（按配置时区）自动恢复，调度时精准跳过禁用凭据并分发至健康账号。
+- 🔴 **限额账号智能禁用**：无魔粒禁用该 key，次日 00:00（按配置时区）自动恢复，调度时精准跳过禁用凭据并分发至健康账号。
 - 🔁 **分组凭据智能选择**：按 provider 分组，内置 `round-robin`（轮询）/ `fill-first`（填充优先）策略，`providers` 顺序即优先级，前组额度耗尽后才回退后续组。
-- ⏳ **指数退避避流重试**：连续 429（`insufficient_quota`）时全局阻塞，退避按 ×2 递增（10→20→40→60s 封顶）并叠加随机抖动防惊群，成功响应自动重置。
-- 🌐 **代理模式**：配置 `proxy_url` 后，托管 provider 收到 429 时探测代理可达性并经管理 API 开启全局上游代理，成功后自动关闭并还原宿主原代理。
-- 📊 **状态页**：管理端实时展示掩码 key、模型剩余进度条与可用计数，5s 自动刷新；管理密钥仅服务端使用，不渲染进未鉴权页面。
-
-## 🧰 Tech Stack
-
-| 类别 | 技术 / 依赖 |
-| --- | --- |
-| 语言 | Go 1.26（`go.mod` 声明 `go 1.26.0`） |
-| 构建模式 | CGO `c-shared`（导出 C ABI 动态库 `.so` / `.dylib` / `.dll`） |
-| 宿主 SDK | `github.com/router-for-me/CLIProxyAPI/v7 v7.2.51`（`sdk/pluginabi` 方法常量路由） |
-| 依赖库 | `gopkg.in/yaml.v3 v3.0.1`（配置解析） |
-| 核心层约束 | `internal/ratelimit/` 纯标准库，不引入宿主 SDK / cgo，可独立 `go test -race` |
-| 管理调用 | 插件自带 `net/http` 直连宿主管理 API（不经 cgo 回调） |
-| 文档站 | VitePress（仓库根 `docs/` 提供插件开发规范） |
+- ⚡ **skip_provider_on_429 兜底**：开启后，一旦 429 立马使用非 Modelscope 模型重试，避免因限流等待时间过久，推荐打开：
+  ```text
+  关闭：modelscope 429 → modelscope 429 → modelscope 200
+  打开：modelscope 429 → glm 200
+  ```
+- 🎲 **自动签到与魔粒监控**：每日 00:00 自动调用 `/api/v1/users/login/info` 完成签到领取魔粒，定时拉取 `/openapi/v1/magicubes/balance` 与消费流水，状态页实时展示魔粒余额与今日消耗。
+- 📊 **状态页**：管理中心实时展示掩码 key、魔粒余额、今日消耗与可用计数，5s 自动刷新；管理密钥仅服务端使用，不渲染进未鉴权页面。
 
 ## 🚀 Getting Started
 
@@ -37,37 +30,65 @@ Modelscope 免费额度采用**共享配额**机制——多个 key、多个托�
 
 - **Go ≥ 1.26**：`go.mod` 声明 `go 1.26.0`，首次构建需 `GOTOOLCHAIN=auto` 自动拉取工具链。
 - **CGO 环境**：`build.sh` 默认 `CGO_ENABLED=1`，需本机 C 编译器（gcc/clang）。
-- **交叉编译 Windows**：需 [zig](https://ziglang.org/) 0.13+ 作为 C 交叉编译器。
+- **交叉编译**：需 [zig](https://ziglang.org/) 0.13+ 作为 C 交叉编译器（Windows、Linux ARM64）。
 - **CLIProxyAPI v7.2.51+**：插件经稳定 C ABI 由宿主加载，产物须与宿主进程同架构。
 - **国内网络**：`GOPROXY=https://goproxy.cn,direct`（`build.sh` 已内置默认值）。
 
-### 安装与配置
+### 安装方式
+
+#### 方式一：从源码编译安装
 
 ```bash
-git clone <仓库地址>
+git clone https://github.com/bytehola/modelscope-ratelimit.git
 cd modelscope-ratelimit
 
 bash build.sh             # 编译当前平台原生动态库 (.so/.dylib/.dll)
-bash build.sh windows     # 交叉编译 Windows/amd64 .dll（需 zig）
+bash build.sh windows      # 交叉编译 Windows/amd64 .dll（需 zig 0.13+）
+bash build.sh linux-arm64  # 交叉编译 Linux/arm64 .so（需 zig 0.13+）
 bash build.sh all         # 原生 + Windows 均编译
 bash build.sh test        # 核心状态机单测（含 -race）
-bash build.sh vet         # go vet ./...
+bash build.sh vet         # go vet
 ```
 
-> ⚠️ 产物文件名必须为 `modelscope-ratelimit.so` / `.dll`，需与配置中的插件 ID `modelscope-ratelimit` 对应，否则宿主无法加载。
+> ⚠️ 产物文件名必须为 `modelscope-ratelimit.so` / `.dll` / `.dylib`，与配置中的插件 ID `modelscope-ratelimit` 对应，否则宿主无法加载。
+
+将编译产物放入宿主 `plugins/<GOOS>/<GOARCH>/` 目录，在 `config.yaml` 中启用插件（见下方配置）。
+
+#### 方式二：从 GitHub Releases 下载预编译产物安装
+
+前往 [Releases](https://github.com/bytehola/modelscope-ratelimit/releases) 页面，下载对应平台的 `.zip` 包（如 `modelscope-ratelimit-windows-amd64.zip`），解压后得到 `modelscope-ratelimit.dll`（或 `.so` / `.dylib`），放入宿主 `plugins/<GOOS>/<GOARCH>/` 目录，在 `config.yaml` 中启用插件（见下方配置）。
+
+#### 方式三：通过管理中心插件商店安装
+
+在宿主 `config.yaml` 的 `plugins` 段添加 `store-sources`，指向本插件的 `registry.json`：
+
+```yaml
+plugins:
+  enabled: true
+  store-sources:
+    - "https://raw.githubusercontent.com/bytehola/modelscope-ratelimit/main/registry.json"
+```
+
+内置官方商店始终包含，`store-sources` 是追加自定义源。配置后在管理中心 → 插件商店即可搜索并安装本插件，宿主会自动根据运行平台下载对应架构的产物。
+
+### 配置
 
 将 Modelscope 配置为 `openai-compatibility` 多 key provider，并在 CLIProxyAPI 的 `config.yaml` 中启用插件：
 
 ```yaml
 openai-compatibility:
   - name: "modelscope"
+    disabled: false
     base-url: "https://api-inference.modelscope.cn/v1"
     api-key-entries:
       - api-key: "ms-key-AAAAAAAAAAAA"
       - api-key: "ms-key-BBBBBBBBBBBB"
+      - api-key: "ms-key-CCCCCCCCCCCC"
     models:
       - name: "Qwen/Qwen2.5-72B-Instruct"
         alias: "Qwen-72B"
+      - name: "Qwen/Qwen2.5-7B-Instruct"
+        alias: "Qwen-7B"
 
 plugins:
   enabled: true
@@ -76,66 +97,64 @@ plugins:
     modelscope-ratelimit:
       enabled: true
       priority: 10
-      providers: ["modelscope"]              # 监控的供应商名称，必填，顺序=优先级
-      host_base_url: "http://127.0.0.1:8317" # CPA 管理 API 地址（选填）
-      management_key: "your-management-secret" # CPA 管理密钥（必填，仅服务端使用）
-      credential_strategy: "round-robin"     # round-robin | fill-first
-      insufficient_quota_cooldown: 10         # 退避基准秒数，封顶 60s
-      timezone: "Asia/Shanghai"              # 每日 00:00 重置时区
-      disable_threshold: 0                   # 剩余次数 ≤ 此值即当日禁用，默认 0（耗尽）
-      # proxy_url: "socks5://user:pass@127.0.0.1:1080"  # 429 时自动代理（选填）
-      # managed_models: ["Qwen-72B"]          # 仅监控这些别名模型，留空=全部
-      # skip_provider_on_429: false           # 429 时一次性跳至非托管 provider
+
+      # ---- 必填 ----
+      providers: ["modelscope"]
+      skip_provider_on_429: false # 推荐打开：429 时使用别的模型兜底
+      host_base_url: "http://127.0.0.1:8317"
+      management_key: "your-management-secret"
+
+      # ---- 凭据与退避策略 ----
+      credential_strategy: "round-robin"  # round-robin | fill-first
+      insufficient_quota_cooldown: 0.1
+
+      # proxy_url: "socks5://user:pass@127.0.0.1:1080"
+      timezone: "Asia/Shanghai"
+      # ms_proxy_url: "http://127.0.0.1:8888"  # 调试用
 ```
+
+完整字段说明见 `config.example.yaml`。
 
 ## 📦 Usage
 
-插件入口为 [cmd/plugin/main.go](cmd/plugin/main.go)，导出 `cliproxyPluginCall` / `cliproxyPluginFree` / `cliproxyPluginShutdown` 三个 C ABI 函数，由宿主按声明的能力调用对应方法。注册时声明 `scheduler`、`response_interceptor`、`response_stream_interceptor`、`usage_plugin`、`management_api` 五项能力。
+插件以动态库形式被宿主自动加载，无需独立启动。宿主启动 10 秒后自动拉取全部账号的签到信息与魔粒余额，管理页面即时可用。
 
-不经脚本直接单测核心状态机：
-
-```bash
-GOTOOLCHAIN=auto go test -race -count=1 ./internal/ratelimit/
-```
-
-请求处理链路：
+管理中心 → **Modelscope 限流** 页面提供以下 API 端点：
 
 ```text
-请求 → scheduler.pick（跳过禁用 key/model，按优先级选健康凭据）
-     → 上游请求
-     → response / stream 拦截
-        ├─ 有限流头 → 解析剩余次数，耗尽则禁用
-        └─ 429 insufficient_quota → 全局阻塞退避（×2 递增，封顶 60s）
-     → 00:00 自动重置禁用状态
+?api=accounts         — 全部账号概览（掩码 key、余额、今日消耗、调度状态）
+?api=account&key=xxx  — 单账号详情（绑定信息、SDK Token 列表）
+?api=transactions&key=xxx — 魔粒消费流水
+?api=checkin-all      — 一键全部签到
+?api=refresh-balance&key=xxx — 刷新单个账号余额与今日消耗
 ```
 
-- **优先级**：`providers` 顺序即优先级，前组额度耗尽后才用后续组。
-- **作用域**：单模型耗尽只禁该模型，总额度耗尽全局禁用，非托管 provider 不受影响。
-- **退避**：同 provider 共享配额，冷却无关 key，全局递增避免二次限流。
-
-## 🗂️ Project Structure
+## 📁 Project Structure
 
 ```text
 modelscope-ratelimit/
-├── cmd/plugin/                    # C-ABI 胶水层：方法分发、配置解析、panic 恢复、管理 API 调用与状态页渲染
-│   ├── main.go                    # 唯一导出入口，映射插件方法到核心层 helper
-│   └── stableid_test.go           # 稳定 ID 单测
-├── internal/ratelimit/            # 限流状态机核心（纯标准库，可独立 -race 单测）
-│   ├── apply.go                   # 限流头解析 + 冷却钩子
-│   ├── config.go                  # 配置结构 + ManagesProvider 匹配
-│   ├── doc.go                     # 包文档与业务规则说明
-│   ├── proxy.go                   # 代理模式：探测、开关、还原宿主代理
-│   ├── scheduler.go               # 全局阻塞 + 优先级调度
-│   ├── state.go                   # 并发状态：禁用 / 冷却 / 退避 / 快照
-│   ├── status_html.go             # 状态页 HTML 渲染
-│   ├── types.go                   # JSON 线格式（镜像文档载荷）
-│   └── *_test.go                  # 核心层单测（含 -race）
-├── build.sh                       # 编译 / 测试 / vet 脚本
-├── config.example.yaml            # 配置示例
-├── go.mod / go.sum                # 模块声明与依赖校验
-└── LICENSE                        # MIT 许可证
+├── cmd/plugin/                  # 胶水层：C-ABI 导出、方法路由、配置解析、状态页渲染
+│   ├── main.go                  #   插件注册、导出函数、管理 API 路由
+│   ├── msclient.go              #   Modelscope HTTP 客户端、账号数据抓取与缓存
+│   └── status_page.html         #   管理中心状态页前端（嵌入式 HTML）
+├── internal/ratelimit/          # 核心层：纯标准库限流状态机（不引入 SDK / cgo）
+│   ├── state.go                 #   限流状态存储、每日重置、魔粒记录、签到记录
+│   ├── scheduler.go             #   scheduler.pick 实现：凭据选择与 provider 优先级
+│   ├── apply.go                 #   响应处理：429 检测、余额不足判定
+│   ├── config.go                #   配置结构与解析
+│   ├── proxy.go                 #   代理模式：探测与开关
+│   ├── api.go                   #   API 响应结构体与注入闭包类型
+│   ├── types.go                 #   插件方法请求/响应载荷镜像类型
+│   └── status_html.go           #   状态页 HTML 生成
+├── demo/                        # 独立演示程序（模拟宿主调用链路）
+├── build.sh                     # 编译脚本（原生 / Windows / Linux ARM64 / 全平台 release）
+├── config.example.yaml          # 配置示例
+├── registry.json                # 插件商店清单（direct 安装，schema_version 2）
+├── go.mod / go.sum              # Go 模块定义
+├── LICENSE                      # MIT 协议
+└── README.md
 ```
 
 ## 📄 License
 
-本项目采用 [MIT](LICENSE) 协议开源，版权归 © 2026 bytehola 所有。
+本项目采用 MIT 协议开源，版权归 bytehola 所有。

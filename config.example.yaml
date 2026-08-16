@@ -23,6 +23,11 @@ openai-compatibility:
 plugins:
   enabled: true
   dir: "plugins"
+  # 插件商店安装方式（管理中心 → 插件商店）：
+  # 在此处添加 store-sources 指向本插件的 registry.json，
+  # 配置后在管理中心 → 插件商店即可搜索并安装本插件。
+  # store-sources:
+  #   - "https://raw.githubusercontent.com/bytehola/modelscope-ratelimit/main/registry.json"
   configs:
     modelscope-ratelimit:
       enabled: true

@@ -3,9 +3,13 @@
 # modelscope-ratelimit 编译脚本
 #
 # 用法:
-#   ./build.sh              # 编译当前平台原生动态库 (Linux->.so / macOS->.dylib / Windows->.dll)
-#   ./build.sh windows      # 交叉编译 Windows/amd64 .dll (需 zig 作为 C 交叉编译器)
+#   ./build.sh              # 编译当前平台原生动态库 (Linux->.so / macOS->.dylib)
+#   ./build.sh windows      # 交叉编译 Windows/amd64 .dll (需 zig 0.13+)
+#   ./build.sh linux-arm64  # 交叉编译 Linux/arm64 .so (需 zig 0.13+)
+#   ./build.sh darwin-amd64 # 交叉编译 macOS/amd64 .dylib (需 zig 0.13+)
+#   ./build.sh darwin-arm64 # 交叉编译 macOS/arm64 .dylib (需 zig 0.13+)
 #   ./build.sh all          # 原生 + Windows 都编译
+#   ./build.sh release      # 全部 5 平台编译 + 打包 .zip + 计算 SHA256
 #   ./build.sh vet          # 仅 go vet ./...
 #   ./build.sh test         # 仅核心状态机单测 (含 -race)
 #
@@ -32,8 +36,19 @@ export PATH GOCACHE GOPATH GOPROXY GOFLAGS CGO_ENABLED GOTOOLCHAIN
 PKG="./cmd/plugin"
 OUT_DIR="$SCRIPT_DIR/cmd/plugin"
 NAME="modelscope-ratelimit"
+RELEASE_DIR="$SCRIPT_DIR/release"
 
 log() { printf '>> %s\n' "$*"; }
+
+# mkzip <zip_path> <file_to_add> — 用 Python zipfile 打包 (兼容无 zip 命令的环境)
+mkzip() {
+  python3 -c "
+import zipfile, sys
+z, f = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(z, 'w', zipfile.ZIP_DEFLATED) as zf:
+    zf.write(f, arcname=__import__('os').path.basename(f))
+" "$1" "$2"
+}
 
 update_build_time() {
   local html="$SCRIPT_DIR/cmd/plugin/status_page.html"
@@ -45,14 +60,14 @@ update_build_time() {
 }
 
 build_native() {
-  local ext
+  local ext out
   case "$(go env GOOS)" in
     linux)   ext="so"    ;;
     windows) ext="dll"   ;;
     darwin)  ext="dylib" ;;
     *)       ext="so"    ;;
   esac
-  local out="$OUT_DIR/$NAME.$ext"
+  out="${BUILD_OUT:-$OUT_DIR/$NAME.$ext}"
   log "编译原生动态库 ($(go env GOOS)/$(go env GOARCH)) -> $out"
   update_build_time
   go build -buildmode=c-shared -trimpath -o "$out" "$PKG"
@@ -69,7 +84,7 @@ resolve_zig() {
 }
 
 build_windows() {
-  local zig out="$OUT_DIR/$NAME.dll"
+  local zig out="${BUILD_OUT:-$OUT_DIR/$NAME.dll}"
   zig="$(resolve_zig)" || {
     printf '错误: 未找到 zig C 交叉编译器。请安装 zig (0.13+), 或设置 ZIG=/path/to/zig\n' >&2
     printf '       查找顺序: $ZIG -> PATH(zig) -> /opt/zig/zig -> /tmp/zig/zig\n' >&2
@@ -83,6 +98,42 @@ build_windows() {
   log "完成: $out"
 }
 
+# 通用 zig 交叉编译: 参数 GOOS, GOARCH, zig-target, ext
+build_cross() {
+  local goos="$1" goarch="$2" zig_target="$3" ext="$4"
+  local zig out="${BUILD_OUT:-$OUT_DIR/$NAME.$ext}"
+  zig="$(resolve_zig)" || {
+    printf '错误: 未找到 zig C 交叉编译器。请安装 zig (0.13+), 或设置 ZIG=/path/to/zig\n' >&2
+    exit 1
+  }
+  log "交叉编译 $goos/$goarch (zig=$zig) -> $out"
+  update_build_time
+  GOOS="$goos" GOARCH="$goarch" \
+    CC="$zig cc -target $zig_target" \
+    go build -buildmode=c-shared -trimpath -o "$out" "$PKG" || return 1
+  log "完成: $out"
+}
+
+build_linux_arm64()  { build_cross linux arm64 aarch64-linux-gnu so; }
+build_darwin_amd64() { build_cross darwin amd64 x86_64-macos dylib; }
+build_darwin_arm64() { build_cross darwin arm64 aarch64-macos dylib; }
+
+# build_and_package: 编译单个平台并立即打包 (避免 .so 产物互相覆盖)
+build_and_package() {
+  local goos="$1" goarch="$2" zig_target="$3" ext="$4"
+  local lib_name="$NAME.$ext"
+  local zip_name="$NAME-$goos-$goarch.zip"
+  local out="$OUT_DIR/$lib_name"
+  # 编译到固定名, 打包后删除, 避免文件名冲突
+  # 失败时返回非零, 调用方用 || 容错跳过
+  BUILD_OUT="$out" \
+    build_cross "$goos" "$goarch" "$zig_target" "$ext" || return 1
+  (cd "$OUT_DIR" && mkzip "$RELEASE_DIR/$zip_name" "$lib_name")
+  rm -f "$out"
+  printf '  %s  sha256: %s\n' "$zip_name" "$(sha256sum "$RELEASE_DIR/$zip_name" | awk '{print $1}')"
+}
+
+
 run_vet()  { log "go vet ./..."; go vet ./...; }
 run_test() { log "go test -race ./internal/ratelimit/"; go test -race -timeout 120s ./internal/ratelimit/; }
 
@@ -90,8 +141,31 @@ target="${1:-native}"
 case "$target" in
   native|"") build_native ;;
   windows|win) build_windows ;;
+  linux-arm64) build_linux_arm64 ;;
+  darwin-amd64) build_darwin_amd64 ;;
+  darwin-arm64) build_darwin_arm64 ;;
   all) build_native; build_windows ;;
+  release)
+    rm -rf "$RELEASE_DIR"
+    mkdir -p "$RELEASE_DIR"
+    update_build_time
+    echo ""
+    log "========== 编译 + 打包 release =========="
+    # linux/amd64 (原生编译)
+    BUILD_OUT="$OUT_DIR/$NAME.so" build_native
+    (cd "$OUT_DIR" && mkzip "$RELEASE_DIR/$NAME-linux-amd64.zip" "$NAME.so")
+    rm -f "$OUT_DIR/$NAME.so"
+    printf '  %s  sha256: %s\n' "$NAME-linux-amd64.zip" "$(sha256sum "$RELEASE_DIR/$NAME-linux-amd64.zip" | awk '{print $1}')"
+    # 交叉编译平台
+    build_and_package windows  amd64 x86_64-windows-gnu dll || log "跳过 windows/amd64"
+    build_and_package linux    arm64 aarch64-linux-gnu  so  || log "跳过 linux/arm64"
+    build_and_package darwin   amd64 x86_64-macos       dylib || log "跳过 darwin/amd64 (需 macOS SDK)"
+    build_and_package darwin   arm64 aarch64-macos      dylib || log "跳过 darwin/arm64 (需 macOS SDK)"
+    echo ""
+    log "所有 release 产物: $RELEASE_DIR/"
+    ls -la "$RELEASE_DIR/"
+    ;;
   vet)  run_vet ;;
   test) run_test ;;
-  *) printf '用法: %s [native|windows|all|vet|test]\n' "$0" >&2; exit 2 ;;
+  *) printf '用法: %s [native|windows|linux-arm64|darwin-amd64|darwin-arm64|all|release|vet|test]\n' "$0" >&2; exit 2 ;;
 esac
