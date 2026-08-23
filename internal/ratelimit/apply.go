@@ -21,7 +21,7 @@ func (s *Store) ApplyRateLimit(authID, model string, headers map[string][]string
 	// the balance is topped up). Checked before rate-limit headers because
 	// insufficient balance responses may not carry rate-limit headers. Not
 	// gated by skip_provider_on_429: balance exhaustion is not a
-	// recoverable rate window, so the skip/proxy logic must not bypass the
+	// recoverable rate window, so the skip logic must not bypass the
 	// daily disable.
 	if IsInsufficientBalance(statusCode, body) {
 		s.recordSeen([]string{authID})
@@ -78,13 +78,6 @@ func (s *Store) ApplyInsufficientQuotaCooldown(authID, model string, statusCode 
 func (s *Store) OnResponse(req ResponseInterceptRequest) ResponseInterceptResponse {
 	authID := AuthIDFromMetadata(req.Metadata)
 	s.ApplyRateLimit(authID, req.Model, req.ResponseHeaders, req.StatusCode, req.Body, s.now())
-	// Skip insufficient_quota cooldown when proxy mode is active (proxy_url
-	// configured and probe not failed) — the proxy trigger handles 429s
-	// instead, and a cooldown here would conflict with the 2s proxy wait.
-	cfg := s.config()
-	if !(cfg.ProxyURL != "" && !s.IsProxyProbeFailed()) && !cfg.SkipProviderOn429 {
-		s.ApplyInsufficientQuotaCooldown(authID, req.Model, req.StatusCode, req.Body, s.now())
-	}
 	return ResponseInterceptResponse{}
 }
 
@@ -99,9 +92,6 @@ func (s *Store) OnStreamChunk(req StreamChunkInterceptRequest) StreamChunkInterc
 	return StreamChunkInterceptResponse{}
 }
 
-// OnUsage handles usage.handle. UsageRecord carries AuthID, Model and the
-// response headers together, so this is the authoritative correlation path
-// (covering both streaming and non-streaming responses).
 // OnUsage handles usage.handle. UsageRecord carries AuthID, Model and the
 // response headers together, so this is the authoritative correlation path
 // (covering both streaming and non-streaming responses).
@@ -128,9 +118,9 @@ func (s *Store) OnUsage(rec UsageRecord) {
 		model = rec.Model
 	}
 	now := s.now()
-	// Extract status/body for ApplyRateLimit's skip_provider_on_429 gate:
-	// only insufficient_quota 429s skip the daily disable; other 429s
-	// (exceeded-today, limit_burst_rate) still get daily-disabled.
+	// Extract status/body so ApplyRateLimit can detect "insufficient
+	// balance" (magic-cube exhaustion) and globally disable the key for
+	// the rest of the day.
 	var statusCode int
 	var body string
 	if rec.Failed && rec.Failure != nil {
@@ -152,16 +142,17 @@ func (s *Store) OnUsage(rec UsageRecord) {
 		s.resetCooldownBackoff()
 		s.recordSuccess(rec.AuthID)
 		s.recordModelUsage(s.displayName(model))
-		// Disable the global proxy if it was active — a managed provider
-		// succeeded, so the proxy is no longer needed.
-		s.HandleProxyOnSuccess()
 	}
 	// Clear the per-provider skip set on ANY 200 (managed or non-managed) so
 	// the next request probes the free managed quota again. This is the
 	// "prioritise free quota" strategy: every new request tries managed first,
 	// and only on a 429+insufficient_quota does it skip to non-managed.
+	// Also reset the within-request cross-provider cursor so the next request
+	// always starts from the first managed provider; only per-provider key
+	// cursors keep rotating across requests.
 	if !rec.Failed {
 		s.ClearAllSkippedProviders()
+		s.resetManagedProviderCursor()
 	}
 
 	// 429 responses take the executor's error path (the host returns early and
@@ -170,8 +161,8 @@ func (s *Store) OnUsage(rec UsageRecord) {
 	// host's usage manager dispatches each record to all plugins
 	// unconditionally), so a non-managed fallback provider (e.g. Aliyun Model
 	// Studio) that also returns 429+insufficient_quota must NOT receive a
-	// cooldown or trigger proxy mode. Guard with ManagesProvider so only
-	// monitored providers are affected.
+	// cooldown. Guard with ManagesProvider so only monitored providers
+	// are affected.
 	if rec.Failed && rec.Failure != nil {
 		if cfg.ManagesProvider(rec.Provider) {
 			// Record 429 from managed providers (daily counter for status page).
@@ -195,32 +186,25 @@ func (s *Store) OnUsage(rec UsageRecord) {
 			// when all managed candidates are tried. Other 429 types
 			// (exceeded-today, limit_burst_rate) fall through to normal
 			// daily-disable + cooldown handling.
-			// When proxy_url is also configured, the skip and proxy modes
-			// complement each other: skip provides immediate relief (go to
-			// other providers), proxy provides different-IP retry when the
-			// skip is cleared (any 200). Both are armed on the same 429 —
-			// fall through to the proxy trigger below instead of returning.
 			if cfg.SkipProviderOn429 && isInsufficientQuota(rec.Failure.StatusCode, rec.Failure.Body) {
 				s.recordSeen([]string{rec.AuthID})
 				providerName := extractProviderName(rec.Provider)
 				s.SetSkipProvider(providerName)
 				s.log.Printf("modelscope-ratelimit: managed 429, skip provider %s model=%s", providerName, s.displayName(model))
-				// Fall through: also arm proxy trigger if configured.
-			}
-			// Proxy mode: on 429+insufficient_quota from a managed provider.
-			// When proxy_url is configured and the probe has NOT already
-			// failed, set a trigger flag for SchedulerPick to consume (2s
-			// wait + probe + enable). When the probe already failed once,
-			// fall back to the insufficient_quota_cooldown mechanism.
-			if isInsufficientQuota(rec.Failure.StatusCode, rec.Failure.Body) && cfg.ProxyURL != "" && !s.IsProxyProbeFailed() {
-				s.SetProxyTrigger(rec.AuthID, model)
-				return
 			}
 			// Cooldown fallback: only when skip mode is off (skip mode
 			// handles 429s via the skip set, not cooldowns). The cooldown
 			// block in SchedulerPick is also bypassed when skip mode is on.
 			if !cfg.SkipProviderOn429 {
 				s.ApplyInsufficientQuotaCooldown(rec.AuthID, model, rec.Failure.StatusCode, rec.Failure.Body, now)
+				// Advance the within-request cross-provider cursor so the
+				// host's retry picks the next provider within the same
+				// request. Any 200 resets the cursor (above) so the next
+				// request starts from the first provider; per-provider key
+				// cursors keep rotating across requests.
+				if isInsufficientQuota(rec.Failure.StatusCode, rec.Failure.Body) {
+					s.advanceManagedProvider()
+				}
 			}
 		}
 	}

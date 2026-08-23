@@ -9,6 +9,7 @@ import (
 // formats are supported:
 //   - /api/v1/*     → {"Code":200,"Data":{...},"Success":true}  (CamelCase)
 //   - /openapi/v1/* → {"success":true,"data":{...}}             (snake_case)
+//
 // The Data field holds the inner payload as raw JSON for the caller to
 // unmarshal into the appropriate struct.
 type APIResponse struct {
@@ -88,7 +89,7 @@ type TransactionRecord struct {
 	Title         string `json:"title"`
 	Description   string `json:"description"`
 	Category      string `json:"category"`
-	ModelTier     string `json:"model_tier"`     // SPEND_CONFIRM only
+	ModelTier     string `json:"model_tier"` // SPEND_CONFIRM only
 	TotalAmount   int    `json:"total_amount"`
 	Count         int    `json:"count"`
 	ExpireDays    int    `json:"expire_days"`    // EARN only
@@ -98,9 +99,9 @@ type TransactionRecord struct {
 
 // TransactionsResp mirrors GET /openapi/v1/magicubes/transactions -> data.
 type TransactionsResp struct {
-	Page     int                  `json:"page"`
-	PageSize int                  `json:"page_size"`
-	Total    int                  `json:"total"`
+	Page     int                 `json:"page"`
+	PageSize int                 `json:"page_size"`
+	Total    int                 `json:"total"`
 	Records  []TransactionRecord `json:"records"`
 }
 
@@ -169,6 +170,9 @@ type MidnightSignInFunc func()
 
 // ---- Store setter methods for injected closures ----
 
+// SetLoginInfoFetcher injects a function that reads the user profile
+// (name, email, Havana ID, etc.) for a session ID. Used by the midnight
+// sign-in to populate account summary state.
 func (s *Store) SetLoginInfoFetcher(f LoginInfoFetcher) {
 	if f == nil {
 		s.loginInfoFetcher.Store(nil)
@@ -177,6 +181,9 @@ func (s *Store) SetLoginInfoFetcher(f LoginInfoFetcher) {
 	s.loginInfoFetcher.Store(&f)
 }
 
+// SetBalanceFetcher injects a function that reads the current magic-cube balance
+// for a session ID (m_session_id). Used by the midnight sign-in to update
+// core state with available/total/frozen balance.
 func (s *Store) SetBalanceFetcher(f BalanceFetcher) {
 	if f == nil {
 		s.balanceFetcher.Store(nil)
@@ -185,6 +192,8 @@ func (s *Store) SetBalanceFetcher(f BalanceFetcher) {
 	s.balanceFetcher.Store(&f)
 }
 
+// SetRateLimitFetcher injects a function that reads the daily usage counter
+// for a session ID. Used by the midnight sign-in to update usage-per-day state.
 func (s *Store) SetRateLimitFetcher(f RateLimitFetcher) {
 	if f == nil {
 		s.rateLimitFetcher.Store(nil)
@@ -193,6 +202,9 @@ func (s *Store) SetRateLimitFetcher(f RateLimitFetcher) {
 	s.rateLimitFetcher.Store(&f)
 }
 
+// SetMidnightSignInFunc injects the daily boundary callback invoked by
+// PruneAll when the calendar day changes. The glue implementation signs in
+// every account and refreshes balance + usage.
 func (s *Store) SetMidnightSignInFunc(f MidnightSignInFunc) {
 	if f == nil {
 		s.midnightSignInFunc.Store(nil)

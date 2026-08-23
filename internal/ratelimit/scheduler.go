@@ -20,12 +20,16 @@ var ErrAllCredentialsDisabled = errors.New("all credentials disabled for model (
 // Provider is empty while each Candidate.Provider carries the real runtime
 // key (e.g. "openai-compatible-modelscope").
 //
-// Provider preference: among managed providers, the plugin respects the order
-// of the Providers config field — the first-listed provider is always picked
-// before the second, and so on. Only when every key from an earlier provider is
-// disabled (daily rate-limit exhausted) does the plugin fall through to the
-// next provider. This lets an operator express "use moda first, then
-// modelscope" purely by listing them in that order.
+// Provider rotation: when skip_provider_on_429 is OFF, managed providers are
+// selected by a within-request cross-provider cursor in Providers config
+// order. Each 429+insufficient_quota advances that cursor so the host's retry
+// picks the next provider within the same request, and the selected
+// provider's key cursor advances. Any 200 resets the cross-provider cursor
+// to 0, so the next request always starts from the first provider; only
+// per-provider key cursors keep rotating across requests. When
+// skip_provider_on_429 is ON, the provider skip set removes recently-429'd
+// providers and the plugin falls back to non-managed providers until the
+// next 200.
 //
 // Fallback to non-managed providers: when every managed candidate for the
 // model is disabled, the plugin must NOT hard-block the request if
@@ -59,22 +63,6 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 		}
 	}
 
-	// Proxy cleanup: when no managed candidates remain (all tried or
-	// unavailable), the request is falling through to non-managed providers.
-	// Disable the global proxy so non-managed traffic goes direct.
-	if !hasManaged {
-		s.DisableProxyIfActive()
-	}
-
-	// Proxy mode: when proxy_url is configured and a 429 trigger is pending
-	// (set by OnUsage), block here for 2s + probe + enable. This is in the
-	// synchronous retry loop (unlike OnUsage which is async), so the 2s wait
-	// actually delays the next credential pick. When proxy_url is configured,
-	// the insufficient_quota_cooldown mechanism is skipped entirely.
-	if hasManaged && cfg.ProxyURL != "" {
-		s.ConsumeProxyTrigger(s.displayName(req.Model), now)
-	}
-
 	// Global insufficient-quota blocking: Modelscope shares a quota across all
 	// keys and across managed providers (e.g. moda + modelscope), so a cooldown
 	// on ANY managed key blocks ALL managed scheduling. This prevents
@@ -82,15 +70,13 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 	// cooldown has expired and keys are available again. Only applied when
 	// there are managed candidates to retry (hasManaged); a request that has
 	// already exhausted every managed key and is falling through to a
-	// non-managed provider is never blocked. Runs in proxy mode too: a 429
-	// while the proxy is already active escalates the shared backoff
-	// (the first proxy-enable 429 sets no cooldown, so this is a no-op then).
+	// non-managed provider is never blocked.
 	// skip_provider_on_429 mode bypasses the cooldown block entirely: it uses a
 	// one-shot flag (not per-key cooldowns), so leftover cooldowns from before
 	// the mode was enabled must not block the skip check (which runs after this
 	// block). Blocking here creates a window where the flag is consumed/cleared
 	// by a concurrent pick or a managed 200, so the skip never fires.
-	if hasManaged && cfg.InsufficientQuotaCooldown > 0 && !cfg.SkipProviderOn429 && (cfg.ProxyURL == "" || s.IsProxyProbeFailed() || s.IsProxyActive()) {
+	if hasManaged && cfg.InsufficientQuotaCooldown > 0 && !cfg.SkipProviderOn429 {
 		if wait := s.cooldownWaitDuration(now); wait > 0 {
 			// Record the max cooldown expiry before sleeping. After the sleep,
 			// a concurrent request may have set a NEW (longer) cooldown on a
@@ -203,14 +189,22 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 		return SchedulerPickResponse{}, fmt.Errorf("%w: model=%q", ErrAllCredentialsDisabled, s.displayName(req.Model))
 	}
 
-	// Pick from the first provider (in cfg.Providers order) that has available
-	// candidates. This implements strict preference by config order: the
-	// first-listed provider is always used before the second, and so on.
-	// Within the chosen provider, pickManaged indexes the round-robin cursor
-	// into the full config-ordered key list (including disabled/tried keys),
-	// so 429 retries and disabled keys don't corrupt the rotation order.
 	var picked Candidate
-	for i := 0; i < len(cfg.Providers); i++ {
+	// Provider rotation:
+	//   - skip_provider_on_429 OFF: start from the within-request cross-
+	//     provider cursor (advanced by OnUsage on each insufficient_quota
+	//     429, reset to 0 on any 200). Within the chosen provider,
+	//     pickManaged indexes the per-provider key cursor, which keeps
+	//     rotating across requests.
+	//   - skip_provider_on_429 ON: strict config order (first provider with
+	//     available candidates). The per-provider skip set already filters
+	//     providers that recently 429'd.
+	start := 0
+	if !cfg.SkipProviderOn429 {
+		start = s.managedProviderStart(len(cfg.Providers))
+	}
+	for step := 0; step < len(cfg.Providers); step++ {
+		i := (start + step) % len(cfg.Providers)
 		if candidates, ok := availableByProvider[i]; ok && len(candidates) > 0 {
 			picked, _ = s.pickManaged(candidates, cfg.Providers[i])
 			break

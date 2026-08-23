@@ -84,3 +84,66 @@ func TestMaskKeyShowsLast12NoEllipsis(t *testing.T) {
 		t.Fatalf("maskKey short = %q, want full", got)
 	}
 }
+
+// TestBuildDedupMaps verifies that duplicate raw keys across different
+// providers are deduplicated for account-level API calls while the full
+// raw-to-auth-ID grouping is preserved for disable propagation.
+func TestBuildDedupMaps(t *testing.T) {
+	raw := map[string]string{
+		"openai-compatibility:modelscope:aaaabbbbcccc":  "ms-key-dup-1",
+		"openai-compatibility:modelscope2:aaaabbbbcccc": "ms-key-dup-1",
+		"openai-compatibility:modelscope:dddd11112222":  "ms-key-other-1",
+	}
+	siteBase := map[string]string{
+		"openai-compatibility:modelscope:aaaabbbbcccc":  "https://modelscope.cn",
+		"openai-compatibility:modelscope2:aaaabbbbcccc": "https://www.modelscope.ai",
+		"openai-compatibility:modelscope:dddd11112222":  "https://modelscope.cn",
+	}
+	ordered := []string{
+		"openai-compatibility:modelscope:aaaabbbbcccc",
+		"openai-compatibility:modelscope2:aaaabbbbcccc",
+		"openai-compatibility:modelscope:dddd11112222",
+	}
+
+	dedup, groups, _, maskToSite := buildDedupMaps(ordered, raw, siteBase)
+
+	if len(dedup) != 2 {
+		t.Fatalf("dedup count = %d, want 2 (duplicate key collapsed)", len(dedup))
+	}
+	if dedup[0] != ordered[0] || dedup[1] != ordered[2] {
+		t.Fatalf("dedup order = %v, want first occurrence of each raw key", dedup)
+	}
+
+	siblings := groups["ms-key-dup-1"]
+	if len(siblings) != 2 {
+		t.Fatalf("sibling count = %d, want 2", len(siblings))
+	}
+	if siblings[0] != ordered[0] || siblings[1] != ordered[1] {
+		t.Fatalf("sibling order = %v, want config order", siblings)
+	}
+
+	if got := maskToSite[maskKey("ms-key-dup-1")]; got != "https://modelscope.cn" {
+		t.Fatalf("maskToSite = %q, want the first provider's site", got)
+	}
+}
+
+// TestStableIDGenSameKeyDifferentProviders verifies the same raw key does not
+// collapse across providers: each provider gets a distinct auth ID, because
+// the provider name participates in the digest.
+func TestStableIDGenSameKeyDifferentProviders(t *testing.T) {
+	g := newStableIDGen()
+	key := "ms-key-same-account"
+
+	idA := g.Next("openai-compatibility:modelscope", key, "https://modelscope.cn", "")
+	idB := g.Next("openai-compatibility:modelscope2", key, "https://modelscope.cn", "")
+
+	if idA == idB {
+		t.Fatalf("same key across providers must produce different auth IDs: %s", idA)
+	}
+
+	// Same provider, same key, same base, same proxy must collide and get -1.
+	idC := g.Next("openai-compatibility:modelscope", key, "https://modelscope.cn", "")
+	if collisionSuffix(idC) != "-1" {
+		t.Fatalf("same-input collision suffix = %q, want %q", collisionSuffix(idC), "-1")
+	}
+}

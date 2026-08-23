@@ -1,7 +1,6 @@
 package ratelimit
 
 import (
-	"math/rand/v2"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,17 +24,17 @@ func (NoopLogger) Printf(string, ...any) {}
 // configured timezone. The recorded time is when the exhaustion was observed.
 
 type keyState struct {
-	mu           sync.RWMutex
-	global       *time.Time           // global (all-model) disable time, nil if none
-	globalReason string               // "" = daily quota disable (resets midnight); "unauthorized" = 401 (until restart)
-	cooldown     *time.Time           // short-term global cooldown expiry (insufficient_quota), nil if none
-	successCount int                  // daily successful request count (reset at midnight)
-	magicCubeAvailable int       // available_balance from /openapi/v1/magicubes/balance
-	magicCubeTotal int           // total_balance
-	magicCubeFrozen int          // frozen_amount
-	usagePerDay int              // currentUsagePerDay from /api/v1/inference/rate-limit
-	checkedIn bool               // daily sign-in via /api/v1/users/login/info
-	lastCheckIn time.Time        // when the sign-in was performed
+	mu                 sync.RWMutex
+	global             *time.Time // global (all-model) disable time, nil if none
+	globalReason       string     // "" = daily quota disable (resets midnight); "unauthorized" = 401 (until restart)
+	cooldown           *time.Time // short-term global cooldown expiry (insufficient_quota), nil if none
+	successCount       int        // daily successful request count (reset at midnight)
+	magicCubeAvailable int        // available_balance from /openapi/v1/magicubes/balance
+	magicCubeTotal     int        // total_balance
+	magicCubeFrozen    int        // frozen_amount
+	usagePerDay        int        // currentUsagePerDay from /api/v1/inference/rate-limit
+	checkedIn          bool       // daily sign-in via /api/v1/users/login/info
+	lastCheckIn        time.Time  // when the sign-in was performed
 }
 
 // Store is the concurrency-safe rate-limit state shared by all plugin hooks.
@@ -50,6 +49,15 @@ type Store struct {
 	// arbitrary value left over from the previous provider.
 	managedCursorsMu sync.Mutex
 	managedCursors   map[string]uint64
+	// managedProviderCursor is the within-request cross-provider cursor used
+	// when skip_provider_on_429 is OFF. A 429+insufficient_quota advances it so
+	// the next pick (still the same request, retried by the host) starts from
+	// the next provider in cfg.Providers order. Any 200 resets it to 0, so the
+	// next request always starts from the first provider; only per-provider
+	// key cursors keep rotating across requests. Each provider keeps its own
+	// key cursor, so a 200 keeps the same provider with its advanced key until
+	// it 429s.
+	managedProviderCursor uint64
 	// managedOrder remembers the largest host-ordered candidate ID list seen
 	// per managed provider. When providerFullOrder is unavailable (fetcher
 	// unset or management API unreachable), pickManaged uses this snapshot as
@@ -112,11 +120,11 @@ type Store struct {
 	cooldownLevel   float64   // current backoff interval (seconds); 0 = idle
 	cooldownLevelAt time.Time // when the level was last advanced
 	// cooldownExpiresAt is when the current round's cooldown actually expires
-	// (level + the jitter used when the level was advanced). It anchors "same
-	// round" detection: a failure before this point is the same round of an
-	// exhausted shared quota (kept, not doubled); a failure after is a new
-	// round (doubled). Using the actual expiry — not cooldownLevelAt+level+1s
-	// — avoids under-escalating when the next retry arrives right at expiry.
+	// (the level duration, no jitter). It anchors "same round" detection and
+	// is also the per-key cooldown expiry for every key in that round, so all
+	// keys in a round expire at the same instant (no drift). A failure before
+	// this point is the same round of an exhausted shared quota (kept, not
+	// doubled); a failure after is a new round (doubled).
 	cooldownExpiresAt time.Time
 
 	// cooldownCount and cooldownWaitNanos track daily insufficient_quota
@@ -132,45 +140,6 @@ type Store struct {
 	blockActive       int       // number of goroutines currently in a cooldown sleep
 	blockStart        time.Time // when the current block period started (blockActive 0→1)
 
-	// jitterFn returns a random [0, 1s) duration added to each
-	// insufficient_quota cooldown so concurrent retries against a shared
-	// exhausted quota don't all wake at the same instant (thundering herd).
-	// Injectable in tests (return 0) for deterministic timing assertions.
-	jitterFn atomic.Pointer[func() time.Duration]
-
-	// Proxy state: when proxy_url is configured, a 429 from a managed
-	// provider triggers a 2s wait + proxy probe. If the probe succeeds the
-	// global upstream proxy is toggled on via proxyToggler (injected by the
-	// C-ABI glue, which calls the management API PUT/DELETE proxy-url). The
-	// proxy stays on until a managed provider succeeds or all managed keys
-	// are exhausted, then is disabled. A 60s safety timer auto-disables.
-	proxyMu             sync.Mutex
-	proxyActive         bool
-	proxyEnabling       bool   // another goroutine is mid-enable (probe/toggler)
-	proxyTriggerPending bool   // set by OnUsage on 429, consumed by SchedulerPick (sync)
-	proxyTriggerAuthID  string // authID of the 429 that set the trigger (for setCooldown)
-	proxyTriggerModel   string // model of the 429 that set the trigger
-	proxyProbeFailed    bool   // probe failed once; subsequent 429s skip probe and use cooldown
-	proxyProbed         bool   // probe has been performed at least once (success or fail)
-	proxyEnabledAt      time.Time
-	proxyTimer          *time.Timer
-	originalProxyURL    string // host's proxy URL before plugin enabled its own (for restore)
-	originalSnapshotted bool   // host proxy snapshot taken once (lazy, on first enable); guards re-GET
-	proxyToggler        atomic.Pointer[func(proxyURL string) error]
-	proxyURLGetter      atomic.Pointer[func() (string, error)]
-	// Test seams: an injectable probe (avoids real network during tests) and a
-	// proxy-wait override (keeps proxy-mode tests from sleeping 2s). Both are
-	// nil/zero in production, falling back to probeProxy / proxyWaitDuration.
-	probeFn        atomic.Pointer[func(proxyURL string) bool]
-	proxyWaitNanos atomic.Int64
-	// proxySafetyNanos overrides proxySafetyTimeout for tests (so the
-	// safety-timer reset can be exercised without waiting 60s). 0 = default.
-	proxySafetyNanos atomic.Int64
-	// proxyGeneration is a monotonic counter incremented each time the safety
-	// timer is (re)armed. The timer callback captures the generation it was
-	// created with and only calls disableProxy if it matches the current
-	// value — a stale callback from a superseded timer is silently dropped.
-	proxyGeneration atomic.Int64
 	// skipProviders is the per-provider latching skip set for
 	// skip_provider_on_429 mode. OnUsage adds a provider name when it returns
 	// 429+insufficient_quota; SchedulerPick filters out candidates from
@@ -209,8 +178,6 @@ func NewStore(log Logger) *Store {
 	}
 	s.loc.Store(utc)
 	s.cfg.Store(DefaultConfig())
-	df := defaultJitter
-	s.jitterFn.Store(&df)
 	return s
 }
 
@@ -459,6 +426,41 @@ func (s *Store) pickManaged(group []Candidate, providerCfgName string) (Candidat
 	return group[idx], true
 }
 
+// managedProviderStart returns the starting provider index for the next
+// scheduler pick when skip_provider_on_429 is OFF. The cursor is shared by
+// all managed providers so a 429 rotates the selection across providers,
+// while each provider keeps its own key cursor.
+func (s *Store) managedProviderStart(providerCount int) int {
+	if providerCount <= 0 {
+		return 0
+	}
+	s.managedCursorsMu.Lock()
+	defer s.managedCursorsMu.Unlock()
+	return int(s.managedProviderCursor % uint64(providerCount))
+}
+
+// advanceManagedProvider moves the within-request cross-provider cursor to the
+// next provider. Called by OnUsage after a managed insufficient_quota 429 when
+// skip_provider_on_429 is OFF, so the host's retry picks the next provider
+// within the same request. Any 200 resets the cursor (see
+// resetManagedProviderCursor) so the next request starts from the first
+// provider; per-provider key cursors keep rotating across requests.
+func (s *Store) advanceManagedProvider() {
+	s.managedCursorsMu.Lock()
+	s.managedProviderCursor++
+	s.managedCursorsMu.Unlock()
+}
+
+// resetManagedProviderCursor resets the within-request cross-provider cursor
+// to the first provider. Called by OnUsage on any 200 (managed or non-managed)
+// so the next request always starts from the first managed provider; only
+// per-provider key cursors keep rotating across requests.
+func (s *Store) resetManagedProviderCursor() {
+	s.managedCursorsMu.Lock()
+	s.managedProviderCursor = 0
+	s.managedCursorsMu.Unlock()
+}
+
 // Now returns the current clock value (used by the glue for rendering).
 func (s *Store) Now() time.Time { return s.now() }
 
@@ -493,6 +495,7 @@ func (s *Store) Reconfigure(cfg *Config) {
 	// values from a previous config are meaningless.
 	s.managedCursorsMu.Lock()
 	s.managedCursors = make(map[string]uint64)
+	s.managedProviderCursor = 0
 	s.managedCursorsMu.Unlock()
 	s.nonManagedRR.Store(0)
 	// Reset the observed-order snapshots too: a new provider set or reordered
@@ -507,6 +510,10 @@ func (s *Store) Reconfigure(cfg *Config) {
 	s.cooldownLevelAt = time.Time{}
 	s.cooldownExpiresAt = time.Time{}
 	s.backoffMu.Unlock()
+	// Clear per-key short-term cooldowns left over from the previous config:
+	// a changed insufficient_quota_cooldown base (or a skip-mode switch)
+	// makes them stale. Daily global disables are kept (still legitimate).
+	s.clearAllCooldowns()
 	// Clear the per-provider skip set: stale entries from a previous config
 	// would make the next pick skip managed providers for no reason.
 	s.ClearAllSkippedProviders()
@@ -602,10 +609,6 @@ func (s *Store) getOrCreateKey(authID string) *keyState {
 	return ks
 }
 
-// recordRemaining stores the last-seen rate-limit numbers for a credential,
-// day-bounded so stale values clear at the midnight reset. It does not touch
-// disable state; ApplyRateLimit disables separately based on the threshold.
-
 // deleteKey removes an empty keyState entry.
 func (s *Store) deleteKey(authID string) {
 	s.mu.Lock()
@@ -620,9 +623,9 @@ func (s *Store) deleteKey(authID string) {
 	}
 }
 
-// isDisabled reports whether the (authID, model) pair is currently disabled.
-// A global disable covers all models. Stale records (rolled-over day) do not
-// count; the background cleaner removes them eventually.
+// isDisabled reports whether the authID is currently globally disabled.
+// Stale daily records (rolled-over day) do not count unless the reason is
+// "unauthorized"; the background cleaner removes expiring daily records.
 func (s *Store) isDisabled(authID, model string, now time.Time) bool {
 	ks := s.getKey(authID)
 	if ks == nil {
@@ -636,24 +639,7 @@ func (s *Store) isDisabled(authID, model string, now time.Time) bool {
 	// because Modelscope shares a quota across all keys and providers — the
 	// cooldown is global, not per-key. After the block the cooldown has
 	// expired and the key is available again. Daily disables (global +
-	// per-model) are still checked here.
-	if ks.global != nil && (ks.globalReason == "unauthorized" || active(*ks.global, now, loc)) {
-		return true
-	}
-	return false
-}
-
-// hasAnyDisable reports whether the key has any active global or model disable.
-func (s *Store) hasAnyDisable(authID string, now time.Time, loc *time.Location) bool {
-	ks := s.getKey(authID)
-	if ks == nil {
-		return false
-	}
-	ks.mu.RLock()
-	defer ks.mu.RUnlock()
-	if ks.cooldown != nil && now.Before(*ks.cooldown) {
-		return true
-	}
+	// Daily global disables are still checked here.
 	if ks.global != nil && (ks.globalReason == "unauthorized" || active(*ks.global, now, loc)) {
 		return true
 	}
@@ -738,14 +724,16 @@ func (s *Store) seenIDs() []string {
 	return ids
 }
 
-// Overview returns overall key counts at "now": total observed, keys with any
-// active disable, and available (total - disabled).
+// Overview returns overall key counts at "now": total observed, keys with an
+// active global disable (matching the scheduler's isDisabled view), and
+// available (total - disabled). Short-term cooldowns are reported separately
+// by Snapshot, so "available" here never diverges from what the scheduler
+// will actually pick.
 func (s *Store) Overview(now time.Time) (total, disabled, available int) {
 	ids := s.seenIDs()
-	loc := s.location()
 	total = len(ids)
 	for _, id := range ids {
-		if s.hasAnyDisable(id, now, loc) {
+		if s.isDisabled(id, "", now) {
 			disabled++
 		}
 	}
@@ -753,7 +741,8 @@ func (s *Store) Overview(now time.Time) (total, disabled, available int) {
 	return
 }
 
-// Counts returns per-model counts among observed keys at "now".
+// Counts returns observed-key counts for the supplied model. Global disables
+// apply to every model, so a model name only affects logging/summary context.
 func (s *Store) Counts(model string, now time.Time) (disabled, available, total int) {
 	ids := s.seenIDs()
 	total = len(ids)
@@ -766,9 +755,9 @@ func (s *Store) Counts(model string, now time.Time) (disabled, available, total 
 	return
 }
 
-// MagicCubeRemaining returns the total available magic cube balance across
-// all active (non-disabled) keys. Used by the scheduler log to report how
-// much balance remains on still-active keys.
+// ModelRemaining returns the total available magic cube balance across all
+// active (non-disabled) keys. Used by scheduler logs to report how much
+// balance remains on still-active keys.
 func (s *Store) ModelRemaining(model string, now time.Time) int {
 	ids := s.seenIDs()
 	loc := s.location()
@@ -789,9 +778,9 @@ func (s *Store) ModelRemaining(model string, now time.Time) int {
 }
 
 // disableGlobal marks authID as globally disabled for the rest of the day.
-// The earliest observation time is kept. model is the model whose total quota
-// exhaustion triggered the disable; it is only used to report the remaining
-// model quota on the still-active keys in the log.
+// The earliest observation time is kept. model is retained only for call-site
+// compatibility and debug context; a global disable applies to every requested
+// model for that credential.
 func (s *Store) disableGlobal(authID, model string, now time.Time) {
 	ks := s.getOrCreateKey(authID)
 	loc := s.location()
@@ -805,6 +794,15 @@ func (s *Store) disableGlobal(authID, model string, now time.Time) {
 	ks.globalReason = ""
 	ks.mu.Unlock()
 	s.log.Printf("modelscope-ratelimit: key %s globally disabled", authID)
+}
+
+// DisableGlobal disables a credential globally for the rest of the day.
+// The glue layer uses this to propagate an insufficient-balance disable from
+// one auth ID to every other auth ID that shares the same raw API key across
+// providers. This keeps the core layer independent from raw-key knowledge
+// while preserving a single account-level disable state.
+func (s *Store) DisableGlobal(authID, model string, now time.Time) {
+	s.disableGlobal(authID, model, now)
 }
 
 // disableUnauthorized marks authID as globally disabled until plugin restart
@@ -824,7 +822,6 @@ func (s *Store) disableUnauthorized(authID string, now time.Time) {
 	ks.mu.Unlock()
 	s.log.Printf("modelscope-ratelimit: key %s disabled (unauthorized: secret may be invalid)", authID)
 }
-
 
 // maxInsufficientQuotaCooldown is the ceiling for a single insufficient_quota
 // cooldown interval (seconds). Exponential backoff doubles each consecutive
@@ -850,12 +847,6 @@ func (s *Store) setCooldown(authID string, base float64, now time.Time) {
 	if authID == "" || base <= 0 {
 		return
 	}
-	// Compute the jitter up front so the round-expiry anchor and the per-key
-	// cooldown use the same value.
-	jitter := time.Duration(0)
-	if jf := s.jitterFn.Load(); jf != nil && *jf != nil {
-		jitter = (*jf)()
-	}
 	s.backoffMu.Lock()
 	level := s.cooldownLevel
 	advanced := false
@@ -865,15 +856,12 @@ func (s *Store) setCooldown(authID string, base float64, now time.Time) {
 		level = base
 		advanced = true
 	case now.Before(s.cooldownExpiresAt):
-		// Still inside the previous round's actual cooldown (level + the
-		// jitter that was in effect when the level was advanced): multiple
-		// keys of the same shared quota failing together are one round.
-		// Keep the level AND the original round anchor (cooldownLevelAt /
-		// cooldownExpiresAt) so the round isn't over-counted or slid
-		// forward. Using the real expiry — not cooldownLevelAt+level+1s —
-		// means a retry arriving right at expiry (after the cooldown block
-		// slept through it) counts as a new round and escalates, instead of
-		// being absorbed into the previous round by an over-generous buffer.
+		// Still inside the current round's cooldown window: multiple keys of
+		// the same shared quota failing together are one round. Keep the
+		// level AND the original round anchor (cooldownExpiresAt) so the
+		// round is neither over-counted nor slid forward. The per-key
+		// cooldown below is anchored to this same expiry, so every key in a
+		// round expires at the same instant (no drift, no over-escalation).
 	default:
 		// Previous window elapsed - a new round of failures. Double, capped.
 		level = min(level*2, maxInsufficientQuotaCooldown)
@@ -882,21 +870,20 @@ func (s *Store) setCooldown(authID string, base float64, now time.Time) {
 	if advanced {
 		s.cooldownLevel = level
 		s.cooldownLevelAt = now
-		expiry := time.Duration(level * float64(time.Second)) + jitter
+		expiry := time.Duration(level * float64(time.Second))
 		if expiry > maxInsufficientQuotaCooldown*time.Second {
 			expiry = maxInsufficientQuotaCooldown * time.Second
 		}
 		s.cooldownExpiresAt = now.Add(expiry)
 	}
+	// dur is the backoff interval for logging only.
+	dur := time.Duration(level * float64(time.Second))
+	// Anchor the per-key cooldown to the round expiry so all keys in the same
+	// round unblock together. This is the fix for the previous drift: a
+	// same-round key used to get now+level (a later instant) which slid the
+	// effective block past the anchor and caused over-escalation.
+	until := s.cooldownExpiresAt
 	s.backoffMu.Unlock()
-
-	// Add the precomputed jitter so retries against a shared exhausted quota
-	// don't all wake simultaneously, then cap at the maximum.
-	dur := time.Duration(level * float64(time.Second)) + jitter
-	if dur > maxInsufficientQuotaCooldown*time.Second {
-		dur = maxInsufficientQuotaCooldown * time.Second
-	}
-	until := now.Add(dur)
 	ks := s.getOrCreateKey(authID)
 	ks.mu.Lock()
 	ks.cooldown = &until
@@ -908,7 +895,7 @@ func (s *Store) setCooldown(authID string, base float64, now time.Time) {
 }
 
 // resetCooldownBackoff clears the global exponential-backoff level. Called
-// when a healthy response (quota above threshold) is observed, so the next
+// when a healthy managed response is observed, so the next
 // insufficient_quota failure restarts from the configured base.
 func (s *Store) resetCooldownBackoff() {
 	s.backoffMu.Lock()
@@ -916,6 +903,28 @@ func (s *Store) resetCooldownBackoff() {
 	s.cooldownLevelAt = time.Time{}
 	s.cooldownExpiresAt = time.Time{}
 	s.backoffMu.Unlock()
+}
+
+// clearAllCooldowns nils out every per-key short-term cooldown. Called by
+// Reconfigure so a changed insufficient_quota_cooldown base or a skip-mode
+// switch does not carry stale cooldowns into Snapshot views. Daily global
+// disables are intentionally kept (still legitimate until midnight/restart).
+func (s *Store) clearAllCooldowns() {
+	s.mu.RLock()
+	ids := make([]string, 0, len(s.keys))
+	for id := range s.keys {
+		ids = append(ids, id)
+	}
+	s.mu.RUnlock()
+	for _, id := range ids {
+		ks := s.getKey(id)
+		if ks == nil {
+			continue
+		}
+		ks.mu.Lock()
+		ks.cooldown = nil
+		ks.mu.Unlock()
+	}
 }
 
 // CooldownStats returns the daily count of insufficient_quota cooldown
@@ -991,74 +1000,6 @@ func (s *Store) RateLimitCount() int {
 	n := s.rateLimitCount
 	s.cooldownStatsMu.Unlock()
 	return int(n)
-}
-
-// defaultJitter returns a random duration in [0, 1s), used to stagger
-// insufficient_quota cooldown retries so they don't thunder-herd.
-func defaultJitter() time.Duration {
-	return time.Duration(rand.Float64() * float64(time.Second))
-}
-
-// SetJitter overrides the jitter source. Tests inject a fixed or zero value
-// for deterministic timing assertions; a nil argument restores the default.
-func (s *Store) SetJitter(f func() time.Duration) {
-	if f == nil {
-		df := defaultJitter
-		s.jitterFn.Store(&df)
-		return
-	}
-	s.jitterFn.Store(&f)
-}
-
-// SetProbeFunc injects a function used in place of the real probeProxy network
-// call. Tests use it to simulate a reachable or unreachable proxy without
-// hitting https://api-inference.modelscope.cn. A nil argument restores the
-// default (real HTTP probe).
-func (s *Store) SetProbeFunc(f func(proxyURL string) bool) {
-	if f == nil {
-		s.probeFn.Store(nil)
-		return
-	}
-	s.probeFn.Store(&f)
-}
-
-// SetProxyWait overrides the proxy 2s rotation/probe wait so proxy-mode tests
-// run without sleeping. A zero or negative duration restores the default
-// (proxyWaitDuration).
-func (s *Store) SetProxyWait(d time.Duration) {
-	if d <= 0 {
-		s.proxyWaitNanos.Store(0)
-		return
-	}
-	s.proxyWaitNanos.Store(int64(d))
-}
-
-// proxyWait returns the configured proxy wait, honoring the test override.
-func (s *Store) proxyWait() time.Duration {
-	if v := s.proxyWaitNanos.Load(); v > 0 {
-		return time.Duration(v)
-	}
-	return proxyWaitDuration
-}
-
-// SetProxySafetyTimeout overrides the proxy safety-timer duration (default
-// proxySafetyTimeout=60s) so tests can exercise the reset behavior without
-// waiting a minute. A zero or negative duration restores the default.
-func (s *Store) SetProxySafetyTimeout(d time.Duration) {
-	if d <= 0 {
-		s.proxySafetyNanos.Store(0)
-		return
-	}
-	s.proxySafetyNanos.Store(int64(d))
-}
-
-// proxySafetyTimeoutDur returns the configured safety timeout, honoring the
-// test override.
-func (s *Store) proxySafetyTimeoutDur() time.Duration {
-	if v := s.proxySafetyNanos.Load(); v > 0 {
-		return time.Duration(v)
-	}
-	return proxySafetyTimeout
 }
 
 // SetSkipProvider adds a managed provider to the per-provider skip set
@@ -1282,8 +1223,6 @@ func (s *Store) PruneAll(now time.Time) {
 	s.cooldownStatsMu.Unlock()
 }
 
-// ModelView is a render-ready snapshot of one model's rate-limit state for a
-// key: last-seen remaining/limit (when known) and whether it is disabled.
 // KeyView is a render-ready snapshot of one credential's state.
 type KeyView struct {
 	AuthID             string
@@ -1302,8 +1241,7 @@ type KeyView struct {
 }
 
 // Snapshot returns a render-ready view of every observed credential's state at
-// "now". Only current-day rate-limit data is included; rolled-over disables
-// and stale (previous-day) remaining values are excluded.
+// "now". Rolled-over disables (except unauthorized) are excluded.
 func (s *Store) Snapshot(now time.Time) map[string]KeyView {
 	loc := s.location()
 	s.mu.RLock()

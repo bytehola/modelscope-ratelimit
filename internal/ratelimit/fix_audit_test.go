@@ -1,55 +1,9 @@
 package ratelimit
 
 import (
-	"sync"
 	"testing"
 	"time"
 )
-
-// Fix #1: after a disable -> re-enable -> disable cycle, every disable must
-// still restore the host's original proxy URL. disableProxy previously cleared
-// originalProxyURL after one use and reenableProxy never re-snapshotted it, so
-// the second disable restored "" (DELETE) instead of the host original.
-func TestFixProxyOriginalSurvivesReenableCycle(t *testing.T) {
-	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
-	s, _ := newTestStore(now)
-	s.Reconfigure(proxyCfg("http://127.0.0.1:8888", "modelscope"))
-	s.SetProxyWait(time.Millisecond)
-	s.SetProbeFunc(func(string) bool { return true })
-	var mu sync.Mutex
-	var toggled []string
-	s.SetProxyToggler(func(u string) error {
-		mu.Lock()
-		defer mu.Unlock()
-		toggled = append(toggled, u)
-		return nil
-	})
-	s.SetProxyURLGetter(func() (string, error) { return "host-orig", nil })
-
-	// Enable (first-time probe path).
-	s.SetProxyTrigger("auth-1", "Qwen-72B")
-	if !s.ConsumeProxyTrigger("Qwen-72B", now) {
-		t.Fatal("1st enable must succeed")
-	}
-	s.HandleProxyOnSuccess() // 1st disable -> restore host-orig
-
-	// Re-enable (proxyProbed=true -> direct re-enable path).
-	s.SetProxyTrigger("auth-1", "Qwen-72B")
-	if !s.ConsumeProxyTrigger("Qwen-72B", now) {
-		t.Fatal("2nd enable must succeed")
-	}
-	s.HandleProxyOnSuccess() // 2nd disable -> must STILL restore host-orig
-
-	mu.Lock()
-	defer mu.Unlock()
-	// Expected: enable(plugin) -> restore(host-orig) -> enable(plugin) -> restore(host-orig).
-	if len(toggled) != 4 {
-		t.Fatalf("toggler calls = %v, want 4", toggled)
-	}
-	if toggled[1] != "host-orig" || toggled[3] != "host-orig" {
-		t.Fatalf("both disables must restore host-orig, got %v", toggled)
-	}
-}
 
 // Fix #2: Status() must report a 401-disabled key across the midnight
 // boundary, matching isDisabled(). Previously Status() only used active()
@@ -117,35 +71,5 @@ func TestFixFallbackRetryPicksNextInOrder(t *testing.T) {
 	// cursor % len(smaller_list) bug produced).
 	if r2.AuthID != "b-2" {
 		t.Fatalf("retry pick: expected b-2 (next in order), got %q", r2.AuthID)
-	}
-}
-
-// Fix #4: when an enable is already in flight (proxyEnabling=true), a
-// concurrent ConsumeProxyTrigger with a pending trigger must wait and return
-// IsProxyActive(), NOT race into reenableProxy and issue a duplicate PUT.
-func TestFixProxyEnablingGuardsConcurrentReenable(t *testing.T) {
-	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
-	s, _ := newTestStore(now)
-	s.Reconfigure(proxyCfg("http://127.0.0.1:8888", "modelscope"))
-	s.SetProxyWait(time.Millisecond)
-	s.SetProbeFunc(func(string) bool { return true })
-	called := false
-	s.SetProxyToggler(func(string) error { called = true; return nil })
-
-	// Simulate an enable already in flight: proxyProbed=true (so the re-enable
-	// branch would be taken) AND proxyEnabling=true (the guard). A pending
-	// trigger must now wait and return IsProxyActive() (false), without
-	// touching the toggler.
-	s.proxyMu.Lock()
-	s.proxyProbed = true
-	s.proxyEnabling = true
-	s.proxyMu.Unlock()
-	s.SetProxyTrigger("auth-1", "Qwen-72B")
-
-	if s.ConsumeProxyTrigger("Qwen-72B", now) {
-		t.Fatal("with proxyEnabling in flight and proxy inactive, must return false (waited)")
-	}
-	if called {
-		t.Fatal("toggler must not be called while another enable is in flight")
 	}
 }

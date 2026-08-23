@@ -14,45 +14,42 @@ type Config struct {
 	// everything else is left to the built-in scheduler (Handled=false).
 	// Required for scheduling to take effect.
 	//
-	// Order determines preference: candidates from the first-listed provider are
-	// always picked before the second, and so on. Only when every key from an
-	// earlier provider is disabled (daily rate-limit exhausted) does the plugin
-	// fall through to the next provider in the list.
+	// Order defines the cross-provider rotation sequence: when
+	// skip_provider_on_429 is OFF, a single request starts from the first
+	// provider and advances to the next after each 429+insufficient_quota; any
+	// 200 resets to the first provider so the next request starts there. Each
+	// provider also round-robins its own keys independently (across requests).
 	Providers []string `json:"providers" yaml:"providers"`
 
-	// SkipProviderOn429 activates "skip-provider-on-429" mode: on any 429 from
-	// a managed provider, the next scheduler pick jumps straight to a
-	// non-managed provider (one-shot, no cooldown, no proxy, no daily
-	// disable), so the request gets a fast response instead of waiting for
-	// the managed 429 backoff. Default false.
+	// SkipProviderOn429 activates "skip-provider-on-429" mode: on a managed
+	// 429+insufficient_quota, the provider is added to a latching skip set so
+	// the next pick falls through to non-managed providers. Any 200 (managed
+	// or non-managed) clears the set so the next request probes the managed
+	// quota again. When OFF (default), a 429+insufficient_quota rotates the
+	// within-request cross-provider cursor and applies the insufficient_quota
+	// cooldown backoff instead; any 200 resets that cursor to the first
+	// provider.
 	SkipProviderOn429 bool `json:"skip_provider_on_429" yaml:"skip_provider_on_429"`
 
 	// Timezone is the IANA timezone used for the daily 00:00 reset boundary.
 	// Defaults to "Asia/Shanghai".
 	Timezone string `json:"timezone" yaml:"timezone"`
 
-// CredentialStrategy controls how the plugin picks among available managed
+	// CredentialStrategy controls how the plugin picks among available managed
 	// keys within a provider: "round-robin" (default) spreads load; "fill-first"
 	// always uses the first key until disabled. Only applies to managed providers.
 	CredentialStrategy string `json:"credential_strategy" yaml:"credential_strategy"`
 
-	// InsufficientQuotaCooldown is the number of seconds to temporarily cool
-	// down (skip) a managed key after it returns HTTP 429 with an
-	// "insufficient_quota" error body. During the cooldown the scheduler
-	// picks a different key; after it expires the key becomes available
-	// again. Supports fractional seconds (e.g. 0.1). Default 0.1.
+	// InsufficientQuotaCooldown is the base (in seconds) for the global
+	// exponential-backoff cooldown applied after a 429+insufficient_quota.
+	// Because Modelscope shares a quota across all managed keys, the cooldown
+	// is global: SchedulerPick blocks all managed picks until the active
+	// cooldown expires. Consecutive failures double the interval, capped at
+	// 60 seconds, with no jitter; all keys in the same round expire together
+	// (no drift). Any 200 resets it. Set to 0 to disable the cooldown entirely
+	// (429 rotates to the next provider/key immediately, no blocking).
+	// Supports fractional seconds (e.g. 0.1). Default 0.1.
 	InsufficientQuotaCooldown float64 `json:"insufficient_quota_cooldown" yaml:"insufficient_quota_cooldown"`
-
-	// ProxyURL, when non-empty, activates proxy mode: on the first 429 from a
-	// managed provider, the plugin waits 2s, probes the proxy by requesting
-	// https://api-inference.modelscope.cn (10s timeout), and if reachable
-	// enables the global upstream proxy via the management API. The proxy
-	// stays on until a managed provider succeeds or all managed keys are
-	// exhausted, then is disabled. When proxy mode is active,
-	// InsufficientQuotaCooldown is ignored. Format: a single proxy URL such
-	// as "socks5://user:pass@host:port" or "http://host:port".
-	ProxyURL string `json:"proxy_url" yaml:"proxy_url"`
-
 
 	// MsProxyURL, when set, routes all Modelscope API calls through this proxy.
 	// Used for debugging/traffic inspection (e.g. "http://127.0.0.1:8888").
@@ -147,7 +144,6 @@ func (c *Config) ManagesProvider(provider string) bool {
 	return c.ProviderIndex(provider) >= 0
 }
 
-
 // ConfigFromMap builds a Config from a generic map (the glue parses the host
 // YAML into a map and delegates here). Missing or zero-value fields fall back
 // to DefaultConfig so partial configs stay valid across versions.
@@ -180,9 +176,6 @@ func ConfigFromMap(raw map[string]any) (*Config, error) {
 		} else {
 			return nil, fmt.Errorf("invalid insufficient_quota_cooldown: %w", err)
 		}
-	}
-	if v, ok := raw["proxy_url"].(string); ok {
-		cfg.ProxyURL = strings.TrimSpace(v)
 	}
 	if v, ok := raw["ms_proxy_url"].(string); ok {
 		cfg.MsProxyURL = strings.TrimSpace(v)

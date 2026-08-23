@@ -11,7 +11,6 @@ func newTestStore(now time.Time) (*Store, *time.Time) {
 	loc := time.FixedZone("CST", 8*3600)
 	s := NewStore(NoopLogger{})
 	s.SetLocation(loc)
-	s.SetJitter(func() time.Duration { return 0 })
 	cur := now
 	s.SetClock(func() time.Time { return cur })
 	return s, &cur
@@ -58,8 +57,8 @@ func TestConfigFromMap(t *testing.T) {
 	})
 	t.Run("overrides", func(t *testing.T) {
 		c, err := ConfigFromMap(map[string]any{
-			"providers":              []any{"ms", "ms2"},
-			"timezone":               "UTC",
+			"providers":                   []any{"ms", "ms2"},
+			"timezone":                    "UTC",
 			"insufficient_quota_cooldown": 3,
 		})
 		if err != nil {
@@ -157,7 +156,7 @@ func TestSchedulerSkipsDisabledAndRotates(t *testing.T) {
 	s, _ := newTestStore(now)
 	s.Reconfigure(cfgWith("modelscope"))
 
-	// Exhaust auth-1 for Qwen-72B only.
+	// Globally disable auth-1 (insufficient balance / magic-cube exhausted).
 	s.ApplyRateLimit("auth-1", "Qwen-72B", nil, 429, insufficientBalanceBody, now)
 
 	req := SchedulerPickRequest{
@@ -188,7 +187,8 @@ func TestSchedulerSkipsDisabledAndRotates(t *testing.T) {
 		t.Fatalf("expected rotation across available keys, got %v", picks)
 	}
 
-	// A different model on auth-1 must still be pickable (per-model scoping).
+	// auth-1 is globally disabled, so a different model must still be handled
+	// (by auth-2/auth-3).
 	req2 := req
 	req2.Model = "Qwen-7B"
 	resp, err := s.SchedulerPick(req2)
@@ -508,7 +508,7 @@ func TestOnResponseWithMetadataAuthID(t *testing.T) {
 	resp := s.OnResponse(ResponseInterceptRequest{
 		Model:           "Qwen-72B",
 		ResponseHeaders: nil, StatusCode: 429, Body: insufficientBalanceBody,
-		Metadata:        map[string]any{"auth_id": "auth-1"},
+		Metadata: map[string]any{"auth_id": "auth-1"},
 	})
 	// Plugin must not rewrite the response.
 	if resp.Body != "" || len(resp.Headers) != 0 {
@@ -568,10 +568,10 @@ func TestAuthIDFromMetadata(t *testing.T) {
 	}
 }
 
-// TestSchedulerProviderOrderPrefersFirst verifies that when multiple managed
-// providers have available keys, the plugin always picks from the first-listed
-// provider (strict priority by config order). The second provider is only used
-// after every key from the first is disabled.
+// TestSchedulerProviderOrderPrefersFirst verifies the initial provider
+// rotation order before a 429 advances the cross-provider cursor. With the
+// cursor at zero, the first-listed provider is chosen while it has available
+// keys; the second provider is used after every key from the first is disabled.
 func TestSchedulerProviderOrderPrefersFirst(t *testing.T) {
 	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
 	s, _ := newTestStore(now)
@@ -732,8 +732,9 @@ func TestRoundRobinRotates(t *testing.T) {
 	}
 }
 
-// TestFillFirstProviderOrder verifies that fill-first respects provider order:
-// the first-listed provider's keys are used exclusively until exhausted.
+// TestFillFirstProviderOrder verifies that fill-first uses the first-listed
+// provider's first available key until disabled, under the initial provider
+// cursor position. A 429 would advance the cross-provider cursor separately.
 func TestFillFirstProviderOrder(t *testing.T) {
 	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
 	s, _ := newTestStore(now)
@@ -1420,10 +1421,12 @@ func TestInsufficientQuotaExponentialBackoff(t *testing.T) {
 	}
 
 	// Same window: a second key failing within the 5s window keeps the level
-	// (not over-counting one round of shared-quota exhaustion).
+	// (not over-counting one round of shared-quota exhaustion) AND anchors to
+	// the same expiry as the first (no drift). At now+1s the remaining wait is
+	// 4s, not a fresh 5s.
 	fail("auth-2", now.Add(1*time.Second))
-	if w := cooldownOf(now.Add(1 * time.Second)); w != 5*time.Second {
-		t.Fatalf("same-window 2nd key: want 5s, got %s", w)
+	if w := cooldownOf(now.Add(1 * time.Second)); w != 4*time.Second {
+		t.Fatalf("same-window 2nd key: want 4s (anchored, no drift), got %s", w)
 	}
 
 	// Round 2: after the 5s window elapses, the next failure doubles to 10s.
@@ -1474,48 +1477,58 @@ func TestInsufficientQuotaExponentialBackoff(t *testing.T) {
 	}
 }
 
-// TestInsufficientQuotaJitter verifies that a non-zero jitter is added on top
-// of the backoff level, and that the total never exceeds the 60s cap.
-func TestInsufficientQuotaJitter(t *testing.T) {
+// TestInsufficientQuotaBackoffCap verifies that without jitter the cooldown is
+// exactly the backoff level, doubles per round, never exceeds the 60s cap, and
+// that a same-round second key anchors to the SAME expiry as the first (the
+// drift fix: previously it slid to now+level and over-escalated under load).
+func TestInsufficientQuotaBackoffCap(t *testing.T) {
 	now := time.Date(2026, 7, 10, 12, 0, 0, 0, time.FixedZone("CST", 8*3600))
 	s, cur := newTestStore(now)
 	cfg := cfgWith("modelscope")
 	cfg.InsufficientQuotaCooldown = 5
 	s.Reconfigure(cfg)
-	// Fixed 500ms jitter so the assertion is deterministic.
-	s.SetJitter(func() time.Duration { return 500 * time.Millisecond })
-
-	s.OnUsage(UsageRecord{
-		AuthID:   "auth-1",
-		Provider: "modelscope",
-		Model:    "Qwen-72B",
-		Alias:    "Qwen-72B",
-		Failed:   true,
-		Failure:  &UsageFailure{StatusCode: 429, Body: `{"error":{"code":"insufficient_quota"}}`},
-	})
-
-	// base(5s) + 500ms jitter, exact.
-	if w := s.cooldownWaitDuration(now); w != 5500*time.Millisecond {
-		t.Fatalf("want 5.5s (base+jitter), got %s", w)
+	fail := func(id string, at time.Time) {
+		*cur = at
+		s.OnUsage(UsageRecord{
+			AuthID: id, Provider: "modelscope", Model: "Qwen-72B", Alias: "Qwen-72B",
+			Failed: true, Failure: &UsageFailure{StatusCode: 429, Body: `{"error":{"code":"insufficient_quota"}}`},
+		})
 	}
-	_ = cur
+	cooldownOf := func(at time.Time) time.Duration {
+		*cur = at
+		return s.cooldownWaitDuration(at)
+	}
 
-	// Drive the level to the 60s cap; jitter must be clipped so the total
-	// never exceeds 60s.
+	// Round 1: first failure -> exactly base (5s), no jitter.
+	fail("auth-1", now)
+	if w := cooldownOf(now); w != 5*time.Second {
+		t.Fatalf("round 1: want 5s, got %s", w)
+	}
+
+	// Same round: a second key failing within the window must anchor to the
+	// SAME expiry as the first (no drift). At now+1s the remaining wait is 4s
+	// (the original 5s window minus 1s), not a fresh 5s.
+	fail("auth-2", now.Add(1*time.Second))
+	if w := cooldownOf(now.Add(1 * time.Second)); w != 4*time.Second {
+		t.Fatalf("same-round 2nd key: want 4s (anchored, no drift), got %s", w)
+	}
+
+	// Drive the level to the 60s cap; the cooldown must equal the level
+	// exactly (no jitter) and never exceed 60s.
 	tPrev := now
 	for {
-		next := tPrev.Add(time.Duration(61) * time.Second) // past any window
+		next := tPrev.Add(61 * time.Second) // past the previous window
 		*cur = next
 		s.OnUsage(UsageRecord{
 			AuthID: "auth-1", Provider: "modelscope", Model: "Qwen-72B", Alias: "Qwen-72B",
 			Failed: true, Failure: &UsageFailure{StatusCode: 429, Body: `{"error":{"code":"insufficient_quota"}}`},
 		})
-		w := s.cooldownWaitDuration(next)
+		w := cooldownOf(next)
 		if w > 60*time.Second {
 			t.Fatalf("cooldown %s exceeds 60s cap", w)
 		}
 		if w == 60*time.Second {
-			break // reached the cap, jitter clipped
+			break // reached the cap
 		}
 		tPrev = next
 		if tPrev.Sub(now) > 5*time.Minute {
@@ -1579,5 +1592,77 @@ func TestUnauthorizedDisablePersistsAcrossMidnight(t *testing.T) {
 	}
 	if s.isDisabled("auth-2", "Qwen-72B", nextDay) {
 		t.Fatal("quota global disable must be cleared at midnight")
+	}
+}
+
+// TestCrossProviderDisablePropagation simulates the glue-layer propagation
+// path: when one provider's auth ID for a shared account receives 429 +
+// "insufficient balance", the glue layer calls DisableGlobal on every other
+// auth ID that shares the same raw API key. This test verifies the core
+// state machine honours that propagation so the scheduler skips the account
+// across all providers.
+func TestCrossProviderDisablePropagation(t *testing.T) {
+	loc := time.FixedZone("CST", 8*3600)
+	now := time.Date(2026, 7, 8, 10, 0, 0, 0, loc)
+	s, _ := newTestStore(now)
+	s.Reconfigure(cfgWith("modelscope", "modelscope2"))
+
+	authA := "openai-compatibility:modelscope:aaaabbbbcccc"
+	authB := "openai-compatibility:modelscope2:aaaabbbbcccc" // same raw key, different provider
+
+	// ProviderA's key gets 429 + insufficient balance.
+	s.ApplyRateLimit(authA, "Qwen-72B", nil, 429, insufficientBalanceBody, now)
+
+	// authA is disabled, authB is not yet (separate auth IDs).
+	if !s.isDisabled(authA, "Qwen-72B", now) {
+		t.Fatal("authA should be disabled after 429+insufficient balance")
+	}
+	if s.isDisabled(authB, "Qwen-72B", now) {
+		t.Fatal("authB should NOT be disabled before propagation")
+	}
+
+	// Glue layer propagates: DisableGlobal on all sibling auth IDs.
+	s.DisableGlobal(authB, "Qwen-72B", now)
+
+	// Now both are disabled.
+	if !s.isDisabled(authB, "Qwen-72B", now) {
+		t.Fatal("authB should be disabled after propagation")
+	}
+
+	// Scheduler must skip both candidates.
+	req := SchedulerPickRequest{
+		Provider:  "openai-compatible-modelscope",
+		Model:     "Qwen-72B",
+		Providers: []string{"openai-compatible-modelscope", "openai-compatible-modelscope2"},
+		Candidates: []Candidate{
+			{ID: authA, Provider: "openai-compatible-modelscope", Priority: 10, Status: "active"},
+			{ID: authB, Provider: "openai-compatible-modelscope2", Priority: 5, Status: "active"},
+		},
+	}
+	// Both managed candidates are disabled, no non-managed fallback =>
+	// ErrAllCredentialsDisabled.
+	resp, err := s.SchedulerPick(req)
+	if !errors.Is(err, ErrAllCredentialsDisabled) {
+		t.Fatalf("expected ErrAllCredentialsDisabled, got Handled=%v AuthID=%q err=%v", resp.Handled, resp.AuthID, err)
+	}
+}
+
+// TestDisableGlobalIsIdempotent ensures DisableGlobal on an already-disabled
+// key keeps the earliest disable timestamp (matching disableGlobal semantics).
+func TestDisableGlobalIsIdempotent(t *testing.T) {
+	loc := time.FixedZone("CST", 8*3600)
+	now := time.Date(2026, 7, 8, 9, 0, 0, 0, loc)
+	s, cur := newTestStore(now)
+	s.Reconfigure(cfgWith("modelscope"))
+
+	s.DisableGlobal("auth-1", "Qwen-72B", *cur)
+	first := *cur
+
+	*cur = now.Add(3 * time.Hour)
+	s.DisableGlobal("auth-1", "Qwen-7B", *cur)
+
+	st := s.Status()
+	if len(st) != 1 || st[0].Global == nil || *st[0].Global != first {
+		t.Fatalf("expected earliest time %v kept, got %+v", first, st)
 	}
 }

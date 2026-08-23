@@ -65,7 +65,7 @@ func TestNormalizeAPIResponseUnparseable(t *testing.T) {
 		t.Fatal("expected error for unparseable response")
 	}
 }
- 
+
 // TestNormalizeAPIResponseMixedCase covers the mixed envelope where
 // "Code" is CamelCase but "data" is lowercase — the format returned by
 // GET /api/v1/inference/rate-limit. This was the original bug where the
@@ -90,8 +90,8 @@ func TestNormalizeAPIResponseMixedCase(t *testing.T) {
 	if rl.CurrentUsagePerDay != 6 {
 		t.Fatalf("currentUsagePerDay = %d, want 6", rl.CurrentUsagePerDay)
 	}
- }
- 
+}
+
 // TestNormalizeAPIResponseLowerData covers the mixed envelope where "Code"
 // is CamelCase but "data" is fully lowercase — also seen on some /api/v1/*
 // endpoints. Go's case-insensitive json.Unmarshal should capture it in the
@@ -115,7 +115,7 @@ func TestNormalizeAPIResponseLowerData(t *testing.T) {
 	if rl.CurrentUsagePerDay != 42 {
 		t.Fatalf("currentUsagePerDay = %d, want 42", rl.CurrentUsagePerDay)
 	}
- }
+}
 
 func TestTransactionRecordFields(t *testing.T) {
 	// Verify the JSON tags match the real API response

@@ -9,8 +9,8 @@ import (
 func TestSkipProviderOn429Parsed(t *testing.T) {
 	t.Run("true", func(t *testing.T) {
 		c, err := ConfigFromMap(map[string]any{
-			"providers":              []any{"modelscope"},
-			"skip_provider_on_429":   true,
+			"providers":            []any{"modelscope"},
+			"skip_provider_on_429": true,
 		})
 		if err != nil {
 			t.Fatalf("parse: %v", err)
@@ -36,7 +36,7 @@ func TestSkipProviderOn429Parsed(t *testing.T) {
 // YAML/JSON numeric representations.
 func TestToFloat64EdgeCases(t *testing.T) {
 	tests := []struct {
-		name string
+		name  string
 		input any
 		want  float64
 		ok    bool
@@ -72,8 +72,8 @@ func TestToFloat64EdgeCases(t *testing.T) {
 // is silently ignored (no error, no effect on config).
 func TestConfigNoManagedModelsField(t *testing.T) {
 	c, err := ConfigFromMap(map[string]any{
-		"providers":       []any{"modelscope"},
-		"managed_models":  []any{"Qwen-72B"},  // should be silently ignored
+		"providers":      []any{"modelscope"},
+		"managed_models": []any{"Qwen-72B"}, // should be silently ignored
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

@@ -1,5 +1,5 @@
 // Command plugin is the CLIProxyAPI dynamic-library plugin that implements
-// Modelscope per-model and global daily rate-limit control.
+// Modelscope account-level magic-cube rate-limit control.
 //
 // The rate-limit state machine lives in modelscope-ratelimit/internal/ratelimit
 // (stdlib-only, unit-tested). This file is the native C-ABI adapter: it maps
@@ -80,8 +80,8 @@ extern void cliproxyPluginShutdown(void);
 import "C"
 
 import (
-	_ "embed"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -89,8 +89,8 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"strings"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 	_ "time/tzdata"
@@ -140,17 +140,19 @@ type strategyEntry struct {
 }
 
 type resolvedEntry struct {
-	masked        map[string]string
-	raw           map[string]string // authID -> raw API key (m_session_id cookie value)
-	maskToRaw     map[string]string // maskedKey -> raw API key (O(1) lookup)
-	maskToSite    map[string]string // maskedKey -> site base URL (O(1) lookup)
-	siteBase      map[string]string // authID -> Modelscope site base URL (cn/ai)
-	orderedAuthIDs []string // stable iteration order (deterministic idx)
-	providerOrder map[string][]string // provider name -> auth IDs in config.yaml api-key order
-	realTotal     int
-	unmatched     []string // configured providers not found upstream
-	err           error
-	at            time.Time
+	masked         map[string]string
+	raw            map[string]string   // authID -> raw API key (m_session_id cookie value)
+	maskToRaw      map[string]string   // maskedKey -> raw API key (O(1) lookup)
+	maskToSite     map[string]string   // maskedKey -> site base URL (O(1) lookup)
+	siteBase       map[string]string   // authID -> Modelscope site base URL (cn/ai)
+	orderedAuthIDs []string            // stable iteration order (deterministic idx)
+	dedupedAuthIDs []string            // one auth ID per raw API key (first in config order)
+	rawToAuthIDs   map[string][]string // raw API key -> auth IDs sharing this account
+	providerOrder  map[string][]string // provider name -> auth IDs in config.yaml api-key order
+	realTotal      int
+	unmatched      []string // configured providers not found upstream
+	err            error
+	at             time.Time
 }
 
 type stderrLogger struct{}
@@ -270,6 +272,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		// If the response was 429 + "insufficient balance", the account's
 		// magic cube is exhausted. Update the accounts cache immediately so
 		// the frontend reflects the real balance without waiting for refresh.
+		// Magic cubes are account-scoped on the server, so propagate the core
+		// disable to every auth ID that shares the same raw API key across
+		// providers. This avoids trying the same exhausted account through a
+		// second managed provider.
 		if r.Failed && r.Failure != nil && modelscope.IsInsufficientBalance(r.Failure.StatusCode, r.Failure.Body) {
 			// resolved.masked maps authID -> maskKey(apiKey), which is the
 			// same MaskedKey stored in accountsCache.results. Using
@@ -278,6 +284,19 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			resolved := getResolved()
 			if mk, ok := resolved.masked[r.AuthID]; ok && mk != "" {
 				markAccountExhausted(mk)
+			}
+			model := strings.TrimSpace(r.Alias)
+			if model == "" {
+				model = r.Model
+			}
+			rawKey, ok := resolved.raw[r.AuthID]
+			if ok {
+				now := store.Now()
+				for _, otherAuthID := range resolved.rawToAuthIDs[rawKey] {
+					if otherAuthID != r.AuthID {
+						store.DisableGlobal(otherAuthID, model, now)
+					}
+				}
 			}
 		}
 		return okEnvelope(struct{}{})
@@ -330,83 +349,6 @@ func configure(raw []byte) error {
 	store.SetProviderOrderFetcher(func() map[string][]string {
 		return fetchProviderOrderCached(cfg.HostBaseURL, cfg.ManagementKey, cfg.Providers)
 	})
-	// Inject the proxy toggler: a non-empty proxyURL sets the global upstream
-	// proxy via PUT /v0/management/proxy-url; an empty string clears it via
-	// DELETE. Uses the plugin's own net/http client (not host.http.do) so the
-	// management call is never routed through the proxy it just enabled.
-	store.SetProxyToggler(func(proxyURL string) error {
-		c := currentConfig()
-		if c == nil {
-			return fmt.Errorf("no config")
-		}
-		endpoint := strings.TrimRight(c.HostBaseURL, "/") + "/v0/management/proxy-url"
-		if proxyURL != "" {
-			payload := strings.NewReader(fmt.Sprintf(`{"value":%q}`, proxyURL))
-			req, err := http.NewRequest(http.MethodPut, endpoint, payload)
-			if err != nil {
-				return err
-			}
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("Authorization", "Bearer "+c.ManagementKey)
-			resp, err := resolveHTTPClient.Do(req)
-			if err != nil {
-				return err
-			}
-			resp.Body.Close()
-			if resp.StatusCode >= 300 {
-				return fmt.Errorf("management API PUT proxy-url returned %d", resp.StatusCode)
-			}
-		} else {
-			req, err := http.NewRequest(http.MethodDelete, endpoint, nil)
-			if err != nil {
-				return err
-			}
-			req.Header.Set("Authorization", "Bearer "+c.ManagementKey)
-			resp, err := resolveHTTPClient.Do(req)
-			if err != nil {
-				return err
-			}
-			resp.Body.Close()
-			if resp.StatusCode >= 300 {
-				return fmt.Errorf("management API DELETE proxy-url returned %d", resp.StatusCode)
-			}
-		}
-		return nil
-	})
-	// Inject the proxy URL getter: reads the current global proxy URL via
-	// GET /v0/management/proxy-url so the plugin can save and later restore
-	// the host's original proxy when toggling its own.
-	store.SetProxyURLGetter(func() (string, error) {
-		c := currentConfig()
-		if c == nil {
-			return "", fmt.Errorf("no config")
-		}
-		endpoint := strings.TrimRight(c.HostBaseURL, "/") + "/v0/management/proxy-url"
-		req, err := http.NewRequest(http.MethodGet, endpoint, nil)
-		if err != nil {
-			return "", err
-		}
-		req.Header.Set("Authorization", "Bearer "+c.ManagementKey)
-		resp, err := resolveHTTPClient.Do(req)
-		if err != nil {
-			return "", err
-		}
-		defer resp.Body.Close()
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return "", err
-		}
-		if resp.StatusCode >= 300 {
-			return "", fmt.Errorf("management API GET proxy-url returned %d", resp.StatusCode)
-		}
-		var result struct {
-			ProxyURL string `json:"proxy-url"`
-		}
-		if err := json.Unmarshal(body, &result); err != nil {
-			return "", err
-		}
-		return strings.TrimSpace(result.ProxyURL), nil
-	})
 	// Inject the midnight auto sign-in function: at the daily boundary
 	// (PruneAll dayChanged), iterate all resolved auth IDs, call
 	// /api/v1/users/login/info for each (activates daily magic cube),
@@ -427,7 +369,7 @@ func configure(raw []byte) error {
 
 		var swg sync.WaitGroup
 		sem := make(chan struct{}, 20)
-		for _, authID := range resolved.orderedAuthIDs {
+		for _, authID := range resolved.dedupedAuthIDs {
 			sessionID := resolved.raw[authID]
 			sb := resolved.siteBase[authID]
 			aid := authID
@@ -435,15 +377,15 @@ func configure(raw []byte) error {
 			sbCopy := sb
 			swg.Add(1)
 			sem <- struct{}{}
-		go func() {
-			defer swg.Done()
-			defer func() { <-sem }()
-			defer func() {
-				if rec := recover(); rec != nil {
-					log.Printf("modelscope-ratelimit: recovered panic in sign-in worker: %v", rec)
-				}
-			}()
-			sc, _, err := mc.getWithRetry(sbCopy, "/api/v1/users/login/info", sid)
+			go func() {
+				defer swg.Done()
+				defer func() { <-sem }()
+				defer func() {
+					if rec := recover(); rec != nil {
+						log.Printf("modelscope-ratelimit: recovered panic in sign-in worker: %v", rec)
+					}
+				}()
+				sc, _, err := mc.getWithRetry(sbCopy, "/api/v1/users/login/info", sid)
 				if err != nil || sc != 200 {
 					return
 				}
@@ -453,8 +395,14 @@ func configure(raw []byte) error {
 				var bErr, rlErr error
 				var bWg sync.WaitGroup
 				bWg.Add(2)
-				go func() { defer bWg.Done(); bSc, bRaw, bErr = mc.getWithRetry(sbCopy, "/openapi/v1/magicubes/balance", sid) }()
-				go func() { defer bWg.Done(); rlSc, rlRaw, rlErr = mc.getWithRetry(sbCopy, "/api/v1/inference/rate-limit", sid) }()
+				go func() {
+					defer bWg.Done()
+					bSc, bRaw, bErr = mc.getWithRetry(sbCopy, "/openapi/v1/magicubes/balance", sid)
+				}()
+				go func() {
+					defer bWg.Done()
+					rlSc, rlRaw, rlErr = mc.getWithRetry(sbCopy, "/api/v1/inference/rate-limit", sid)
+				}()
 				bWg.Wait()
 				if bErr == nil && bSc == 200 {
 					var b modelscope.MagicCubeBalance
@@ -474,20 +422,20 @@ func configure(raw []byte) error {
 		// Refresh the accounts cache so the first page load is instant.
 		// Use forceBackgroundRefresh to avoid racing with an in-progress refresh.
 		go func() {
-				if !forceBackgroundRefresh() {
-					return
+			if !forceBackgroundRefresh() {
+				return
+			}
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("modelscope-ratelimit: recovered panic in midnight refresh: %v", rec)
 				}
-				defer func() {
-					if rec := recover(); rec != nil {
-						log.Printf("modelscope-ratelimit: recovered panic in midnight refresh: %v", rec)
-					}
-					markRefreshDone()
-				}()
-				refreshMu.Lock()
-				defer refreshMu.Unlock()
-				refreshAccountsCache(getResolved())
+				markRefreshDone()
 			}()
-		})
+			refreshMu.Lock()
+			defer refreshMu.Unlock()
+			refreshAccountsCache(getResolved())
+		}()
+	})
 	cfgMu.Lock()
 	pluginCfg = cfg
 	cfgMu.Unlock()
@@ -500,13 +448,6 @@ func configure(raw []byte) error {
 	strategyMu.Lock()
 	strategyCache = strategyEntry{}
 	strategyMu.Unlock()
-	// If the proxy feature was removed in this reload (proxy_url now empty)
-	// but the proxy is still active from the previous config, proactively
-	// restore the host's original proxy now. Must run after pluginCfg is set
-	// so the toggler closure uses the fresh management endpoint.
-	if cfg.ProxyURL == "" {
-		store.DisableProxyOnReconfigure()
-	}
 	// 10s after startup: fetch login/info (daily sign-in) + balance for all
 	// accounts so the management page has data ready before first access.
 	// After this, refreshes only fetch balance + rate-limit (no login/info).
@@ -718,49 +659,142 @@ func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string
 	return masked, raw, siteBase, orderedAuthIDs, providerOrder, realTotal, unmatched, nil
 }
 
-func resolveKeysCached(baseURL, mgmtKey string, providers []string) (map[string]string, map[string][]string, int, []string, error) {
-	resolvedMu.Lock()
-	c := resolvedCache
-	resolvedMu.Unlock()
-	if !c.at.IsZero() {
-		ttl := resolvedCacheTTL
-		if c.err != nil {
-			ttl = resolvedErrTTL
-		}
-		if c.at.Add(ttl).After(time.Now()) {
-			return c.masked, c.providerOrder, c.realTotal, c.unmatched, c.err
-		}
+// resolveRefreshMu guards resolveRefreshing, the singleflight flag that
+// deduplicates concurrent resolveKeys calls so a cache miss under load fires
+// at most one management-API request. The scheduler hot path is non-blocking
+// (fetchProviderOrderCached); only the management page / midnight sign-in use
+// the synchronous resolveKeysCached.
+var (
+	resolveRefreshMu  sync.Mutex
+	resolveRefreshing bool
+)
+
+// resolvedExpired reports whether the cached entry is past its TTL. Error
+// entries use a longer backoff TTL to avoid hammering the management API on
+// auth failures.
+func resolvedExpired(c resolvedEntry) bool {
+	if c.at.IsZero() {
+		return true
 	}
+	ttl := resolvedCacheTTL
+	if c.err != nil {
+		ttl = resolvedErrTTL
+	}
+	return c.at.Add(ttl).Before(time.Now())
+}
+
+// performResolve does the management-API fetch and stores the result,
+// returning the fresh entry. Shared by the sync (resolveKeysCached) and async
+// (startResolveRefresh) paths so the store logic lives in one place.
+func performResolve(baseURL, mgmtKey string, providers []string) resolvedEntry {
 	masked, raw, siteBase, orderedAuthIDs, providerOrder, realTotal, unmatched, err := resolveKeys(baseURL, mgmtKey, providers)
-	// Build O(1) maskedKey -> raw key lookup
-	maskToRaw := make(map[string]string, len(raw))
-	maskToSite := make(map[string]string, len(raw))
-	for authID, sid := range raw {
+	dedupedAuthIDs, rawToAuthIDs, maskToRaw, maskToSite := buildDedupMaps(orderedAuthIDs, raw, siteBase)
+	refreshed := resolvedEntry{masked: masked, raw: raw, maskToRaw: maskToRaw, maskToSite: maskToSite, siteBase: siteBase, orderedAuthIDs: orderedAuthIDs, dedupedAuthIDs: dedupedAuthIDs, rawToAuthIDs: rawToAuthIDs, providerOrder: providerOrder, realTotal: realTotal, unmatched: unmatched, err: err, at: time.Now()}
+	resolvedMu.Lock()
+	resolvedCache = refreshed
+	resolvedMu.Unlock()
+	return refreshed
+}
+
+// startResolveRefresh launches a singleflight background refresh if one is not
+// already running. Used by the scheduler hot path: it never blocks the caller,
+// which returns stale (or nil) data immediately and lets the async refresh
+// warm the cache for subsequent picks.
+func startResolveRefresh(baseURL, mgmtKey string, providers []string) {
+	resolveRefreshMu.Lock()
+	if resolveRefreshing {
+		resolveRefreshMu.Unlock()
+		return
+	}
+	resolveRefreshing = true
+	resolveRefreshMu.Unlock()
+	go func() {
+		defer func() {
+			resolveRefreshMu.Lock()
+			resolveRefreshing = false
+			resolveRefreshMu.Unlock()
+		}()
+		performResolve(baseURL, mgmtKey, providers)
+	}()
+}
+
+func resolveKeysCached(baseURL, mgmtKey string, providers []string) (map[string]string, map[string][]string, int, []string, error) {
+	c := getResolved()
+	if !resolvedExpired(c) {
+		return c.masked, c.providerOrder, c.realTotal, c.unmatched, c.err
+	}
+	// Singleflight: only one caller performs the HTTP fetch; concurrent
+	// callers get the (possibly stale) cached entry instead of firing
+	// duplicate management-API requests.
+	resolveRefreshMu.Lock()
+	if resolveRefreshing {
+		resolveRefreshMu.Unlock()
+		return c.masked, c.providerOrder, c.realTotal, c.unmatched, c.err
+	}
+	resolveRefreshing = true
+	resolveRefreshMu.Unlock()
+	defer func() {
+		resolveRefreshMu.Lock()
+		resolveRefreshing = false
+		resolveRefreshMu.Unlock()
+	}()
+	c = performResolve(baseURL, mgmtKey, providers)
+	return c.masked, c.providerOrder, c.realTotal, c.unmatched, c.err
+}
+
+// buildDedupMaps constructs the deduplication and lookup maps from the
+// resolved key data. It is extracted as a pure function so it can be
+// unit-tested without HTTP. When the same raw API key appears in multiple
+// providers (different auth IDs), only the first occurrence (first provider in
+// config order) is kept in dedupedAuthIDs / maskToRaw / maskToSite, while
+// rawToAuthIDs groups every auth ID that shares the raw key for disable
+// propagation.
+func buildDedupMaps(orderedAuthIDs []string, raw map[string]string, siteBase map[string]string) (dedupedAuthIDs []string, rawToAuthIDs map[string][]string, maskToRaw map[string]string, maskToSite map[string]string) {
+	maskToRaw = make(map[string]string, len(raw))
+	maskToSite = make(map[string]string, len(raw))
+	rawToAuthIDs = make(map[string][]string, len(raw))
+	seenKeys := make(map[string]bool, len(raw))
+	dedupedAuthIDs = make([]string, 0, len(orderedAuthIDs))
+	for _, authID := range orderedAuthIDs {
+		sid := raw[authID]
+		rawToAuthIDs[sid] = append(rawToAuthIDs[sid], authID)
+		if seenKeys[sid] {
+			continue
+		}
+		seenKeys[sid] = true
+		dedupedAuthIDs = append(dedupedAuthIDs, authID)
 		mk := maskKey(sid)
 		maskToRaw[mk] = sid
 		maskToSite[mk] = siteBase[authID]
 	}
-	resolvedMu.Lock()
-	resolvedCache = resolvedEntry{masked: masked, raw: raw, maskToRaw: maskToRaw, maskToSite: maskToSite, siteBase: siteBase, orderedAuthIDs: orderedAuthIDs, providerOrder: providerOrder, realTotal: realTotal, unmatched: unmatched, err: err, at: time.Now()}
-	resolvedMu.Unlock()
-	return masked, providerOrder, realTotal, unmatched, err
+	return dedupedAuthIDs, rawToAuthIDs, maskToRaw, maskToSite
 }
 
-// getResolved returns the cached resolved entry (raw keys + site base URLs).
-func getResolved() *resolvedEntry {
+// getResolved returns a value copy of the cached resolved entry. The maps are
+// immutable after construction, so copying the struct is cheap and prevents a
+// caller from reading fields of a racing global replacement.
+func getResolved() resolvedEntry {
 	resolvedMu.Lock()
 	defer resolvedMu.Unlock()
-	return &resolvedCache
+	return resolvedCache
 }
 
-// fetchProviderOrderCached returns a map from provider name to auth IDs in
-// config.yaml api-key order (including keys that may currently be disabled).
-// The scheduler uses this to index the round-robin cursor into the FULL
-// config-ordered list, so that 429 retries and disabled keys don't corrupt
-// the rotation order. Cached alongside resolveKeysCached.
+// fetchProviderOrderCached is the scheduler.hot-path reader for the per-
+// provider config-ordered auth-ID list (including keys that may currently be
+// disabled). The scheduler indexes the round-robin cursor into this FULL list
+// so 429 retries and disabled keys don't corrupt the rotation order.
+//
+// It is NON-BLOCKING: it returns the cached list immediately (stale entries
+// are fine for key ordering) and only triggers a singleflight async refresh
+// when the cache is expired. On a cold cache it returns nil so pickManaged
+// falls back to its observed-order snapshot — a request never stalls on a
+// management-API HTTP call.
 func fetchProviderOrderCached(baseURL, mgmtKey string, providers []string) map[string][]string {
-	_, m, _, _, _ := resolveKeysCached(baseURL, mgmtKey, providers)
-	return m
+	c := getResolved()
+	if resolvedExpired(c) {
+		startResolveRefresh(baseURL, mgmtKey, providers)
+	}
+	return c.providerOrder // nil when cold/error; stale otherwise
 }
 
 // fetchHostStrategy queries GET /v0/management/routing/strategy and returns
@@ -792,18 +826,60 @@ func fetchHostStrategy(baseURL, mgmtKey string) string {
 	}
 }
 
+// strategyRefreshMu guards strategyRefreshing, the singleflight flag for
+// background strategy refreshes so the fallback path never fires concurrent
+// management-API requests.
+var (
+	strategyRefreshMu  sync.Mutex
+	strategyRefreshing bool
+)
+
+// strategyExpired reports whether the cached strategy is past its TTL.
+func strategyExpired(c strategyEntry) bool {
+	if c.at.IsZero() {
+		return true
+	}
+	return c.at.Add(strategyCacheTTL).Before(time.Now())
+}
+
+// startStrategyRefresh launches a singleflight background strategy refresh if
+// one is not already running. Non-blocking: callers return the stale/default
+// strategy immediately.
+func startStrategyRefresh(baseURL, mgmtKey string) {
+	strategyRefreshMu.Lock()
+	if strategyRefreshing {
+		strategyRefreshMu.Unlock()
+		return
+	}
+	strategyRefreshing = true
+	strategyRefreshMu.Unlock()
+	go func() {
+		defer func() {
+			strategyRefreshMu.Lock()
+			strategyRefreshing = false
+			strategyRefreshMu.Unlock()
+		}()
+		v := fetchHostStrategy(baseURL, mgmtKey)
+		strategyMu.Lock()
+		strategyCache = strategyEntry{strategy: v, at: time.Now()}
+		strategyMu.Unlock()
+	}()
+}
+
 func fetchHostStrategyCached(baseURL, mgmtKey string) string {
 	strategyMu.Lock()
 	c := strategyCache
 	strategyMu.Unlock()
-	if !c.at.IsZero() && c.at.Add(strategyCacheTTL).After(time.Now()) {
+	if !strategyExpired(c) {
 		return c.strategy
 	}
-	v := fetchHostStrategy(baseURL, mgmtKey)
-	strategyMu.Lock()
-	strategyCache = strategyEntry{strategy: v, at: time.Now()}
-	strategyMu.Unlock()
-	return v
+	// Non-blocking: trigger an async refresh and return stale-or-default so
+	// the scheduler.pick fallback path never stalls on a management-API call.
+	startStrategyRefresh(baseURL, mgmtKey)
+	if c.strategy != "" {
+		return c.strategy
+	}
+	return "round-robin"
 }
 
 // pluginRegistration builds the plugin.register result: metadata, config
@@ -817,17 +893,16 @@ func pluginRegistration() any {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             "modelscope-ratelimit",
-			Version:          "2.2.1",
+			Version:          "2.2.2",
 			Author:           "k452b",
 			GitHubRepository: "https://github.com/bytehola/modelscope-ratelimit",
 			ConfigFields: []pluginapi.ConfigField{
-				{Name: "providers", Type: pluginapi.ConfigFieldTypeArray, Description: "监控的提供商名称（必填）。填入顺序决定优先级：先填入的组额度耗尽之后，才能依次使用后面的"},
-				{Name: "skip_provider_on_429", Type: pluginapi.ConfigFieldTypeBoolean, Description: "开启后，一旦 429，立马使用非modelscope模型重试，避免因429限流等待时间过久。默认 false。"},
+				{Name: "providers", Type: pluginapi.ConfigFieldTypeArray, Description: "监控的提供商名称（必填）。填入顺序决定轮换顺序：skip_provider_on_429 关闭时，单次请求内 429 后切下一个 provider，任意 200 后下一次请求回到第一个 provider；只有 key 在各 provider 内跨请求轮换。"},
+				{Name: "skip_provider_on_429", Type: pluginapi.ConfigFieldTypeBoolean, Description: "关闭时（默认）：429+insufficient_quota 单次请求内切下一个 provider + 全局退避冷却，任意 200 回到第一个 provider；开启时：429 后直接用非托管模型兜底。"},
 				{Name: "host_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "CPA 链接地址，默认 http://127.0.0.1:8317。"},
 				{Name: "management_key", Type: pluginapi.ConfigFieldTypeString, Description: "CPA 管理密钥。（必填）"},
 				{Name: "credential_strategy", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"round-robin", "fill-first"}, Description: "凭据选择策略（仅对监控的 provider 生效）：round-robin=轮询（默认），fill-first=填充优先"},
-				{Name: "insufficient_quota_cooldown", Type: pluginapi.ConfigFieldTypeNumber, Description: "冷却基准秒数（支持小数），默认 0.1。连续失败指数退避×2递增，封顶 60 秒。"},
-				{Name: "proxy_url", Type: pluginapi.ConfigFieldTypeString, Description: "代理 URL（选填，留空=不启用）。只有在 429 时才会开启，成功后关闭。格式：socks5://user:pass@host:port"},
+				{Name: "insufficient_quota_cooldown", Type: pluginapi.ConfigFieldTypeNumber, Description: "冷却基准秒数（支持小数），默认 0.1。连续失败指数退避×2递增，封顶 60 秒，无抖动。设为 0 完全跳过冷却（429 后立即轮换，不阻塞）。"},
 				{Name: "timezone", Type: pluginapi.ConfigFieldTypeString, Description: "每日 00:00 重置所用时区，默认 Asia/Shanghai。（留空即可）"},
 				{Name: "ms_proxy_url", Type: pluginapi.ConfigFieldTypeString, Description: "调试用：Modelscope API 代理地址（如 http://127.0.0.1:8888），留空=直连。"},
 			},
@@ -930,7 +1005,7 @@ func statusOrGuidance() string {
 //   - providers or management_key missing -> guidance (fill them via 编辑配置)
 //   - resolution fails (wrong key / host)  -> guidance (fix management_key / host_base_url)
 //   - configured providers not upstream    -> guidance (providers setting wrong)
-//   - otherwise                            -> full status page (masked keys + remaining + per-model summary)
+//   - otherwise                            -> full status page (masked keys, magic balance, usage and account status)
 //
 // Key resolution runs server-side via direct net/http, so the management key
 // never reaches the browser and the page is immune to browser same-origin /
@@ -971,7 +1046,7 @@ func handleManagement(r managementRequest) managementResponse {
 // concurrent refreshes (e.g. the 10s startup goroutine). If another refresh
 // is already running, waits for it and returns the cache; otherwise acquires
 // refreshMu and does the fetch.
-func syncFetchAccounts(resolved *resolvedEntry) managementResponse {
+func syncFetchAccounts(resolved resolvedEntry) managementResponse {
 	if forceBackgroundRefresh() {
 		defer markRefreshDone()
 		refreshMu.Lock()
@@ -1112,14 +1187,14 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 			ok  bool
 			sc  int
 		}
-	var (
-			cmu sync.Mutex
-			cwg sync.WaitGroup
-			cout = make([]checkinResult, 0, len(resolved.raw))
+		var (
+			cmu  sync.Mutex
+			cwg  sync.WaitGroup
+			cout = make([]checkinResult, 0, len(resolved.dedupedAuthIDs))
 			csem = make(chan struct{}, 20)
 		)
 		ci := 0
-		for _, authID := range resolved.orderedAuthIDs {
+		for _, authID := range resolved.dedupedAuthIDs {
 			sessionID := resolved.raw[authID]
 			sb := resolved.siteBase[authID]
 			i := ci
@@ -1186,34 +1261,40 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 			bwg         sync.WaitGroup
 		)
 		bwg.Add(2)
-		go func() { defer bwg.Done(); bSc, bRaw, bErr = mc.getWithRetry(sb, "/openapi/v1/magicubes/balance", sessionID) }()
-		go func() { defer bwg.Done(); txSc, txRaw, txErr = mc.getWithRetry(sb, "/openapi/v1/magicubes/transactions?page=1&page_size=50", sessionID) }()
+		go func() {
+			defer bwg.Done()
+			bSc, bRaw, bErr = mc.getWithRetry(sb, "/openapi/v1/magicubes/balance", sessionID)
+		}()
+		go func() {
+			defer bwg.Done()
+			txSc, txRaw, txErr = mc.getWithRetry(sb, "/openapi/v1/magicubes/transactions?page=1&page_size=50", sessionID)
+		}()
 		bwg.Wait()
-	result := map[string]any{"balance": nil, "todayConsumed": 0, "records": []any{}}
-	if bErr == nil && bSc == 200 {
-		var b modelscope.MagicCubeBalance
-		if json.Unmarshal(bRaw, &b) == nil {
-			result["balance"] = map[string]any{"total": b.TotalBalance, "available": b.AvailableBalance, "frozen": b.FrozenAmount}
-			// Update the accounts cache so the next ?api=accounts
-			// reflects the real balance (fixes markAccountExhausted
-			// having set available=0 / schedule=exhausted).
-			accountsCacheMu.Lock()
-			for i := range accountsCache.results {
-				if accountsCache.results[i].MaskedKey == mk {
-					accountsCache.results[i].Balance = &balanceJSON{
-						Total: b.TotalBalance, Available: b.AvailableBalance, Frozen: b.FrozenAmount,
+		result := map[string]any{"balance": nil, "todayConsumed": 0, "records": []any{}}
+		if bErr == nil && bSc == 200 {
+			var b modelscope.MagicCubeBalance
+			if json.Unmarshal(bRaw, &b) == nil {
+				result["balance"] = map[string]any{"total": b.TotalBalance, "available": b.AvailableBalance, "frozen": b.FrozenAmount}
+				// Update the accounts cache so the next ?api=accounts
+				// reflects the real balance (fixes markAccountExhausted
+				// having set available=0 / schedule=exhausted).
+				accountsCacheMu.Lock()
+				for i := range accountsCache.results {
+					if accountsCache.results[i].MaskedKey == mk {
+						accountsCache.results[i].Balance = &balanceJSON{
+							Total: b.TotalBalance, Available: b.AvailableBalance, Frozen: b.FrozenAmount,
+						}
+						if b.AvailableBalance <= 0 {
+							accountsCache.results[i].Schedule = "exhausted"
+						} else {
+							accountsCache.results[i].Schedule = "normal"
+						}
+						break
 					}
-					if b.AvailableBalance <= 0 {
-						accountsCache.results[i].Schedule = "exhausted"
-					} else {
-						accountsCache.results[i].Schedule = "normal"
-					}
-					break
 				}
+				accountsCacheMu.Unlock()
 			}
-			accountsCacheMu.Unlock()
 		}
-	}
 		if txErr == nil && txSc == 200 {
 			var tx modelscope.TransactionsResp
 			if json.Unmarshal(txRaw, &tx) == nil {
@@ -1251,12 +1332,12 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 	case "stats":
 		cdCount, cdWait := store.CooldownStats()
 		return mgmtJSON(map[string]any{
-			"successCount":  store.SuccessStats(),
+			"successCount":   store.SuccessStats(),
 			"rateLimitCount": store.RateLimitCount(),
-			"cooldownCount": cdCount,
-			"cooldownWait":  cdWait.Seconds(),
-			"totalKeys":     len(resolved.raw),
-			"modelUsage":    store.ModelUsageStats(),
+			"cooldownCount":  cdCount,
+			"cooldownWait":   cdWait.Seconds(),
+			"totalKeys":      len(resolved.raw),
+			"modelUsage":     store.ModelUsageStats(),
 		})
 	}
 	return mgmtJSONError(404, "unknown api: "+api)
@@ -1283,7 +1364,7 @@ func getQueryInt(r managementRequest, key string) int {
 
 // getKeysByMask finds the raw session ID and site base by masked key (last 12 chars).
 // O(1) lookup using pre-built maskToRaw + maskToSite maps.
-func getKeysByMask(r *resolvedEntry, maskedKey string) (string, string) {
+func getKeysByMask(r resolvedEntry, maskedKey string) (string, string) {
 	return r.maskToRaw[maskedKey], r.maskToSite[maskedKey]
 }
 

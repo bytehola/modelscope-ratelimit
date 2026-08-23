@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/url"
-	"math/rand"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
-	"strings"
 	"time"
 
 	"modelscope-ratelimit/internal/ratelimit"
@@ -61,7 +61,7 @@ func SetMSProxy(proxyURL string) {
 		return
 	}
 	msHTTPClient.Store(&http.Client{
-		Timeout: 15 * time.Second,
+		Timeout:   15 * time.Second,
 		Transport: newMSTransport(http.ProxyURL(u)),
 	})
 }
@@ -167,23 +167,23 @@ func (c *msClient) rateLimitFetcher(siteBase string) ratelimit.RateLimitFetcher 
 // ---- Management API endpoints (served to frontend XHR) ----
 
 type accountSummary struct {
-	Index       int     `json:"index"`
-	MaskedKey   string  `json:"maskedKey"`
-	Phone       string  `json:"phone,omitempty"`
-	Site        string  `json:"site"`
-	Name        string  `json:"name"`
-	NickName    string  `json:"nickName"`
-	Email       string  `json:"email"`
-	HavanaID    string  `json:"havanaId"`
-	FromSite    string  `json:"fromSite"`
-	IsRealName  bool    `json:"isRealName"`
-	CheckedIn   bool    `json:"checkedIn"`
-	LastCheckIn string  `json:"lastCheckIn"`
-	Balance     *balanceJSON `json:"balance"`
-	UsagePerDay int     `json:"usagePerDay"`
-	TodayConsumed int     `json:"todayConsumed"`
-	Schedule    string  `json:"schedule"`
-	Error       string  `json:"error,omitempty"`
+	Index         int          `json:"index"`
+	MaskedKey     string       `json:"maskedKey"`
+	Phone         string       `json:"phone,omitempty"`
+	Site          string       `json:"site"`
+	Name          string       `json:"name"`
+	NickName      string       `json:"nickName"`
+	Email         string       `json:"email"`
+	HavanaID      string       `json:"havanaId"`
+	FromSite      string       `json:"fromSite"`
+	IsRealName    bool         `json:"isRealName"`
+	CheckedIn     bool         `json:"checkedIn"`
+	LastCheckIn   string       `json:"lastCheckIn"`
+	Balance       *balanceJSON `json:"balance"`
+	UsagePerDay   int          `json:"usagePerDay"`
+	TodayConsumed int          `json:"todayConsumed"`
+	Schedule      string       `json:"schedule"`
+	Error         string       `json:"error,omitempty"`
 }
 
 type balanceJSON struct {
@@ -193,25 +193,25 @@ type balanceJSON struct {
 }
 
 type detailJSON struct {
-	Index       int        `json:"index"`
-	Name        string     `json:"name"`
-	NickName    string     `json:"nickName"`
-	Email       string     `json:"email"`
-	Phone       string     `json:"phone"`
-	HavanaID    string     `json:"havanaId"`
-	FromSite    string     `json:"fromSite"`
-	IsRealName  bool       `json:"isRealName"`
-	Org         string     `json:"org"`
-	School      string     `json:"school"`
-	Industry    string     `json:"industry"`
-	UsagePerDay int        `json:"usagePerDay"`
-	TodayConsumed int     `json:"todayConsumed"`
-	SdkToken    string     `json:"sdkToken"`
-	AliyunBound bool       `json:"aliyunBound"`
-	AliyunAID   string     `json:"aliyunAid"`
-	AliyunNick  string     `json:"aliyunNick"`
-	Site        string     `json:"site"`
-	Tokens      []tokenJSON `json:"tokens"`
+	Index         int         `json:"index"`
+	Name          string      `json:"name"`
+	NickName      string      `json:"nickName"`
+	Email         string      `json:"email"`
+	Phone         string      `json:"phone"`
+	HavanaID      string      `json:"havanaId"`
+	FromSite      string      `json:"fromSite"`
+	IsRealName    bool        `json:"isRealName"`
+	Org           string      `json:"org"`
+	School        string      `json:"school"`
+	Industry      string      `json:"industry"`
+	UsagePerDay   int         `json:"usagePerDay"`
+	TodayConsumed int         `json:"todayConsumed"`
+	SdkToken      string      `json:"sdkToken"`
+	AliyunBound   bool        `json:"aliyunBound"`
+	AliyunAID     string      `json:"aliyunAid"`
+	AliyunNick    string      `json:"aliyunNick"`
+	Site          string      `json:"site"`
+	Tokens        []tokenJSON `json:"tokens"`
 }
 
 type tokenJSON struct {
@@ -231,10 +231,10 @@ func (c *msClient) fetchLoginInfo(idx int, sessionID, siteBase, site string) acc
 
 	// login/info + users/info — concurrent
 	var (
-		liSc, uiSc     int
-		liRaw, uiRaw   []byte
-		liErr, uiErr   error
-		wg1            sync.WaitGroup
+		liSc, uiSc   int
+		liRaw, uiRaw []byte
+		liErr, uiErr error
+		wg1          sync.WaitGroup
 	)
 	wg1.Add(2)
 	go func() {
@@ -257,7 +257,7 @@ func (c *msClient) fetchLoginInfo(idx int, sessionID, siteBase, site string) acc
 			a.FromSite = li.FromSite
 			a.IsRealName = li.IsRealName
 			a.CheckedIn = true
-		a.LastCheckIn = time.Now().Format("2006-01-02 15:04:05")
+			a.LastCheckIn = time.Now().Format("2006-01-02 15:04:05")
 		}
 	} else if liSc == 401 || liSc == 403 {
 		a.Schedule = "unauthorized"
@@ -275,16 +275,16 @@ func (c *msClient) fetchLoginInfo(idx int, sessionID, siteBase, site string) acc
 
 	return a
 }
- 
+
 // fetchBalanceData fetches balance + rate-limit + transactions concurrently
 // for a single account. Called in phase 2 after ALL accounts have completed
 // login/info (sign-in) so balance reflects the updated magic cube quota.
 func (c *msClient) fetchBalanceData(a *accountSummary, sessionID, siteBase string) {
 	var (
-		bSc, rlSc, txSc int
+		bSc, rlSc, txSc    int
 		bRaw, rlRaw, txRaw []byte
 		bErr, rlErr, txErr error
-		wg sync.WaitGroup
+		wg                 sync.WaitGroup
 	)
 	wg.Add(3)
 	go func() {
@@ -300,7 +300,7 @@ func (c *msClient) fetchBalanceData(a *accountSummary, sessionID, siteBase strin
 		txSc, txRaw, txErr = c.getWithRetry(siteBase, "/openapi/v1/magicubes/transactions?type=SPEND_CONFIRM&page=1&page_size=50", sessionID)
 	}()
 	wg.Wait()
- 
+
 	// Process balance
 	if bErr == nil && bSc == 200 {
 		var b ratelimit.MagicCubeBalance
@@ -357,17 +357,18 @@ const accountsCacheTTL = 30 * time.Minute
 
 type accountsCacheEntry struct {
 	results        []accountSummary
-	orderedAuthIDs []string
+	dedupedAuthIDs []string
 	siteBase       map[string]string
 	raw            map[string]string
 	at             time.Time
 }
 
 var (
-	accountsCacheMu     sync.Mutex
-	accountsCache       accountsCacheEntry
-	refreshInProgress   bool // prevents duplicate background refresh
+	accountsCacheMu   sync.Mutex
+	accountsCache     accountsCacheEntry
+	refreshInProgress bool // prevents duplicate background refresh
 )
+
 // fetchAccountBalanceOnly fetches only balance + rate-limit (no login/info, no transactions).
 // Used for cache refresh after first load. Profile data (name, email, etc.) is preserved
 // from the existing cache.
@@ -424,14 +425,14 @@ func (c *msClient) fetchAccountBalanceOnly(idx int, sessionID, siteBase, site st
 
 // refreshAccountsCache fetches fresh data for all accounts concurrently
 // and updates the cache. Returns the fresh results.
-func refreshAccountsCache(resolved *resolvedEntry) []accountSummary {
+func refreshAccountsCache(resolved resolvedEntry) []accountSummary {
 	mc := &msClient{}
 	// Check if we have existing cached data (refresh vs first load)
 	// Deep-copy the slice under the lock so concurrent markAccountExhausted
 	// writes can't race with the lock-free traversal below.
 	accountsCacheMu.Lock()
 	existing := accountsCache.results
-	isRefresh := existing != nil && len(existing) == len(resolved.orderedAuthIDs)
+	isRefresh := existing != nil && len(existing) == len(resolved.dedupedAuthIDs)
 	// Build a lookup by maskedKey under the lock so the same underlying
 	// array is not read outside the critical section.
 	existingByMask := make(map[string]*accountSummary, len(existing))
@@ -453,7 +454,7 @@ func refreshAccountsCache(resolved *resolvedEntry) []accountSummary {
 		sem = make(chan struct{}, 20)
 	)
 	idx := 0
-	for _, authID := range resolved.orderedAuthIDs {
+	for _, authID := range resolved.dedupedAuthIDs {
 		sessionID := resolved.raw[authID]
 		sb := resolved.siteBase[authID]
 		site := "cn"
@@ -526,7 +527,7 @@ func refreshAccountsCache(resolved *resolvedEntry) []accountSummary {
 		}
 		wg2.Wait()
 	}
- 
+
 	// Enrich phone from detail cache for accounts missing it
 	for i := range results {
 		if results[i].Phone == "" {
@@ -536,7 +537,7 @@ func refreshAccountsCache(resolved *resolvedEntry) []accountSummary {
 		}
 	}
 	accountsCacheMu.Lock()
-	accountsCache = accountsCacheEntry{results: results, orderedAuthIDs: resolved.orderedAuthIDs, siteBase: resolved.siteBase, raw: resolved.raw, at: time.Now()}
+	accountsCache = accountsCacheEntry{results: results, dedupedAuthIDs: resolved.dedupedAuthIDs, siteBase: resolved.siteBase, raw: resolved.raw, at: time.Now()}
 	accountsCacheMu.Unlock()
 	return results
 }
@@ -571,11 +572,14 @@ func markAccountExhausted(maskedKey string) {
 	for i := range accountsCache.results {
 		if accountsCache.results[i].MaskedKey == maskedKey {
 			accountsCache.results[i].Schedule = "exhausted"
+			// Replace the Balance pointer instead of mutating it in place, so
+			// a concurrent refresh that copied the struct (and may hold the
+			// old pointer) is not raced on the Available field.
+			total := 0
 			if accountsCache.results[i].Balance != nil {
-				accountsCache.results[i].Balance.Available = 0
-			} else {
-				accountsCache.results[i].Balance = &balanceJSON{Total: 0, Available: 0, Frozen: 0}
+				total = accountsCache.results[i].Balance.Total
 			}
+			accountsCache.results[i].Balance = &balanceJSON{Total: total, Available: 0, Frozen: 0}
 			break
 		}
 	}
@@ -604,9 +608,9 @@ func (c *msClient) fetchAccountDetailConcurrent(idx int, sessionID, siteBase, si
 
 	var (
 		bcMu, tlMu sync.Mutex
-		bc  ratelimit.BindingCheck
-		tl  ratelimit.SDKTokenList
-		wg  sync.WaitGroup
+		bc         ratelimit.BindingCheck
+		tl         ratelimit.SDKTokenList
+		wg         sync.WaitGroup
 	)
 
 	// binding/check
@@ -682,47 +686,9 @@ func clearDetailCache() {
 	detailCacheMu.Unlock()
 }
 
-// ---- Transactions cache (per "idx:page:pageSize", 60s TTL) ----
-
-type txCacheEntry struct {
-	data json.RawMessage
-	at   time.Time
-}
-
-var (
-	txCacheMu sync.Mutex
-	txCache   = make(map[string]txCacheEntry)
-)
-
-const txCacheTTL = 60 * time.Second
-
-func getCachedTx(key string) (json.RawMessage, bool) {
-	txCacheMu.Lock()
-	defer txCacheMu.Unlock()
-	if e, ok := txCache[key]; ok && time.Since(e.at) < txCacheTTL {
-		return e.data, true
-	}
-	// Evict expired entry to prevent unbounded growth.
-	delete(txCache, key)
-	return nil, false
-}
-
-func setCachedTx(key string, data json.RawMessage) {
-	txCacheMu.Lock()
-	txCache[key] = txCacheEntry{data: data, at: time.Now()}
-	txCacheMu.Unlock()
-}
-
-func clearTxCache() {
-	txCacheMu.Lock()
-	txCache = make(map[string]txCacheEntry)
-	txCacheMu.Unlock()
-}
-
 func clearAllCaches() {
 	clearAccountsCache()
 	clearDetailCache()
-	clearTxCache()
 }
 
 // shouldBackgroundRefresh returns true if a background refresh should be started.
@@ -739,7 +705,7 @@ func shouldBackgroundRefresh() bool {
 	refreshInProgress = true
 	return true
 }
- 
+
 // forceBackgroundRefresh starts a background refresh if one is not already
 // running, regardless of cache TTL. Returns true if a new refresh was started.
 func forceBackgroundRefresh() bool {
@@ -764,25 +730,6 @@ func getStaleAccountsCache() []accountSummary {
 	accountsCacheMu.Lock()
 	defer accountsCacheMu.Unlock()
 	return accountsCache.results
-}
-
-// isAccountsCacheExpired reports whether the cache is older than accountsCacheTTL.
-func isAccountsCacheExpired() bool {
-	accountsCacheMu.Lock()
-	defer accountsCacheMu.Unlock()
-	return !accountsCache.at.IsZero() && time.Since(accountsCache.at) >= accountsCacheTTL
-}
-
-// getAccountsCacheTime returns the timestamp when the cache was populated.
-// getAccountsCacheSnapshot returns the orderedAuthIDs + raw + siteBase snapshot
-// from when the accounts cache was built, ensuring idx consistency.
-func getAccountsCacheSnapshot() ([]string, map[string]string, map[string]string) {
-	accountsCacheMu.Lock()
-	defer accountsCacheMu.Unlock()
-	if accountsCache.orderedAuthIDs == nil {
-		return nil, nil, nil
-	}
-	return accountsCache.orderedAuthIDs, accountsCache.raw, accountsCache.siteBase
 }
 
 func getAccountsCacheTime() string {

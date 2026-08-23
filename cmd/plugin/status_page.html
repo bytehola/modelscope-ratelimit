@@ -1007,7 +1007,7 @@
         color: #86868b;
       "
     >
-      Modelscope 限流管理后台插件 v2.2.1 · 构建于 2026-08-16 17:58:39 CST
+      Modelscope 限流管理后台插件 v2.2.2 · 构建于 2026-08-22 00:21:26 CST
     </div>
     <div class="toast" id="toast"></div>
     <script>
@@ -1194,7 +1194,9 @@
           '</div><div class="sub-v">含短期+长期魔粒</div></div>' +
           '<div class="card"><div class="k">今日已消耗</div><div class="v orange">' +
           consumed.toLocaleString() +
-          '</div><div class="sub-v">平台累计数据</div></div>' +
+          '</div><div class="sub-v">平台累计数据 · 更新于 ' +
+          lastRefreshTime +
+          '</div></div>' +
           '<div class="card"><div class="k">今日签到账号</div><div class="v blue">' +
           checkedCount +
           '</div><div class="sub-v">共 ' +

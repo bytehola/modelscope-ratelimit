@@ -1,24 +1,32 @@
-// Package ratelimit implements the Modelscope per-key, per-model and global
-// daily rate-limit control for CLIProxyAPI.
+// Package ratelimit implements the Modelscope account-level magic-cube
+// rate-limit control for CLIProxyAPI.
 //
 // The package is intentionally free of any CLIProxyAPI SDK import so that the
 // state machine, the daily 00:00 reset, the round-robin scheduler and the
-// response-header parsing can be unit-tested in isolation. The thin SDK glue
-// in cmd/plugin wires these helpers to the documented plugin hooks
+// response analysis can be unit-tested in isolation. The thin SDK glue in
+// cmd/plugin wires these helpers to the documented plugin hooks
 // (scheduler.pick, response.intercept_after, response.intercept_stream_chunk
 // and usage.handle).
 //
-// Business rules (see docs/cn/plugin):
+// Business rules:
 //
-//   - Parse the Modelscope rate-limit response headers:
-//     Modelscope-Ratelimit-Model-Requests-Remaining  (per-model remaining)
-//     Modelscope-Ratelimit-Requests-Remaining        (total remaining)
-//   - When the per-model remaining is exhausted, disable only the current
-//     model for the owning key for the rest of the day.
-//   - When the total remaining is exhausted, disable the key globally (all
-//     models) for the rest of the day.
-//   - At 00:00 in the configured timezone the disable state is cleared and
-//     the key (and its models) become eligible again.
-//   - During scheduling, disabled key/model pairs are skipped and the request
-//     is routed to the next available account instead of failing.
+//   - 429 + "insufficient balance" (magic cube exhausted): the key is
+//     globally disabled for the rest of the day.
+//   - 429 + "insufficient_quota" (shared pool rate window): a global
+//     exponential-backoff cooldown blocks ALL managed scheduling for a short
+//     interval (base seconds, doubling per consecutive failure, capped at 60).
+//   - 401 Unauthorized: the key is globally disabled until plugin restart
+//     (does NOT reset at midnight).
+//   - At 00:00 in the configured timezone the daily disable state is cleared
+//     and the key becomes eligible again.
+//   - During scheduling, disabled keys are skipped and the request is routed
+//     to the next available account instead of failing.
+//   - When skip_provider_on_429 is OFF, a 429+insufficient_quota advances a
+//     within-request cross-provider cursor so the host's retry picks the next
+//     managed provider; any 200 resets that cursor to 0 so the next request
+//     always starts from the first provider. Each provider keeps its own key
+//     cursor, which keeps rotating across requests.
+//   - When skip_provider_on_429 is ON, the 429'd provider is added to a
+//     latching skip set so the next pick falls through to non-managed
+//     providers until any 200 clears the set.
 package ratelimit

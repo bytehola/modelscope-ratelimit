@@ -136,3 +136,33 @@ func TestFloatCooldownLevelDoubles(t *testing.T) {
 		t.Fatalf("after reset round 1: want 100ms, got %s", w)
 	}
 }
+
+// TestFloatCooldownZeroSkips verifies that setting the base to 0 disables
+// insufficient_quota cooldowns completely: no per-key wait and no cooldown
+// statistic increment. Provider/key rotation should continue without sleeps.
+func TestFloatCooldownZeroSkips(t *testing.T) {
+	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
+	s, _ := newTestStore(now)
+	cfg := cfgWith("modelscope", "modelscope-ai")
+	cfg.InsufficientQuotaCooldown = 0
+	cfg.SkipProviderOn429 = false
+	s.Reconfigure(cfg)
+
+	s.OnUsage(UsageRecord{
+		AuthID: "auth-1", Provider: "modelscope", Model: "Qwen-72B", Alias: "Qwen-72B",
+		Failed: true, Failure: &UsageFailure{StatusCode: 429, Body: `{"error":{"code":"insufficient_quota"}}`},
+	})
+
+	if w := s.cooldownWaitDuration(now); w != 0 {
+		t.Fatalf("cooldown base 0 must skip the wait, got %s", w)
+	}
+	if count, _ := s.CooldownStats(); count != 0 {
+		t.Fatalf("cooldown base 0 must not increment cooldown stats, got %d", count)
+	}
+
+	// The insufficient_quota 429 still advances the within-request provider
+	// cursor even when cooldown itself is disabled.
+	if got := s.managedProviderStart(len(cfg.Providers)); got != 1 {
+		t.Fatalf("429 with cooldown=0 must still advance provider cursor, got %d", got)
+	}
+}

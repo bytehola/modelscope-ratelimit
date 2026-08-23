@@ -14,7 +14,6 @@ func nextMidnight(now time.Time, loc *time.Location) time.Time {
 	return time.Date(y, m, d+1, 0, 0, 0, 0, loc)
 }
 
-
 type GuidanceReason int
 
 const (
@@ -31,12 +30,6 @@ const (
 // RenderGuidanceHTML renders the configuration guide. It always directs the
 // operator to the management center's "插件管理 → 编辑配置" instead of
 // hand-editing config.yaml. detail carries an extra hint (the resolution
-// error, or the comma-joined unmatched provider list). The page auto-refreshes
-// every 15s so it transitions to the status page once the config is fixed and
-// the plugin is reloaded (reconfigure clears the resolution cache).
-// RenderGuidanceHTML renders the Apple-style configuration guide. It always
-// directs the operator to the management center's "插件管理 → 编辑配置" instead
-// of hand-editing config.yaml. detail carries an extra hint (the resolution
 // error, or the comma-joined unmatched provider list). The page auto-refreshes
 // every 15s so it transitions to the status page once the config is fixed and
 // the plugin is reloaded (reconfigure clears the resolution cache).
