@@ -90,17 +90,18 @@ func TestProviderKeyRotationNoSkip(t *testing.T) {
 		fprovider string
 	}
 	steps := []step{
-		// First response cycle.
+		// skip OFF: exhaust m first (4 keys), then a, then y
 		{wantID: "m-1", exclude: nil, failed: true, fprovider: "modelscope"},
-		{wantID: "a-1", exclude: []string{"m-1"}, failed: true, fprovider: "modelscope-ai"},
-		{wantID: "y-1", exclude: []string{"m-1", "a-1"}, failed: true, fprovider: "modelscope-my"},
-		{wantID: "m-2", exclude: []string{"m-1", "a-1", "y-1"}, failed: false, fprovider: "modelscope"},
-		// Second response cycle.
-		{wantID: "m-3", exclude: nil, failed: true, fprovider: "modelscope"},
-		{wantID: "a-2", exclude: []string{"m-3"}, failed: true, fprovider: "modelscope-ai"},
-		{wantID: "y-2", exclude: []string{"m-3", "a-2"}, failed: true, fprovider: "modelscope-my"},
-		{wantID: "m-4", exclude: []string{"m-3", "a-2", "y-2"}, failed: true, fprovider: "modelscope"},
-		{wantID: "a-3", exclude: []string{"m-3", "a-2", "y-2", "m-4"}, failed: false, fprovider: "modelscope-ai"},
+		{wantID: "m-2", exclude: []string{"m-1"}, failed: true, fprovider: "modelscope"},
+		{wantID: "m-3", exclude: []string{"m-1", "m-2"}, failed: true, fprovider: "modelscope"},
+		{wantID: "m-4", exclude: []string{"m-1", "m-2", "m-3"}, failed: false, fprovider: "modelscope"},
+		// 200 reset; next request starts at m again (key cursor continues)
+		{wantID: "m-1", exclude: nil, failed: true, fprovider: "modelscope"},
+		{wantID: "m-2", exclude: []string{"m-1"}, failed: true, fprovider: "modelscope"},
+		{wantID: "m-3", exclude: []string{"m-1", "m-2"}, failed: true, fprovider: "modelscope"},
+		{wantID: "m-4", exclude: []string{"m-1", "m-2", "m-3"}, failed: true, fprovider: "modelscope"},
+		// m exhausted -> a
+		{wantID: "a-1", exclude: []string{"m-1", "m-2", "m-3", "m-4"}, failed: false, fprovider: "modelscope-ai"},
 	}
 	for i, st := range steps {
 		req := mkReq(allCands(st.exclude...)...)
@@ -161,20 +162,20 @@ func TestProviderRotationResetsOnSuccess(t *testing.T) {
 		Candidate{ID: "a-1", Provider: "modelscope-ai", Priority: 1},
 		Candidate{ID: "a-2", Provider: "modelscope-ai", Priority: 1},
 	))
-	if err != nil || r2.AuthID != "a-1" {
-		t.Fatalf("2nd pick: want a-1 (cursor advanced to ai), got %+v err=%v", r2, err)
+	if err != nil || r2.AuthID != "m-2" {
+		t.Fatalf("2nd pick: want m-2 (exhaust m keys first), got %+v err=%v", r2, err)
 	}
 
 	// ai#1 200 -> cursor resets to 0; next request starts at ms (not ai).
 	s.OnUsage(UsageRecord{AuthID: "a-1", Provider: "modelscope-ai", Model: "Qwen-72B", Alias: "Qwen-72B"})
-	// Request 2: cursor reset -> ms#2 (ms key cursor advanced past m-1).
+	// Request 2: cursor reset -> ms#1 (ms key cursor wrapped around).
 	r3, err := s.SchedulerPick(mkReq(
 		Candidate{ID: "m-1", Provider: "modelscope", Priority: 1},
 		Candidate{ID: "m-2", Provider: "modelscope", Priority: 1},
 		Candidate{ID: "a-1", Provider: "modelscope-ai", Priority: 1},
 	))
-	if err != nil || r3.AuthID != "m-2" {
-		t.Fatalf("3rd pick after 200: want m-2 (reset to first provider), got %+v err=%v", r3, err)
+	if err != nil || r3.AuthID != "m-1" {
+		t.Fatalf("3rd pick after 200: want m-1 (key cursor wrapped), got %+v err=%v", r3, err)
 	}
 }
 
@@ -248,28 +249,44 @@ func TestProviderKeyRotationResetsOnSuccess_UserExample(t *testing.T) {
 		t.Fatalf("r1#1: want m-1, got %s", id)
 	}
 	usage429("m-1", "modelscope")
-	if id := pick("m-1"); id != "a-1" {
-		t.Fatalf("r1#2: want a-1, got %s", id)
-	}
-	usage429("a-1", "modelscope-ai")
-	if id := pick("m-1", "a-1"); id != "y-1" {
-		t.Fatalf("r1#3: want y-1, got %s", id)
-	}
-	usage200("y-1", "modelscope-my")
-
-	// 第二轮
-	if id := pick(); id != "m-2" {
-		t.Fatalf("r2#1: want m-2, got %s", id)
+	if id := pick("m-1"); id != "m-2" {
+		t.Fatalf("r1#2: want m-2, got %s", id)
 	}
 	usage429("m-2", "modelscope")
-	if id := pick("m-2"); id != "a-2" {
-		t.Fatalf("r2#2: want a-2, got %s", id)
+	if id := pick("m-1", "m-2"); id != "m-3" {
+		t.Fatalf("r1#3: want m-3, got %s", id)
+	}
+	usage429("m-3", "modelscope")
+	if id := pick("m-1", "m-2", "m-3"); id != "a-1" {
+		t.Fatalf("r1#4: want a-1 (m exhausted), got %s", id)
+	}
+	usage429("a-1", "modelscope-ai")
+	if id := pick("m-1", "m-2", "m-3", "a-1"); id != "a-2" {
+		t.Fatalf("r1#5: want a-2, got %s", id)
+	}
+	usage200("a-2", "modelscope-ai")
+
+	// 第二轮
+	if id := pick(); id != "m-1" {
+		t.Fatalf("r2#1: want m-1, got %s", id)
+	}
+	usage429("m-1", "modelscope")
+	if id := pick("m-1"); id != "m-2" {
+		t.Fatalf("r2#2: want m-2, got %s", id)
+	}
+	usage429("m-2", "modelscope")
+	if id := pick("m-1", "m-2"); id != "m-3" {
+		t.Fatalf("r2#3: want m-3, got %s", id)
+	}
+	usage429("m-3", "modelscope")
+	if id := pick("m-1", "m-2", "m-3"); id != "a-3" {
+		t.Fatalf("r2#4: want a-3 (m exhausted, ai cursor advanced from a-1), got %s", id)
 	}
 	usage200("a-2", "modelscope-ai")
 
 	// 第三轮
-	if id := pick(); id != "m-3" {
-		t.Fatalf("r3#1: want m-3, got %s", id)
+	if id := pick(); id != "m-1" {
+		t.Fatalf("r3#1: want m-1, got %s", id)
 	}
-	usage200("m-3", "modelscope")
+	usage200("m-1", "modelscope")
 }

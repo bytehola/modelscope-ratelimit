@@ -6,13 +6,14 @@
 ![CLIProxyAPI](https://img.shields.io/badge/CLIProxyAPI-v7.2.51+-blue)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
 ![Build](https://img.shields.io/badge/build-c--shared-black)
-![Version](https://img.shields.io/badge/version-2.2.2-green)
+![Version](https://img.shields.io/badge/version-2.3.1-green)
 
 ## 核心特性
 
 - 🔴 **限额账号禁用**：余额耗尽禁用该 key，次日 00:00（按配置时区）自动恢复，调度跳过禁用凭据。
 - 🔁 **凭据轮换**：支持 `round-robin` / `fill-first`。每次请求从第一个 provider 开始，429 切下一个 provider，200 后下一请求回到第一个 provider；key 在各 provider 内跨请求轮换。
 - ⚡ **skip_provider_on_429 兜底**：开启后 429 立即用非托管模型重试，避免等待，推荐打开。
+- 🧪 **use_responses 透传**：开启后将 OpenAI Responses API 请求透传到上游 /v1/responses，并复用现有限流/key 轮换；默认关闭。
 - 🎲 **自动签到 + 魔粒监控**：每日 00:00 签到领取魔粒，定时拉取余额与消费流水。
 - 📊 **状态页**：管理中心查看掩码 key、余额、消耗，5 秒刷新；管理密钥不渲染。
 
@@ -64,6 +65,7 @@ plugins:
       priority: 10
       providers: ["modelscope"]
       skip_provider_on_429: false # 推荐 true
+      use_responses: false # 开启后 Responses API 请求透传到上游 /v1/responses
       host_base_url: "http://127.0.0.1:8317"
       management_key: "your-management-secret"
       credential_strategy: "round-robin" # round-robin | fill-first

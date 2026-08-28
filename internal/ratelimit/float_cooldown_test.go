@@ -160,9 +160,10 @@ func TestFloatCooldownZeroSkips(t *testing.T) {
 		t.Fatalf("cooldown base 0 must not increment cooldown stats, got %d", count)
 	}
 
-	// The insufficient_quota 429 still advances the within-request provider
-	// cursor even when cooldown itself is disabled.
-	if got := s.managedProviderStart(len(cfg.Providers)); got != 1 {
-		t.Fatalf("429 with cooldown=0 must still advance provider cursor, got %d", got)
+	// With the unified rotation logic, a 429 does NOT advance the provider
+	// cursor. The cursor stays at 0; keys are exhausted within the same
+	// provider before moving to the next.
+	if got := s.managedProviderStart(len(cfg.Providers)); got != 0 {
+		t.Fatalf("429 with cooldown=0 must NOT advance provider cursor, got %d", got)
 	}
 }

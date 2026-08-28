@@ -106,6 +106,10 @@ import (
 // stderr logger; wire host.log in if your SDK exposes a convenient bridge.
 var store = modelscope.NewStore(stderrLogger{})
 
+const pluginVersion = "2.3.1"
+
+var pluginHost *C.cliproxy_host_api
+
 //go:embed status_page.html
 var statusPageHTML []byte
 
@@ -141,14 +145,16 @@ type strategyEntry struct {
 
 type resolvedEntry struct {
 	masked         map[string]string
-	raw            map[string]string   // authID -> raw API key (m_session_id cookie value)
-	maskToRaw      map[string]string   // maskedKey -> raw API key (O(1) lookup)
-	maskToSite     map[string]string   // maskedKey -> site base URL (O(1) lookup)
-	siteBase       map[string]string   // authID -> Modelscope site base URL (cn/ai)
-	orderedAuthIDs []string            // stable iteration order (deterministic idx)
-	dedupedAuthIDs []string            // one auth ID per raw API key (first in config order)
-	rawToAuthIDs   map[string][]string // raw API key -> auth IDs sharing this account
-	providerOrder  map[string][]string // provider name -> auth IDs in config.yaml api-key order
+	raw            map[string]string            // authID -> raw API key (m_session_id cookie value)
+	maskToRaw      map[string]string            // maskedKey -> raw API key (O(1) lookup)
+	maskToSite     map[string]string            // maskedKey -> site base URL (O(1) lookup)
+	siteBase       map[string]string            // authID -> Modelscope site base URL (cn/ai)
+	baseURL        map[string]string            // authID -> upstream OpenAI-compatible base URL
+	aliasToName    map[string]map[string]string // provider name -> client alias -> upstream model name
+	orderedAuthIDs []string                     // stable iteration order (deterministic idx)
+	dedupedAuthIDs []string                     // one auth ID per raw API key (first in config order)
+	rawToAuthIDs   map[string][]string          // raw API key -> auth IDs sharing this account
+	providerOrder  map[string][]string          // provider name -> auth IDs in config.yaml api-key order
 	realTotal      int
 	unmatched      []string // configured providers not found upstream
 	err            error
@@ -163,17 +169,13 @@ func main() {}
 
 //export cliproxy_plugin_init
 func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
-	// The host parameter carries host.* callback function pointers. We do not
-	// use host callbacks: the plugin is a c-shared library with its own Go
-	// runtime, so a panic inside a host callback would cross the runtime
-	// boundary and be unrecoverable, fusing the plugin (502 on the auto-
-	// refreshing status page). Key resolution talks directly to the local
-	// management API via net/http instead (see httpDo). The host param is
-	// accepted only to satisfy the init ABI.
-	_ = host
 	if plugin == nil {
 		return 1
 	}
+	// Store host.* callback pointers for executor HTTP/streaming. Management
+	// API key resolution still uses net/http direct (see httpDo) to avoid
+	// cgo panics on the status-page auto-refresh path.
+	pluginHost = C.cliproxy_copy_host(host)
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
@@ -237,6 +239,50 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			return nil, err
 		}
 		return okEnvelope(pluginRegistration())
+
+	case pluginabi.MethodModelRoute:
+		var r pluginapi.ModelRouteRequest
+		if err := json.Unmarshal(request, &r); err != nil {
+			return nil, err
+		}
+		return okEnvelope(routeResponsesRequest(r))
+
+	case pluginabi.MethodExecutorIdentifier:
+		return okEnvelope(struct {
+			Identifier string `json:"identifier"`
+		}{Identifier: "modelscope-ratelimit"})
+
+	case pluginabi.MethodExecutorExecute:
+		var r executorRequestWithCallback
+		if err := json.Unmarshal(request, &r); err != nil {
+			return nil, err
+		}
+		resp, err := executeResponsesPassthrough(r)
+		if err != nil {
+			return nil, err
+		}
+		return okEnvelope(resp)
+
+	case pluginabi.MethodExecutorExecuteStream:
+		var r executorRequestWithCallback
+		if err := json.Unmarshal(request, &r); err != nil {
+			return nil, err
+		}
+		resp, err := executeResponsesPassthroughStream(r)
+		if err != nil {
+			return nil, err
+		}
+		// Async streaming: return headers only; chunks are pushed via
+		// host.stream.emit using the stream_id from the request.
+		return okEnvelope(struct {
+			Headers http.Header `json:"headers,omitempty"`
+		}{Headers: resp.Headers})
+
+	case pluginabi.MethodExecutorCountTokens:
+		return okEnvelope(pluginapi.ExecutorResponse{Payload: []byte(`{"total_tokens":0}`)})
+
+	case pluginabi.MethodExecutorHTTPRequest:
+		return errorEnvelope("not_implemented", "executor.http_request is not supported"), nil
 
 	case pluginabi.MethodSchedulerPick:
 		var r modelscope.SchedulerPickRequest
@@ -536,6 +582,10 @@ type mgmtOpenAICompatEntry struct {
 		APIKey   string `json:"api-key"`
 		ProxyURL string `json:"proxy-url"`
 	} `json:"api-key-entries"`
+	Models []struct {
+		Name  string `json:"name"`
+		Alias string `json:"alias"`
+	} `json:"models"`
 }
 
 // stableIDGen replicates the host's synthesizer.StableIDGenerator exactly,
@@ -583,24 +633,24 @@ func (g *stableIDGen) Next(kind string, parts ...string) string {
 // each api-key with stableIDGen (the host's StableIDGenerator algorithm), so
 // no auth-files join is needed (auth-files omits config-based api-keys). The
 // management key stays server-side; nothing sensitive reaches the browser.
-func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string]string, raw map[string]string, siteBase map[string]string, orderedAuthIDs []string, providerOrder map[string][]string, realTotal int, unmatched []string, err error) {
+func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string]string, raw map[string]string, siteBase map[string]string, orderedAuthIDs []string, providerOrder map[string][]string, realTotal int, unmatched []string, baseURLs map[string]string, aliasToName map[string]map[string]string, err error) {
 	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if base == "" {
-		return nil, nil, nil, nil, nil, 0, nil, errors.New("host_base_url is empty")
+		return nil, nil, nil, nil, nil, 0, nil, nil, nil, errors.New("host_base_url is empty")
 	}
 
 	sc, body, err := httpDo("GET", base+"/v0/management/openai-compatibility", mgmtKey)
 	if err != nil {
-		return nil, nil, nil, nil, nil, 0, nil, err
+		return nil, nil, nil, nil, nil, 0, nil, nil, nil, err
 	}
 	if sc != 200 {
-		return nil, nil, nil, nil, nil, 0, nil, fmt.Errorf("openai-compatibility: HTTP %d", sc)
+		return nil, nil, nil, nil, nil, 0, nil, nil, nil, fmt.Errorf("openai-compatibility: HTTP %d", sc)
 	}
 	var oc struct {
 		List []mgmtOpenAICompatEntry `json:"openai-compatibility"`
 	}
 	if err := json.Unmarshal(body, &oc); err != nil {
-		return nil, nil, nil, nil, nil, 0, nil, fmt.Errorf("decode openai-compatibility: %w", err)
+		return nil, nil, nil, nil, nil, 0, nil, nil, nil, fmt.Errorf("decode openai-compatibility: %w", err)
 	}
 
 	want := make(map[string]bool, len(providers))
@@ -613,6 +663,8 @@ func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string
 	masked = make(map[string]string)
 	raw = make(map[string]string)
 	siteBase = make(map[string]string)
+	baseURLs = make(map[string]string)
+	aliasToName = make(map[string]map[string]string)
 	orderedAuthIDs = make([]string, 0)
 	providerOrder = make(map[string][]string)
 	realTotal = 0
@@ -621,6 +673,9 @@ func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string
 	for _, e := range oc.List {
 		nm := strings.ToLower(strings.TrimSpace(e.Name))
 		if len(want) > 0 && !want[nm] {
+			// Non-managed provider: not collected. The Responses executor
+			// only tries managed providers; non-managed providers are served
+			// by the host's built-in path (host.model.execute) via chat.
 			continue
 		}
 		matched[nm] = true
@@ -645,9 +700,17 @@ func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string
 			masked[authID] = maskKey(k.APIKey)
 			raw[authID] = k.APIKey
 			siteBase[authID] = siteBaseFromURL(e.BaseURL)
+			baseURLs[authID] = e.BaseURL
 			orderedAuthIDs = append(orderedAuthIDs, authID)
 			providerOrder[nm] = append(providerOrder[nm], authID)
 		}
+		providerModels := make(map[string]string)
+		for _, m := range e.Models {
+			if m.Alias != "" && m.Name != "" {
+				providerModels[strings.TrimSpace(m.Alias)] = strings.TrimSpace(m.Name)
+			}
+		}
+		aliasToName[nm] = providerModels
 	}
 
 	// Configured providers that no upstream openai-compatibility entry matches.
@@ -656,7 +719,7 @@ func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string
 			unmatched = append(unmatched, p)
 		}
 	}
-	return masked, raw, siteBase, orderedAuthIDs, providerOrder, realTotal, unmatched, nil
+	return masked, raw, siteBase, orderedAuthIDs, providerOrder, realTotal, unmatched, baseURLs, aliasToName, nil
 }
 
 // resolveRefreshMu guards resolveRefreshing, the singleflight flag that
@@ -687,9 +750,9 @@ func resolvedExpired(c resolvedEntry) bool {
 // returning the fresh entry. Shared by the sync (resolveKeysCached) and async
 // (startResolveRefresh) paths so the store logic lives in one place.
 func performResolve(baseURL, mgmtKey string, providers []string) resolvedEntry {
-	masked, raw, siteBase, orderedAuthIDs, providerOrder, realTotal, unmatched, err := resolveKeys(baseURL, mgmtKey, providers)
+	masked, raw, siteBase, orderedAuthIDs, providerOrder, realTotal, unmatched, baseURLs, aliasToName, err := resolveKeys(baseURL, mgmtKey, providers)
 	dedupedAuthIDs, rawToAuthIDs, maskToRaw, maskToSite := buildDedupMaps(orderedAuthIDs, raw, siteBase)
-	refreshed := resolvedEntry{masked: masked, raw: raw, maskToRaw: maskToRaw, maskToSite: maskToSite, siteBase: siteBase, orderedAuthIDs: orderedAuthIDs, dedupedAuthIDs: dedupedAuthIDs, rawToAuthIDs: rawToAuthIDs, providerOrder: providerOrder, realTotal: realTotal, unmatched: unmatched, err: err, at: time.Now()}
+	refreshed := resolvedEntry{masked: masked, raw: raw, maskToRaw: maskToRaw, maskToSite: maskToSite, siteBase: siteBase, baseURL: baseURLs, aliasToName: aliasToName, orderedAuthIDs: orderedAuthIDs, dedupedAuthIDs: dedupedAuthIDs, rawToAuthIDs: rawToAuthIDs, providerOrder: providerOrder, realTotal: realTotal, unmatched: unmatched, err: err, at: time.Now()}
 	resolvedMu.Lock()
 	resolvedCache = refreshed
 	resolvedMu.Unlock()
@@ -893,12 +956,13 @@ func pluginRegistration() any {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             "modelscope-ratelimit",
-			Version:          "2.2.2",
+			Version:          pluginVersion,
 			Author:           "k452b",
 			GitHubRepository: "https://github.com/bytehola/modelscope-ratelimit",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "providers", Type: pluginapi.ConfigFieldTypeArray, Description: "监控的提供商名称（必填）。填入顺序决定轮换顺序：skip_provider_on_429 关闭时，单次请求内 429 后切下一个 provider，任意 200 后下一次请求回到第一个 provider；只有 key 在各 provider 内跨请求轮换。"},
 				{Name: "skip_provider_on_429", Type: pluginapi.ConfigFieldTypeBoolean, Description: "关闭时（默认）：429+insufficient_quota 单次请求内切下一个 provider + 全局退避冷却，任意 200 回到第一个 provider；开启时：429 后直接用非托管模型兜底。"},
+				{Name: "use_responses", Type: pluginapi.ConfigFieldTypeBoolean, Description: "开启后将 OpenAI Responses API 请求透传到上游 /v1/responses，并复用现有限流、禁用、统计与 key 轮换；默认关闭。"},
 				{Name: "host_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "CPA 链接地址，默认 http://127.0.0.1:8317。"},
 				{Name: "management_key", Type: pluginapi.ConfigFieldTypeString, Description: "CPA 管理密钥。（必填）"},
 				{Name: "credential_strategy", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"round-robin", "fill-first"}, Description: "凭据选择策略（仅对监控的 provider 生效）：round-robin=轮询（默认），fill-first=填充优先"},
@@ -913,16 +977,26 @@ func pluginRegistration() any {
 			ResponseStreamInterceptor: true,
 			UsagePlugin:               true,
 			ManagementAPI:             true,
+			ModelRouter:               true,
+			Executor:                  true,
+			ExecutorModelScope:        "both",
+			ExecutorInputFormats:      []string{"responses"},
+			ExecutorOutputFormats:     []string{"responses"},
 		},
 	}
 }
 
 type registrationCapabilities struct {
-	Scheduler                 bool `json:"scheduler"`
-	ResponseInterceptor       bool `json:"response_interceptor"`
-	ResponseStreamInterceptor bool `json:"response_stream_interceptor"`
-	UsagePlugin               bool `json:"usage_plugin"`
-	ManagementAPI             bool `json:"management_api"`
+	Scheduler                 bool     `json:"scheduler"`
+	ResponseInterceptor       bool     `json:"response_interceptor"`
+	ResponseStreamInterceptor bool     `json:"response_stream_interceptor"`
+	UsagePlugin               bool     `json:"usage_plugin"`
+	ManagementAPI             bool     `json:"management_api"`
+	ModelRouter               bool     `json:"model_router"`
+	Executor                  bool     `json:"executor"`
+	ExecutorModelScope        string   `json:"executor_model_scope"`
+	ExecutorInputFormats      []string `json:"executor_input_formats"`
+	ExecutorOutputFormats     []string `json:"executor_output_formats"`
 }
 
 // ---- Management API: one resource page showing the live disable list ----
@@ -1080,6 +1154,11 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 	}
 	mc := &msClient{}
 	switch api {
+	case "config":
+		return mgmtJSON(map[string]any{
+			"version":       pluginVersion,
+			"use_responses": cfg.UseResponses,
+		})
 	case "accounts":
 		refresh := getQuery(r, "refresh")
 		if refresh == "1" {
@@ -1423,4 +1502,938 @@ func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 	}
 	response.ptr = ptr
 	response.len = C.size_t(len(raw))
+}
+
+// ---- Responses passthrough executor ----
+
+// executorRequestWithCallback mirrors rpcExecutorRequest so the glue layer can
+// preserve host_callback_id (needed for host.http.* context) and stream_id
+// (needed for async host.stream.emit).
+type executorRequestWithCallback struct {
+	pluginapi.ExecutorRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+	StreamID       string `json:"stream_id,omitempty"`
+}
+
+// hostHTTPRequest is the wire shape expected by host.http.do.
+type hostHTTPRequest struct {
+	Method         string              `json:"method,omitempty"`
+	URL            string              `json:"url,omitempty"`
+	Headers        map[string][]string `json:"headers,omitempty"`
+	Body           []byte              `json:"body,omitempty"`
+	HostCallbackID string              `json:"host_callback_id,omitempty"`
+}
+
+// hostHTTPResponse mirrors pluginapi.HTTPResponse JSON shape.
+type hostHTTPResponse struct {
+	StatusCode int                 `json:"StatusCode"`
+	Headers    map[string][]string `json:"Headers,omitempty"`
+	Body       []byte              `json:"Body,omitempty"`
+}
+
+// hostHTTPStreamResponse mirrors rpcHostHTTPStreamResponse.
+type hostHTTPStreamResponse struct {
+	StatusCode int                 `json:"status_code"`
+	Headers    map[string][]string `json:"headers,omitempty"`
+	StreamID   string              `json:"stream_id,omitempty"`
+}
+
+// hostStreamReadResponse mirrors rpcHostHTTPStreamReadResponse.
+type hostStreamReadResponse struct {
+	Payload []byte `json:"payload,omitempty"`
+	Error   string `json:"error,omitempty"`
+	Done    bool   `json:"done,omitempty"`
+}
+
+// callHost invokes a host.* callback and returns the decoded result bytes.
+func callHost(method string, payload []byte) ([]byte, error) {
+	if pluginHost == nil {
+		return nil, errors.New("host callback API is unavailable")
+	}
+	cMethod := C.CString(method)
+	defer C.free(unsafe.Pointer(cMethod))
+	var req *C.uint8_t
+	if len(payload) > 0 {
+		req = (*C.uint8_t)(C.CBytes(payload))
+		defer C.free(unsafe.Pointer(req))
+	}
+	var resp C.cliproxy_buffer
+	if rc := C.cliproxy_call_host(pluginHost, cMethod, req, C.size_t(len(payload)), &resp); rc != 0 {
+		return nil, fmt.Errorf("host callback %s failed", method)
+	}
+	if resp.ptr == nil {
+		return nil, fmt.Errorf("host callback %s returned no data", method)
+	}
+	raw := C.GoBytes(resp.ptr, C.int(resp.len))
+	C.cliproxy_free_host(pluginHost, resp.ptr, resp.len)
+	var env pluginabi.Envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("decode host callback %s envelope: %w", method, err)
+	}
+	if !env.OK {
+		if env.Error != nil {
+			return nil, fmt.Errorf("host callback %s: %s", method, env.Error.Message)
+		}
+		return nil, fmt.Errorf("host callback %s returned ok:false", method)
+	}
+	return env.Result, nil
+}
+
+// hostHTTPDo performs a non-streaming upstream HTTP request through the host
+// transport/proxy/request-log policy.
+var hostHTTPDo = func(req pluginapi.HTTPRequest, callbackID string) (hostHTTPResponse, error) {
+	payload, err := json.Marshal(hostHTTPRequest{
+		Method:         req.Method,
+		URL:            req.URL,
+		Headers:        map[string][]string(req.Headers),
+		Body:           req.Body,
+		HostCallbackID: callbackID,
+	})
+	if err != nil {
+		return hostHTTPResponse{}, err
+	}
+	raw, err := callHost(pluginabi.MethodHostHTTPDo, payload)
+	if err != nil {
+		return hostHTTPResponse{}, err
+	}
+	var out hostHTTPResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return hostHTTPResponse{}, fmt.Errorf("decode host.http.do response: %w", err)
+	}
+	return out, nil
+}
+
+// hostHTTPDoStream performs a streaming upstream HTTP request through the host
+// transport policy and returns the host-managed stream id for later reads.
+var hostHTTPDoStream = func(req pluginapi.HTTPRequest, callbackID string) (hostHTTPStreamResponse, error) {
+	payload, err := json.Marshal(hostHTTPRequest{
+		Method:         req.Method,
+		URL:            req.URL,
+		Headers:        map[string][]string(req.Headers),
+		Body:           req.Body,
+		HostCallbackID: callbackID,
+	})
+	if err != nil {
+		return hostHTTPStreamResponse{}, err
+	}
+	raw, err := callHost(pluginabi.MethodHostHTTPDoStream, payload)
+	if err != nil {
+		return hostHTTPStreamResponse{}, err
+	}
+	var out hostHTTPStreamResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return hostHTTPStreamResponse{}, fmt.Errorf("decode host.http.do_stream response: %w", err)
+	}
+	if out.StreamID == "" {
+		return hostHTTPStreamResponse{}, errors.New("host.http.do_stream returned no stream_id")
+	}
+	return out, nil
+}
+
+// hostHTTPStreamRead reads one chunk from a host-managed HTTP stream.
+var hostHTTPStreamRead = func(streamID string) (hostStreamReadResponse, error) {
+	raw, err := callHost(pluginabi.MethodHostHTTPStreamRead, mustJSONMarshal(rpcHostHTTPStreamReadRequest{StreamID: streamID}))
+	if err != nil {
+		return hostStreamReadResponse{}, err
+	}
+	var out hostStreamReadResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return hostStreamReadResponse{}, fmt.Errorf("decode host.http.stream_read response: %w", err)
+	}
+	return out, nil
+}
+
+// hostHTTPStreamClose closes a host-managed HTTP stream.
+func hostHTTPStreamClose(streamID string) {
+	_, _ = callHost(pluginabi.MethodHostHTTPStreamClose, mustJSONMarshal(rpcHostHTTPStreamCloseRequest{StreamID: streamID}))
+}
+
+// hostStreamEmit pushes one executor stream chunk to the host stream bridge.
+func hostStreamEmit(streamID string, payload []byte, errMsg string) error {
+	_, err := callHost(pluginabi.MethodHostStreamEmit, mustJSONMarshal(rpcStreamEmitRequest{
+		StreamID: streamID,
+		Payload:  payload,
+		Error:    errMsg,
+	}))
+	return err
+}
+
+// hostStreamClose closes the executor stream bridge with an optional error.
+func hostStreamClose(streamID, errMsg string) {
+	_, _ = callHost(pluginabi.MethodHostStreamClose, mustJSONMarshal(rpcStreamCloseRequest{
+		StreamID: streamID,
+		Error:    errMsg,
+	}))
+}
+
+func mustJSONMarshal(v any) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+type rpcHostHTTPStreamReadRequest struct {
+	StreamID string `json:"stream_id"`
+}
+
+type rpcHostHTTPStreamCloseRequest struct {
+	StreamID string `json:"stream_id"`
+}
+
+type rpcStreamEmitRequest struct {
+	StreamID string `json:"stream_id"`
+	Payload  []byte `json:"payload,omitempty"`
+	Error    string `json:"error,omitempty"`
+}
+
+type rpcStreamCloseRequest struct {
+	StreamID string `json:"stream_id"`
+	Error    string `json:"error,omitempty"`
+}
+
+// rpcHostModelExecutionRequest mirrors the host glue layer's
+// rpcHostModelExecutionRequest: the embedded HostModelExecutionRequest plus
+// host_callback_id, so the host can resolve the caller context and set
+// SkipRouterPluginID/SkipInterceptorPluginID for non-recursive fallback.
+type rpcHostModelExecutionRequest struct {
+	pluginapi.HostModelExecutionRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+// routeResponsesRequest routes OpenAI Responses API requests to the plugin's
+// own executor so they can be forwarded to the upstream /v1/responses
+// endpoint. Chat Completions requests fall through to the host's normal
+// provider path (openai-compatibility /chat/completions).
+func routeResponsesRequest(req pluginapi.ModelRouteRequest) pluginapi.ModelRouteResponse {
+	cfg := currentConfig()
+	if cfg == nil || len(cfg.Providers) == 0 {
+		return pluginapi.ModelRouteResponse{Handled: false}
+	}
+	if !cfg.UseResponses {
+		return pluginapi.ModelRouteResponse{Handled: false}
+	}
+	switch strings.ToLower(strings.TrimSpace(req.SourceFormat)) {
+	case "openai-response", "responses", "codex":
+		return pluginapi.ModelRouteResponse{
+			Handled:    true,
+			TargetKind: pluginapi.ModelRouteTargetSelf,
+			Reason:     "responses-passthrough",
+		}
+	default:
+		return pluginapi.ModelRouteResponse{Handled: false}
+	}
+}
+
+func ensureResolved() resolvedEntry {
+	cfg := currentConfig()
+	if cfg == nil {
+		return getResolved()
+	}
+	c := getResolved()
+	if resolvedExpired(c) {
+		resolveKeysCached(cfg.HostBaseURL, cfg.ManagementKey, cfg.Providers)
+		c = getResolved()
+	}
+	return c
+}
+
+func managedCandidates(resolved resolvedEntry) []modelscope.Candidate {
+	cfg := currentConfig()
+	if cfg == nil || resolved.providerOrder == nil {
+		return nil
+	}
+	var out []modelscope.Candidate
+	for _, name := range cfg.Providers {
+		providerKey := strings.ToLower(strings.TrimSpace(name))
+		for _, authID := range resolved.providerOrder[providerKey] {
+			out = append(out, modelscope.Candidate{
+				ID:       authID,
+				Provider: "openai-compatible-" + name,
+				Priority: 1,
+				Status:   "available",
+			})
+		}
+	}
+	return out
+}
+
+func pickResponsesKey(req pluginapi.ExecutorRequest) (authID, apiKey, baseURL string, err error) {
+	resolved := ensureResolved()
+	if resolved.err != nil {
+		return "", "", "", fmt.Errorf("resolve keys: %w", resolved.err)
+	}
+	if len(resolved.raw) == 0 {
+		return "", "", "", errors.New("no openai-compatibility keys resolved")
+	}
+	cfg := currentConfig()
+	pickReq := modelscope.SchedulerPickRequest{
+		Provider:   cfg.Providers[0],
+		Providers:  cfg.Providers,
+		Model:      req.Model,
+		Stream:     req.Stream,
+		Candidates: managedCandidates(resolved),
+	}
+	resp, err := store.SchedulerPick(pickReq)
+	if err != nil {
+		return "", "", "", err
+	}
+	if !resp.Handled || resp.AuthID == "" {
+		return "", "", "", errors.New("scheduler returned no credential")
+	}
+	authID = resp.AuthID
+	apiKey = resolved.raw[authID]
+	baseURL = resolved.baseURL[authID]
+	if apiKey == "" || baseURL == "" {
+		return "", "", "", fmt.Errorf("credential %s missing key or base-url", authID)
+	}
+	return authID, apiKey, baseURL, nil
+}
+
+func usageRecordForFailure(authID string, req pluginapi.ExecutorRequest, statusCode int, body string, provider string, model string) modelscope.UsageRecord {
+	return modelscope.UsageRecord{
+		Provider: "openai-compatible-" + provider,
+		AuthID:   authID,
+		Model:    model,
+		Alias:    strings.TrimSpace(req.Model),
+		Failed:   true,
+		Failure:  &modelscope.UsageFailure{StatusCode: statusCode, Body: body},
+	}
+}
+
+func providerNameForAuth(authID string) string {
+	cfg := currentConfig()
+	if cfg == nil || len(cfg.Providers) == 0 {
+		return ""
+	}
+	resolved := getResolved()
+	for _, name := range cfg.Providers {
+		providerKey := strings.ToLower(strings.TrimSpace(name))
+		for _, id := range resolved.providerOrder[providerKey] {
+			if id == authID {
+				return name
+			}
+		}
+	}
+	return cfg.Providers[0]
+}
+
+func upstreamModelForAuth(authID string, req pluginapi.ExecutorRequest) string {
+	alias := strings.TrimSpace(req.Model)
+	provider := strings.ToLower(strings.TrimSpace(providerNameForAuth(authID)))
+	if provider == "" {
+		return alias
+	}
+	if resolved := getResolved(); resolved.aliasToName != nil {
+		if upstream, ok := resolved.aliasToName[provider][alias]; ok && upstream != "" {
+			return upstream
+		}
+	}
+	return alias
+}
+
+func withModel(body []byte, model string) []byte {
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil || obj == nil {
+		return body
+	}
+	obj["model"] = model
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+type retryStep struct {
+	provider string
+}
+
+type retryCandidate struct {
+	authID   string
+	provider string
+	apiKey   string
+	baseURL  string
+	model    string
+}
+
+// buildRetrySequence returns an ordered list of managed-provider steps.
+// Only managed providers are tried via the Responses passthrough executor;
+// each step calls Store.NextProviderKey to resolve the actual auth ID from the
+// per-provider cursor, so key order persists across requests. When all
+// managed providers are exhausted the executor defers to the host's built-in
+// path (host.model.execute) so non-managed providers serve the request through
+// the normal chat protocol with Responses<->Chat translation.
+//
+// skip ON: try one key per managed provider.
+// skip OFF: exhaust all keys per managed provider.
+func buildRetrySequence(resolved resolvedEntry, cfg *modelscope.Config) []retryStep {
+	var steps []retryStep
+	if cfg.SkipProviderOn429 {
+		for _, name := range cfg.Providers {
+			steps = append(steps, retryStep{provider: name})
+		}
+	} else {
+		for _, name := range cfg.Providers {
+			key := strings.ToLower(strings.TrimSpace(name))
+			for i := 0; i < len(resolved.providerOrder[key]); i++ {
+				steps = append(steps, retryStep{provider: name})
+			}
+		}
+	}
+	return steps
+}
+
+// resolveStep resolves the auth ID, API key, base URL, and upstream model
+// name for a managed-provider retry step using the per-provider cursor from
+// the Store, so key order persists across requests.
+func resolveStep(step retryStep, resolved resolvedEntry, alias string) (retryCandidate, bool) {
+	providerKey := strings.ToLower(strings.TrimSpace(step.provider))
+	ids := resolved.providerOrder[providerKey]
+	if len(ids) == 0 {
+		return retryCandidate{}, false
+	}
+	authID := store.NextProviderKey(step.provider, ids)
+	if authID == "" {
+		return retryCandidate{}, false
+	}
+	apiKey := resolved.raw[authID]
+	baseURL := resolved.baseURL[authID]
+	model := alias
+	if models := resolved.aliasToName[step.provider]; models != nil {
+		if upstream, ok := models[alias]; ok && upstream != "" {
+			model = upstream
+		}
+	}
+	return retryCandidate{
+		authID:   authID,
+		provider: step.provider,
+		apiKey:   apiKey,
+		baseURL:  baseURL,
+		model:    model,
+	}, true
+}
+
+func executeResponsesPassthrough(req executorRequestWithCallback) (pluginapi.ExecutorResponse, error) {
+	cfg := currentConfig()
+	resolved := ensureResolved()
+	steps := buildRetrySequence(resolved, cfg)
+	alias := strings.TrimSpace(req.Model)
+
+	originalBody := req.OriginalRequest
+	if len(originalBody) == 0 {
+		originalBody = req.Payload
+	}
+
+	for _, step := range steps {
+		cand, ok := resolveStep(step, resolved, alias)
+		if !ok {
+			continue
+		}
+		if store.IsKeyDisabled(cand.authID, cand.model, store.Now()) {
+			continue
+		}
+		upstreamBody := withModel(originalBody, cand.model)
+		upstreamReq := responsesUpstreamRequest(req.Headers, cand.apiKey, strings.TrimSuffix(cand.baseURL, "/")+"/responses", upstreamBody)
+		resp, errDo := hostHTTPDo(upstreamReq, req.HostCallbackID)
+		if errDo != nil {
+			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, errDo.Error(), cand.provider, cand.model))
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, resp.StatusCode, string(resp.Body), cand.provider, cand.model))
+			if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+				continue
+			}
+			return pluginapi.ExecutorResponse{}, fmt.Errorf("upstream responses: HTTP %d: %s", resp.StatusCode, string(resp.Body))
+		}
+		if modelscope.IsResponsesRateLimitExceeded(string(resp.Body)) {
+			store.ApplyResponsesRateLimit(cand.authID, "openai-compatible-"+cand.provider, req.Model, string(resp.Body), store.Now())
+			continue
+		}
+		if modelscope.IsResponsesFailed(string(resp.Body)) {
+			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, resp.StatusCode, string(resp.Body), cand.provider, cand.model))
+			continue
+		}
+		store.OnUsage(modelscope.UsageRecord{
+			Provider: "openai-compatible-" + cand.provider,
+			AuthID:   cand.authID,
+			Model:    cand.model,
+			Alias:    req.Model,
+		})
+		return pluginapi.ExecutorResponse{Payload: resp.Body, Headers: headerMapToHTTP(resp.Headers)}, nil
+	}
+
+	// All managed providers exhausted via Responses passthrough. Defer to the
+	// host's built-in path so non-managed providers serve the request through
+	// the normal chat protocol (Responses<->Chat translation handled by host).
+	// The host skips this plugin's router/interceptors (non-recursive); the
+	// plugin's scheduler still runs and skips managed keys disabled above.
+	hostResp, err := hostModelExecute(req)
+	if err != nil {
+		return pluginapi.ExecutorResponse{}, fmt.Errorf("responses managed keys exhausted, host fallback failed: %w", err)
+	}
+	if hostResp.StatusCode < 200 || hostResp.StatusCode >= 300 {
+		return pluginapi.ExecutorResponse{}, fmt.Errorf("host fallback: HTTP %d: %s", hostResp.StatusCode, string(hostResp.Body))
+	}
+	return pluginapi.ExecutorResponse{Payload: hostResp.Body, Headers: hostResp.Headers}, nil
+}
+
+const responsesStreamPreflightMaxBytes = 8 << 20
+
+type responsesStreamPreflightStatus uint8
+
+const (
+	responsesStreamPreflightOK responsesStreamPreflightStatus = iota
+	responsesStreamPreflightFailed
+	responsesStreamPreflightRateLimited
+)
+
+type responsesStreamPreflightResult struct {
+	status  responsesStreamPreflightStatus
+	payload []byte
+	done    bool
+	reason  string
+}
+
+func executeResponsesPassthroughStream(req executorRequestWithCallback) (pluginapi.ExecutorStreamResponse, error) {
+	cfg := currentConfig()
+	resolved := ensureResolved()
+	steps := buildRetrySequence(resolved, cfg)
+	alias := strings.TrimSpace(req.Model)
+
+	originalBody := req.OriginalRequest
+	if len(originalBody) == 0 {
+		originalBody = req.Payload
+	}
+
+	for _, step := range steps {
+		cand, ok := resolveStep(step, resolved, alias)
+		if !ok {
+			continue
+		}
+		if store.IsKeyDisabled(cand.authID, cand.model, store.Now()) {
+			continue
+		}
+		upstreamBody := withModel(originalBody, cand.model)
+		upstreamReq := responsesUpstreamRequest(req.Headers, cand.apiKey, strings.TrimSuffix(cand.baseURL, "/")+"/responses", upstreamBody)
+		upstreamReq.Headers.Set("Accept", "text/event-stream")
+		stream, errStream := hostHTTPDoStream(upstreamReq, req.HostCallbackID)
+		if errStream != nil {
+			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, errStream.Error(), cand.provider, cand.model))
+			continue
+		}
+		if stream.StatusCode != 200 {
+			bodyBytes, _, errRead := readHostStream(stream.StreamID, false)
+			hostHTTPStreamClose(stream.StreamID)
+			if errRead != nil {
+				store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, stream.StatusCode, errRead.Error(), cand.provider, cand.model))
+			} else {
+				store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, stream.StatusCode, string(bodyBytes), cand.provider, cand.model))
+			}
+			if stream.StatusCode == 429 || stream.StatusCode >= 500 {
+				continue
+			}
+			return pluginapi.ExecutorStreamResponse{}, fmt.Errorf("upstream responses stream: HTTP %d: %s", stream.StatusCode, string(bodyBytes))
+		}
+
+		first, done, errRead := readHostStreamChunk(stream.StreamID)
+		if errRead != nil {
+			hostHTTPStreamClose(stream.StreamID)
+			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, errRead.Error(), cand.provider, cand.model))
+			continue
+		}
+		preflight, errPreflight := preflightResponsesStream(stream.StreamID, first, done)
+		if errPreflight != nil {
+			hostHTTPStreamClose(stream.StreamID)
+			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, errPreflight.Error(), cand.provider, cand.model))
+			continue
+		}
+		switch preflight.status {
+		case responsesStreamPreflightRateLimited:
+			hostHTTPStreamClose(stream.StreamID)
+			store.ApplyResponsesRateLimit(cand.authID, "openai-compatible-"+cand.provider, req.Model, preflight.reason, store.Now())
+			continue
+		case responsesStreamPreflightFailed:
+			hostHTTPStreamClose(stream.StreamID)
+			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, stream.StatusCode, preflight.reason, cand.provider, cand.model))
+			continue
+		}
+		go forwardResponsesStream(req, cand, stream.StreamID, pluginapi.ExecutorStreamChunk{Payload: preflight.payload}, preflight.done)
+		return pluginapi.ExecutorStreamResponse{Headers: headerMapToHTTP(stream.Headers)}, nil
+	}
+
+	// All managed providers exhausted. Defer to the host's built-in streaming
+	// path so non-managed providers serve the request via chat protocol.
+	hostStream, err := hostModelExecuteStream(req)
+	if err != nil {
+		return pluginapi.ExecutorStreamResponse{}, fmt.Errorf("responses stream managed keys exhausted, host fallback failed: %w", err)
+	}
+	if hostStream.StatusCode != 200 {
+		hostModelStreamClose(hostStream.StreamID)
+		return pluginapi.ExecutorStreamResponse{}, fmt.Errorf("host fallback stream: HTTP %d", hostStream.StatusCode)
+	}
+	first, done, errRead := readHostModelStreamChunk(hostStream.StreamID)
+	if errRead != nil {
+		hostModelStreamClose(hostStream.StreamID)
+		return pluginapi.ExecutorStreamResponse{}, fmt.Errorf("host fallback stream read: %w", errRead)
+	}
+	go forwardHostModelStream(req, hostStream.StreamID, first, done)
+	return pluginapi.ExecutorStreamResponse{Headers: hostStream.Headers}, nil
+}
+
+func responsesUpstreamRequest(headers http.Header, apiKey, url string, body []byte) pluginapi.HTTPRequest {
+	out := pluginapi.HTTPRequest{
+		Method:  http.MethodPost,
+		URL:     url,
+		Headers: make(http.Header),
+		Body:    body,
+	}
+	if headers != nil {
+		for k, vs := range headers {
+			if strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "Content-Length") {
+				continue
+			}
+			for _, v := range vs {
+				out.Headers.Add(k, v)
+			}
+		}
+	}
+	out.Headers.Set("Content-Type", "application/json")
+	out.Headers.Set("Authorization", "Bearer "+apiKey)
+	return out
+}
+
+func headerMapToHTTP(src map[string][]string) http.Header {
+	if src == nil {
+		return http.Header{}
+	}
+	return http.Header(src)
+}
+
+func readHostStreamChunk(streamID string) (chunk pluginapi.ExecutorStreamChunk, done bool, err error) {
+	raw, err := hostHTTPStreamRead(streamID)
+	if err != nil {
+		return pluginapi.ExecutorStreamChunk{}, false, err
+	}
+	chunk = pluginapi.ExecutorStreamChunk{Payload: append([]byte(nil), raw.Payload...)}
+	if raw.Error != "" {
+		chunk.Err = errors.New(raw.Error)
+	}
+	if chunk.Err != nil {
+		return chunk, raw.Done, nil
+	}
+	return chunk, raw.Done, nil
+}
+
+func preflightResponsesStream(streamID string, first pluginapi.ExecutorStreamChunk, done bool) (responsesStreamPreflightResult, error) {
+	if first.Err != nil {
+		return responsesStreamPreflightResult{
+			status: responsesStreamPreflightFailed,
+			done:   done,
+			reason: first.Err.Error(),
+		}, nil
+	}
+
+	payload := append([]byte(nil), first.Payload...)
+	for {
+		detectBody, complete := modelscope.ResponsesFirstDataEvent(string(payload), done)
+		if complete {
+			result := responsesStreamPreflightResult{
+				status:  responsesStreamPreflightOK,
+				payload: payload,
+				done:    done,
+				reason:  detectBody,
+			}
+			switch {
+			case modelscope.IsResponsesRateLimitExceeded(detectBody):
+				result.status = responsesStreamPreflightRateLimited
+			case modelscope.IsResponsesFailed(detectBody):
+				result.status = responsesStreamPreflightFailed
+			}
+			return result, nil
+		}
+		if done {
+			return responsesStreamPreflightResult{
+				status:  responsesStreamPreflightOK,
+				payload: payload,
+				done:    true,
+			}, nil
+		}
+		if len(payload) >= responsesStreamPreflightMaxBytes {
+			return responsesStreamPreflightResult{
+				status:  responsesStreamPreflightOK,
+				payload: payload,
+				done:    done,
+			}, nil
+		}
+
+		chunk, isDone, errRead := readHostStreamChunk(streamID)
+		if errRead != nil {
+			return responsesStreamPreflightResult{}, errRead
+		}
+		if chunk.Err != nil {
+			return responsesStreamPreflightResult{
+				status: responsesStreamPreflightFailed,
+				done:   isDone,
+				reason: chunk.Err.Error(),
+			}, nil
+		}
+		if len(chunk.Payload) == 0 && !isDone {
+			continue
+		}
+		payload = append(payload, chunk.Payload...)
+		done = isDone
+	}
+}
+
+func forwardResponsesStream(req executorRequestWithCallback, cand retryCandidate, upstreamStreamID string, first pluginapi.ExecutorStreamChunk, done bool) {
+	defer hostHTTPStreamClose(upstreamStreamID)
+	emitted := false
+	responsesFailed := false
+	failedBody := ""
+	emit := func(payload []byte, errMsg string) bool {
+		if e := hostStreamEmit(req.StreamID, payload, errMsg); e != nil {
+			if !emitted && errMsg == "" {
+				_ = hostStreamEmit(req.StreamID, nil, e.Error())
+			}
+			return false
+		}
+		emitted = true
+		return true
+	}
+
+	if first.Payload != nil || first.Err != nil {
+		if first.Err != nil {
+			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, first.Err.Error(), cand.provider, cand.model))
+			_ = hostStreamEmit(req.StreamID, nil, first.Err.Error())
+			hostStreamClose(req.StreamID, first.Err.Error())
+			return
+		}
+		if !emit(first.Payload, "") {
+			hostStreamClose(req.StreamID, "host stream emit failed")
+			return
+		}
+	}
+	if done {
+		// first chunk is pre-filtered by executeResponsesPassthroughStream:
+		// response.failed (rate-limit or other) never reaches here, so a
+		// single-chunk stream is always a genuine success.
+		store.OnUsage(modelscope.UsageRecord{
+			Provider: "openai-compatible-" + cand.provider,
+			AuthID:   cand.authID,
+			Model:    cand.model,
+			Alias:    req.Model,
+		})
+		hostStreamClose(req.StreamID, "")
+		return
+	}
+	for {
+		chunk, isDone, errRead := readHostStreamChunk(upstreamStreamID)
+		if errRead != nil {
+			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, errRead.Error(), cand.provider, cand.model))
+			_ = hostStreamEmit(req.StreamID, nil, errRead.Error())
+			hostStreamClose(req.StreamID, errRead.Error())
+			return
+		}
+		if chunk.Err != nil {
+			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, chunk.Err.Error(), cand.provider, cand.model))
+			_ = hostStreamEmit(req.StreamID, nil, chunk.Err.Error())
+			hostStreamClose(req.StreamID, chunk.Err.Error())
+			return
+		}
+		if modelscope.IsResponsesRateLimitExceeded(string(chunk.Payload)) {
+			store.ApplyResponsesRateLimit(cand.authID, "openai-compatible-"+cand.provider, req.Model, string(chunk.Payload), store.Now())
+			responsesFailed = true
+			failedBody = string(chunk.Payload)
+		} else if modelscope.IsResponsesFailed(string(chunk.Payload)) {
+			responsesFailed = true
+			failedBody = string(chunk.Payload)
+		}
+		if !emit(chunk.Payload, "") {
+			hostStreamClose(req.StreamID, "host stream emit failed")
+			return
+		}
+		if isDone {
+			if responsesFailed {
+				store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 200, failedBody, cand.provider, cand.model))
+			} else {
+				store.OnUsage(modelscope.UsageRecord{
+					Provider: "openai-compatible-" + cand.provider,
+					AuthID:   cand.authID,
+					Model:    cand.model,
+					Alias:    req.Model,
+				})
+			}
+			hostStreamClose(req.StreamID, "")
+			return
+		}
+	}
+}
+
+func readHostStream(streamID string, stopAtFirst bool) ([]byte, bool, error) {
+	var out []byte
+	for {
+		chunk, done, err := readHostStreamChunk(streamID)
+		if err != nil {
+			return out, done, err
+		}
+		if chunk.Err != nil {
+			out = append(out, []byte(chunk.Err.Error())...)
+			return out, true, nil
+		}
+		out = append(out, chunk.Payload...)
+		if stopAtFirst || done {
+			return out, done, nil
+		}
+	}
+}
+
+// hostModelExecute defers a non-streaming request to the host built-in provider path.
+var hostModelExecute = func(req executorRequestWithCallback) (pluginapi.HostModelExecutionResponse, error) {
+	originalBody := req.OriginalRequest
+	if len(originalBody) == 0 {
+		originalBody = req.Payload
+	}
+	payload, err := json.Marshal(rpcHostModelExecutionRequest{
+		HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
+			EntryProtocol: req.SourceFormat,
+			Model:         req.Model,
+			Stream:        false,
+			Body:          originalBody,
+			Headers:       req.Headers,
+			Query:         req.Query,
+			Alt:           req.Alt,
+		},
+		HostCallbackID: req.HostCallbackID,
+	})
+	if err != nil {
+		return pluginapi.HostModelExecutionResponse{}, err
+	}
+	raw, err := callHost(pluginabi.MethodHostModelExecute, payload)
+	if err != nil {
+		return pluginapi.HostModelExecutionResponse{}, err
+	}
+	var out pluginapi.HostModelExecutionResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return pluginapi.HostModelExecutionResponse{}, fmt.Errorf("decode host.model.execute response: %w", err)
+	}
+	return out, nil
+}
+
+// hostModelExecuteStream defers a streaming request to the host built-in provider path.
+var hostModelExecuteStream = func(req executorRequestWithCallback) (pluginapi.HostModelStreamResponse, error) {
+	originalBody := req.OriginalRequest
+	if len(originalBody) == 0 {
+		originalBody = req.Payload
+	}
+	payload, err := json.Marshal(rpcHostModelExecutionRequest{
+		HostModelExecutionRequest: pluginapi.HostModelExecutionRequest{
+			EntryProtocol: req.SourceFormat,
+			Model:         req.Model,
+			Stream:        true,
+			Body:          originalBody,
+			Headers:       req.Headers,
+			Query:         req.Query,
+			Alt:           req.Alt,
+		},
+		HostCallbackID: req.HostCallbackID,
+	})
+	if err != nil {
+		return pluginapi.HostModelStreamResponse{}, err
+	}
+	raw, err := callHost(pluginabi.MethodHostModelExecuteStream, payload)
+	if err != nil {
+		return pluginapi.HostModelStreamResponse{}, err
+	}
+	var out pluginapi.HostModelStreamResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return pluginapi.HostModelStreamResponse{}, fmt.Errorf("decode host.model.execute_stream response: %w", err)
+	}
+	if out.StreamID == "" {
+		return pluginapi.HostModelStreamResponse{}, errors.New("host.model.execute_stream returned no stream_id")
+	}
+	return out, nil
+}
+
+var hostModelStreamRead = func(streamID string) (pluginapi.HostModelStreamReadResponse, error) {
+	raw, err := callHost(pluginabi.MethodHostModelStreamRead, mustJSONMarshal(pluginapi.HostModelStreamReadRequest{StreamID: streamID}))
+	if err != nil {
+		return pluginapi.HostModelStreamReadResponse{}, err
+	}
+	var out pluginapi.HostModelStreamReadResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return pluginapi.HostModelStreamReadResponse{}, fmt.Errorf("decode host.model.stream_read response: %w", err)
+	}
+	return out, nil
+}
+
+func hostModelStreamClose(streamID string) {
+	_, _ = callHost(pluginabi.MethodHostModelStreamClose, mustJSONMarshal(pluginapi.HostModelStreamCloseRequest{StreamID: streamID}))
+}
+
+func readHostModelStreamChunk(streamID string) (chunk pluginapi.ExecutorStreamChunk, done bool, err error) {
+	raw, err := hostModelStreamRead(streamID)
+	if err != nil {
+		return pluginapi.ExecutorStreamChunk{}, false, err
+	}
+	chunk = pluginapi.ExecutorStreamChunk{Payload: append([]byte(nil), raw.Payload...)}
+	if raw.Error != "" {
+		chunk.Err = errors.New(raw.Error)
+	}
+	return chunk, raw.Done, nil
+}
+
+// forwardHostModelStream bridges a host-managed model stream to the client stream bridge.
+func forwardHostModelStream(req executorRequestWithCallback, upstreamStreamID string, first pluginapi.ExecutorStreamChunk, done bool) {
+	defer hostModelStreamClose(upstreamStreamID)
+	emitted := false
+	emit := func(payload []byte, errMsg string) bool {
+		if e := hostStreamEmit(req.StreamID, payload, errMsg); e != nil {
+			if !emitted && errMsg == "" {
+				_ = hostStreamEmit(req.StreamID, nil, e.Error())
+			}
+			return false
+		}
+		emitted = true
+		return true
+	}
+
+	if first.Payload != nil || first.Err != nil {
+		if first.Err != nil {
+			_ = hostStreamEmit(req.StreamID, nil, first.Err.Error())
+			hostStreamClose(req.StreamID, first.Err.Error())
+			return
+		}
+		if !emit(first.Payload, "") {
+			hostStreamClose(req.StreamID, "host stream emit failed")
+			return
+		}
+	}
+	if done {
+		hostStreamClose(req.StreamID, "")
+		return
+	}
+	for {
+		chunk, isDone, errRead := readHostModelStreamChunk(upstreamStreamID)
+		if errRead != nil {
+			_ = hostStreamEmit(req.StreamID, nil, errRead.Error())
+			hostStreamClose(req.StreamID, errRead.Error())
+			return
+		}
+		if chunk.Err != nil {
+			_ = hostStreamEmit(req.StreamID, nil, chunk.Err.Error())
+			hostStreamClose(req.StreamID, chunk.Err.Error())
+			return
+		}
+		if !emit(chunk.Payload, "") {
+			hostStreamClose(req.StreamID, "host stream emit failed")
+			return
+		}
+		if isDone {
+			hostStreamClose(req.StreamID, "")
+			return
+		}
+	}
 }

@@ -150,6 +150,25 @@ type Store struct {
 	skipMu        sync.RWMutex
 	skipProviders map[string]struct{}
 
+	// skipRoundDone marks that skip ON mode has completed one full provider
+	// rotation pass (all providers skipped once). After that, it switches to
+	// key-exhaustion mode: no more SetSkipProvider/advanceManagedProvider,
+	// just let pickManaged advance the key cursor within each provider.
+	// Cleared by any 200 (OnUsage success or executor success).
+	skipRoundDone atomic.Bool
+
+	// responsesRateLimited records keys that produced a Responses-API
+	// response.failed/rate_limit_exceeded event. Since those are HTTP 200
+	// streams, the subsequent usage hook would otherwise treat them as a
+	// healthy response and clear the backoff/skip state.
+	responsesRateLimitMu sync.Mutex
+	responsesRateLimited map[string]time.Time
+	// responsesRateLimitApplied suppresses duplicate state updates when the
+	// executor has already applied ApplyResponsesRateLimit and the host then
+	// runs the response/stream interceptor on the same response.
+	responsesRateLimitAppliedMu sync.Mutex
+	responsesRateLimitApplied   map[string]time.Time
+
 	clock func() time.Time // injectable for tests; defaults to time.Now
 
 	stopMu  sync.Mutex
@@ -166,15 +185,17 @@ func NewStore(log Logger) *Store {
 	}
 	utc := time.UTC
 	s := &Store{
-		keys:           make(map[string]*keyState),
-		seen:           make(map[string]struct{}),
-		aliasUpstream:  make(map[string]string),
-		modelUsage:     make(map[string]int),
-		managedCursors: make(map[string]uint64),
-		managedOrder:   make(map[string][]string),
-		clock:          time.Now,
-		stop:           make(chan struct{}),
-		log:            log,
+		keys:                      make(map[string]*keyState),
+		seen:                      make(map[string]struct{}),
+		aliasUpstream:             make(map[string]string),
+		modelUsage:                make(map[string]int),
+		managedCursors:            make(map[string]uint64),
+		managedOrder:              make(map[string][]string),
+		responsesRateLimited:      make(map[string]time.Time),
+		responsesRateLimitApplied: make(map[string]time.Time),
+		clock:                     time.Now,
+		stop:                      make(chan struct{}),
+		log:                       log,
 	}
 	s.loc.Store(utc)
 	s.cfg.Store(DefaultConfig())
@@ -259,6 +280,49 @@ func (s *Store) providerFullOrder(providerCfgName string) []string {
 		return nil
 	}
 	return m[strings.ToLower(strings.TrimSpace(providerCfgName))]
+}
+
+// NextProviderKey returns the next auth ID for the given provider according
+// to the per-provider cursor (round-robin) or fill-first strategy. It
+// advances the cursor so the next call returns the following key. When the
+// fetcher-supplied full order is available, the scan-skip-absent logic from
+// pickManaged is reused; otherwise the ids slice is used directly.
+func (s *Store) NextProviderKey(provider string, ids []string) string {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" || len(ids) == 0 {
+		return ""
+	}
+	full := s.providerFullOrder(provider)
+	if len(full) == 0 {
+		full = s.observedOrder(provider)
+	}
+	if len(full) == 0 {
+		full = ids
+	}
+	present := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		present[id] = true
+	}
+	if s.managedStrategy() == "fill-first" {
+		for _, id := range full {
+			if present[id] {
+				return id
+			}
+		}
+		return ids[0]
+	}
+	s.managedCursorsMu.Lock()
+	defer s.managedCursorsMu.Unlock()
+	cursor := s.managedCursors[provider]
+	start := int(cursor % uint64(len(full)))
+	for step := 0; step < len(full); step++ {
+		pos := (start + step) % len(full)
+		if present[full[pos]] {
+			s.managedCursors[provider] = uint64(pos + 1)
+			return full[pos]
+		}
+	}
+	return ids[0]
 }
 
 // recordObservedOrder grows the per-provider observed-order snapshot from a
@@ -517,6 +581,61 @@ func (s *Store) Reconfigure(cfg *Config) {
 	// Clear the per-provider skip set: stale entries from a previous config
 	// would make the next pick skip managed providers for no reason.
 	s.ClearAllSkippedProviders()
+	s.responsesRateLimitMu.Lock()
+	s.responsesRateLimited = make(map[string]time.Time)
+	s.responsesRateLimitMu.Unlock()
+	s.responsesRateLimitAppliedMu.Lock()
+	s.responsesRateLimitApplied = make(map[string]time.Time)
+	s.responsesRateLimitAppliedMu.Unlock()
+}
+
+const responsesRateLimitWindow = time.Minute
+
+// markResponsesRateLimited marks a key until the next usage callback so the
+// 200-status Responses failure is not mistaken for a healthy response.
+func (s *Store) markResponsesRateLimited(authID string, now time.Time) {
+	if authID == "" {
+		return
+	}
+	s.responsesRateLimitMu.Lock()
+	s.responsesRateLimited[authID] = now.Add(responsesRateLimitWindow)
+	s.responsesRateLimitMu.Unlock()
+}
+
+// markResponsesRateLimitApplied marks that ApplyResponsesRateLimit has already
+// recorded state for this key, so the host-driven response/stream interceptor
+// does not duplicate the cooldown/skip update on the same response.
+func (s *Store) markResponsesRateLimitApplied(authID string, now time.Time) {
+	if authID == "" {
+		return
+	}
+	s.responsesRateLimitAppliedMu.Lock()
+	s.responsesRateLimitApplied[authID] = now.Add(responsesRateLimitWindow)
+	s.responsesRateLimitAppliedMu.Unlock()
+}
+
+// consumeResponsesRateLimitApplied consumes the applied marker.
+func (s *Store) consumeResponsesRateLimitApplied(authID string, now time.Time) bool {
+	s.responsesRateLimitAppliedMu.Lock()
+	defer s.responsesRateLimitAppliedMu.Unlock()
+	expiry, ok := s.responsesRateLimitApplied[authID]
+	if !ok {
+		return false
+	}
+	delete(s.responsesRateLimitApplied, authID)
+	return !expiry.IsZero() && now.Before(expiry)
+}
+
+// consumeResponsesRateLimited consumes the marker for a usage callback.
+func (s *Store) consumeResponsesRateLimited(authID string, now time.Time) bool {
+	s.responsesRateLimitMu.Lock()
+	defer s.responsesRateLimitMu.Unlock()
+	expiry, ok := s.responsesRateLimited[authID]
+	if !ok {
+		return false
+	}
+	delete(s.responsesRateLimited, authID)
+	return !expiry.IsZero() && now.Before(expiry)
 }
 
 // Start launches the background goroutine that prunes expired disables so the
@@ -626,6 +745,10 @@ func (s *Store) deleteKey(authID string) {
 // isDisabled reports whether the authID is currently globally disabled.
 // Stale daily records (rolled-over day) do not count unless the reason is
 // "unauthorized"; the background cleaner removes expiring daily records.
+func (s *Store) IsKeyDisabled(authID, model string, now time.Time) bool {
+	return s.isDisabled(authID, model, now)
+}
+
 func (s *Store) isDisabled(authID, model string, now time.Time) bool {
 	ks := s.getKey(authID)
 	if ks == nil {
@@ -1046,6 +1169,21 @@ func (s *Store) ClearAllSkippedProviders() {
 	s.skipMu.Lock()
 	defer s.skipMu.Unlock()
 	s.skipProviders = make(map[string]struct{})
+}
+
+// SetSkipRoundDone marks that skip ON has completed one full provider pass.
+func (s *Store) SetSkipRoundDone() {
+	s.skipRoundDone.Store(true)
+}
+
+// SkipRoundDone reports whether the skip-on full pass is done.
+func (s *Store) SkipRoundDone() bool {
+	return s.skipRoundDone.Load()
+}
+
+// ClearSkipRoundDone clears the flag (called on any 200).
+func (s *Store) ClearSkipRoundDone() {
+	s.skipRoundDone.Store(false)
 }
 
 // cooldownWaitDuration returns the longest remaining insufficient_quota cooldown

@@ -1007,7 +1007,7 @@
         color: #86868b;
       "
     >
-      Modelscope 限流管理后台插件 v2.2.2 · 构建于 2026-08-22 00:21:26 CST
+      Modelscope 限流管理后台插件 v<span id="plugin-version">加载中</span> · 构建于 2026-08-28 18:47:02 CST · Responses 接口：<span id="responses-status">加载中</span>
     </div>
     <div class="toast" id="toast"></div>
     <script>
@@ -1225,6 +1225,23 @@
           renderStats();
           renderModels();
           if (cb) cb();
+        });
+      }
+
+      function fetchConfig() {
+        xhr("GET", "?api=config", function (sc, d) {
+          var v = document.getElementById("plugin-version");
+          var el = document.getElementById("responses-status");
+          if (v && sc === 200 && d && d.version) {
+            v.textContent = d.version;
+          }
+          if (!el) return;
+          if (sc === 200 && d) {
+            el.textContent = d.use_responses ? "已开启" : "未开启";
+            el.className = d.use_responses ? "green" : "";
+          } else {
+            el.textContent = "未知";
+          }
         });
       }
       function renderStats() {
@@ -1935,6 +1952,7 @@
       setupSorting();
       updateToolbarBtn();
       fetchStats();
+      fetchConfig();
       // 5-second polling: fetch stats + accounts
       setInterval(function () {
         fetchStats();

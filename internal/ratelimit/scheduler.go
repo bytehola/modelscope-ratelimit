@@ -20,16 +20,15 @@ var ErrAllCredentialsDisabled = errors.New("all credentials disabled for model (
 // Provider is empty while each Candidate.Provider carries the real runtime
 // key (e.g. "openai-compatible-modelscope").
 //
-// Provider rotation: when skip_provider_on_429 is OFF, managed providers are
-// selected by a within-request cross-provider cursor in Providers config
-// order. Each 429+insufficient_quota advances that cursor so the host's retry
-// picks the next provider within the same request, and the selected
-// provider's key cursor advances. Any 200 resets the cross-provider cursor
-// to 0, so the next request always starts from the first provider; only
-// per-provider key cursors keep rotating across requests. When
-// skip_provider_on_429 is ON, the provider skip set removes recently-429'd
-// providers and the plugin falls back to non-managed providers until the
-// next 200.
+// Provider rotation: both skip_provider_on_429 modes use the within-request
+// cross-provider cursor in Providers config order. Each rate-limit failure
+// advances the cursor so the next pick starts from the next provider.
+// When skip_provider_on_429 is ON, the provider is also added to the skip
+// set so its candidates are filtered out until the next 200. When OFF, only
+// the cursor advances (no skip set); the cooldown blocks and then the next
+// provider is tried. Any 200 resets the cursor to 0 so the next request
+// starts from the first provider; per-provider key cursors keep rotating
+// across requests.
 //
 // Fallback to non-managed providers: when every managed candidate for the
 // model is disabled, the plugin must NOT hard-block the request if
@@ -146,6 +145,7 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 		// clear.
 		if s.HasSkippedProviders() {
 			s.ClearAllSkippedProviders()
+			s.SetSkipRoundDone()
 		}
 		return SchedulerPickResponse{Handled: false}, nil
 	}
@@ -181,6 +181,7 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 		// window may have recovered).
 		if s.HasSkippedProviders() {
 			s.ClearAllSkippedProviders()
+			s.SetSkipRoundDone()
 			s.log.Printf("modelscope-ratelimit: skip managed on 429, no fallback model=%s", s.displayName(req.Model))
 			return SchedulerPickResponse{}, fmt.Errorf("%w: model=%q (insufficient_quota, no non-managed fallback)", ErrAllCredentialsDisabled, s.displayName(req.Model))
 		}
@@ -199,14 +200,23 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 	//   - skip_provider_on_429 ON: strict config order (first provider with
 	//     available candidates). The per-provider skip set already filters
 	//     providers that recently 429'd.
-	start := 0
-	if !cfg.SkipProviderOn429 {
-		start = s.managedProviderStart(len(cfg.Providers))
-	}
+	start := s.managedProviderStart(len(cfg.Providers))
 	for step := 0; step < len(cfg.Providers); step++ {
 		i := (start + step) % len(cfg.Providers)
 		if candidates, ok := availableByProvider[i]; ok && len(candidates) > 0 {
-			picked, _ = s.pickManaged(candidates, cfg.Providers[i])
+			ids := make([]string, 0, len(candidates))
+			byID := make(map[string]Candidate, len(candidates))
+			for _, candidate := range candidates {
+				ids = append(ids, candidate.ID)
+				byID[candidate.ID] = candidate
+			}
+			s.recordObservedOrder(cfg.Providers[i], candidates)
+			authID := s.NextProviderKey(cfg.Providers[i], ids)
+			if selected, ok := byID[authID]; ok {
+				picked = selected
+				break
+			}
+			picked = candidates[0]
 			break
 		}
 	}

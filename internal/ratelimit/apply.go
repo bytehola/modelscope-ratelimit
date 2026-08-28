@@ -30,11 +30,92 @@ func (s *Store) ApplyRateLimit(authID, model string, headers map[string][]string
 	}
 }
 
-// isInsufficientQuota reports whether the response is a 429 with an
-// "insufficient_quota" error code in the body (e.g. Aliyun Model Studio).
+// IsResponsesRateLimitExceeded reports whether a Responses-API event is the
+// quota-exhaustion failure previously returned as 429 + insufficient_quota by
+// the Chat Completions endpoint. Matching is on the quoted JSON value tokens
+// ("response.failed" / "rate_limit_exceeded") so it tolerates whitespace
+// after colons and SSE "data:" framing.
+func IsResponsesRateLimitExceeded(body string) bool {
+	if body == "" {
+		return false
+	}
+	return strings.Contains(body, `"response.failed"`) &&
+		strings.Contains(body, `"rate_limit_exceeded"`)
+}
+
+// IsResponsesFailed reports whether a Responses-API event is any
+// response.failed (not just rate_limit_exceeded). The Responses protocol
+// delivers errors as HTTP 200 SSE with a response.failed event, so the
+// executor must detect ALL of them and retry the next key/provider instead
+// of treating the 200 as a genuine success. Like
+// IsResponsesRateLimitExceeded it matches the quoted token so JSON spacing
+// and SSE framing do not cause a miss.
+func IsResponsesFailed(body string) bool {
+	if body == "" {
+		return false
+	}
+	return strings.Contains(body, `"response.failed"`)
+}
+
+// ResponsesFirstDataEvent returns the bytes through the end of the first
+// complete SSE event that contains a data field. It returns false until the
+// field and an event dispatch boundary have both arrived, unless atEOF is true
+// (SSE permits the final event to be dispatched by end-of-stream).
+func ResponsesFirstDataEvent(body string, atEOF bool) (string, bool) {
+	dataStart := firstSSEDataFieldIndex(body)
+	if dataStart < 0 {
+		return "", false
+	}
+
+	for i := dataStart; i < len(body); i++ {
+		if body[i] != '\n' {
+			continue
+		}
+		if i+1 < len(body) && body[i+1] == '\n' {
+			return body[:i+1], true
+		}
+		if i+2 < len(body) && body[i+1] == '\r' && body[i+2] == '\n' {
+			return body[:i+1], true
+		}
+	}
+
+	if atEOF {
+		return body, true
+	}
+	return "", false
+}
+
+func firstSSEDataFieldIndex(body string) int {
+	for start := 0; start < len(body); {
+		relEnd := strings.IndexByte(body[start:], '\n')
+		end := len(body)
+		hasNewline := relEnd >= 0
+		if hasNewline {
+			end = start + relEnd
+		}
+
+		line := strings.TrimSuffix(body[start:end], "\r")
+		if strings.HasPrefix(line, "data:") {
+			return start
+		}
+		if !hasNewline {
+			break
+		}
+		start = end + 1
+	}
+	return -1
+}
+
+// isInsufficientQuota reports whether the response represents pool-level
+// quota exhaustion: either the legacy Chat Completions 429 +
+// "insufficient_quota", or the Responses-API 200 stream event
+// response.failed + rate_limit_exceeded.
 // Detection is string-based ("insufficient_quota" with surrounding quotes) to
 // avoid a full JSON parse in the hot path; the token is distinctive enough.
 func isInsufficientQuota(statusCode int, body string) bool {
+	if IsResponsesRateLimitExceeded(body) {
+		return true
+	}
 	return statusCode == 429 && strings.Contains(body, `"insufficient_quota"`)
 }
 
@@ -78,6 +159,18 @@ func (s *Store) ApplyInsufficientQuotaCooldown(authID, model string, statusCode 
 func (s *Store) OnResponse(req ResponseInterceptRequest) ResponseInterceptResponse {
 	authID := AuthIDFromMetadata(req.Metadata)
 	s.ApplyRateLimit(authID, req.Model, req.ResponseHeaders, req.StatusCode, req.Body, s.now())
+	if IsResponsesRateLimitExceeded(req.Body) {
+		if s.consumeResponsesRateLimitApplied(authID, s.now()) {
+			return ResponseInterceptResponse{}
+		}
+		s.ApplyResponsesRateLimit(
+			authID,
+			ProviderFromMetadata(req.Metadata),
+			req.RequestedModel,
+			req.Body,
+			s.now(),
+		)
+	}
 	return ResponseInterceptResponse{}
 }
 
@@ -88,8 +181,47 @@ func (s *Store) OnStreamChunk(req StreamChunkInterceptRequest) StreamChunkInterc
 	if req.ChunkIndex == -1 {
 		authID := AuthIDFromMetadata(req.Metadata)
 		s.ApplyRateLimit(authID, req.Model, req.ResponseHeaders, 0, "", s.now())
+		return StreamChunkInterceptResponse{}
+	}
+	if IsResponsesRateLimitExceeded(req.Body) {
+		authID := AuthIDFromMetadata(req.Metadata)
+		if s.consumeResponsesRateLimitApplied(authID, s.now()) {
+			return StreamChunkInterceptResponse{}
+		}
+		s.ApplyResponsesRateLimit(
+			authID,
+			ProviderFromMetadata(req.Metadata),
+			req.RequestedModel,
+			req.Body,
+			s.now(),
+		)
 	}
 	return StreamChunkInterceptResponse{}
+}
+
+// applyResponsesRateLimit handles the Responses-API quota failure that now
+// arrives as HTTP 200 + response.failed. It mirrors the existing
+// insufficient_quota cooldown/skip behavior without parsing JSON.
+func (s *Store) ApplyResponsesRateLimit(authID, provider, model, body string, now time.Time) {
+	if authID == "" {
+		return
+	}
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return
+	}
+	cfg := s.config()
+	s.recordSeen([]string{authID})
+	s.recordRateLimit()
+	if cfg.SkipProviderOn429 {
+		if provider != "" {
+			s.SetSkipProvider(extractProviderName(provider))
+		}
+	} else {
+		s.ApplyInsufficientQuotaCooldown(authID, model, 200, body, now)
+	}
+	s.markResponsesRateLimited(authID, now)
+	s.markResponsesRateLimitApplied(authID, now)
 }
 
 // OnUsage handles usage.handle. UsageRecord carries AuthID, Model and the
@@ -139,6 +271,12 @@ func (s *Store) OnUsage(rec UsageRecord) {
 	// remaining > 0 (per-request rate limiting vs. billing-quota exhaustion),
 	// which would wrongly reset the backoff on every failure.
 	if !rec.Failed && cfg.ManagesProvider(rec.Provider) {
+		// A Responses-API quota failure arrives as HTTP 200, so the usage
+		// hook would otherwise misread it as healthy and reset the
+		// backoff/skip state set by applyResponsesRateLimit.
+		if s.consumeResponsesRateLimited(rec.AuthID, now) {
+			return
+		}
 		s.resetCooldownBackoff()
 		s.recordSuccess(rec.AuthID)
 		s.recordModelUsage(s.displayName(model))
@@ -152,6 +290,7 @@ func (s *Store) OnUsage(rec UsageRecord) {
 	// cursors keep rotating across requests.
 	if !rec.Failed {
 		s.ClearAllSkippedProviders()
+		s.ClearSkipRoundDone()
 		s.resetManagedProviderCursor()
 	}
 
@@ -197,14 +336,6 @@ func (s *Store) OnUsage(rec UsageRecord) {
 			// block in SchedulerPick is also bypassed when skip mode is on.
 			if !cfg.SkipProviderOn429 {
 				s.ApplyInsufficientQuotaCooldown(rec.AuthID, model, rec.Failure.StatusCode, rec.Failure.Body, now)
-				// Advance the within-request cross-provider cursor so the
-				// host's retry picks the next provider within the same
-				// request. Any 200 resets the cursor (above) so the next
-				// request starts from the first provider; per-provider key
-				// cursors keep rotating across requests.
-				if isInsufficientQuota(rec.Failure.StatusCode, rec.Failure.Body) {
-					s.advanceManagedProvider()
-				}
 			}
 		}
 	}
@@ -216,6 +347,7 @@ func (s *Store) OnUsage(rec UsageRecord) {
 // usage hook still provides the correlation.
 var authIDKeys = []string{
 	"auth_id", "AuthID", "authID", "authId", "auth",
+	"selected_auth_id", "pinned_auth_id",
 }
 
 // AuthIDFromMetadata defensively extracts a credential identifier from the
@@ -225,6 +357,28 @@ func AuthIDFromMetadata(meta map[string]any) string {
 		return ""
 	}
 	for _, k := range authIDKeys {
+		if v, ok := meta[k]; ok {
+			if s, ok := v.(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+// providerIDKeys are the metadata keys tried when correlating a stream or
+// response interceptor call back to the provider key, for skip_provider_on_429.
+var providerIDKeys = []string{
+	"provider", "Provider", "provider_key", "auth_provider", "AuthProvider", "auth_provider_key",
+}
+
+// ProviderFromMetadata defensively extracts the provider key from the host
+// context snapshot attached to a response/stream interception request.
+func ProviderFromMetadata(meta map[string]any) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	for _, k := range providerIDKeys {
 		if v, ok := meta[k]; ok {
 			if s, ok := v.(string); ok && s != "" {
 				return s

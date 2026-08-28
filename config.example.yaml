@@ -30,7 +30,8 @@ plugins:
 
       # ---- 必填 ----
       providers: ["modelscope"] # 监控的 provider 名称；顺序决定轮换顺序。示例: ["modelscope", "modelscope-ai"]
-      skip_provider_on_429: false # 关闭：429 切下一个 provider + 退避冷却，200 回第一个 provider；开启：429 直接用非托管模型兜底（推荐打开）
+     skip_provider_on_429: false # 关闭：429 切下一个 provider + 退避冷却，200 回第一个 provider；开启：429 直接用非托管模型兜底（推荐打开）
+      use_responses: false # 开启后将 OpenAI Responses API 请求透传到上游 /v1/responses，并复用现有限流/key 轮换；默认关闭
       host_base_url: "http://127.0.0.1:8317" # CPA 管理 API 地址，默认 127.0.0.1:8317
       management_key: "your-management-secret" # CPA 管理密钥，仅服务端使用
 

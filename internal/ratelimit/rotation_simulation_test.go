@@ -127,43 +127,34 @@ func TestRotationSim_UserScenario(t *testing.T) {
 	rows = append(rows, "-----|------|------")
 
 	// === 第一轮 ===
-	// 1: ms#1 429
+	// skip OFF: exhaust ms keys first, then ai, then my
 	id := sim.pick()
-	rows = append(rows, fmt.Sprintf("1 | %s | 429 insufficient_quota", shortName(id)))
+	rows = append(rows, fmt.Sprintf("1 | %s | 429", shortName(id)))
 	sim.usage429(id, providerOf(id))
-	// 2: ai#1 429
 	id = sim.pick()
-	rows = append(rows, fmt.Sprintf("2 | %s | 429 insufficient_quota", shortName(id)))
+	rows = append(rows, fmt.Sprintf("2 | %s | 429", shortName(id)))
 	sim.usage429(id, providerOf(id))
-	// 3: my#1 429
 	id = sim.pick()
-	rows = append(rows, fmt.Sprintf("3 | %s | 429 insufficient_quota", shortName(id)))
+	rows = append(rows, fmt.Sprintf("3 | %s | 429", shortName(id)))
 	sim.usage429(id, providerOf(id))
-	// 4: ms#2 200
 	id = sim.pick()
 	rows = append(rows, fmt.Sprintf("4 | %s | 200", shortName(id)))
 	sim.usage200(id, providerOf(id))
 
 	rows = append(rows, "--- 第一轮结束 ---")
 
-	// === 第二轮 ===
-	// 1: ms#3 429
 	id = sim.pick()
-	rows = append(rows, fmt.Sprintf("1 | %s | 429 insufficient_quota", shortName(id)))
+	rows = append(rows, fmt.Sprintf("1 | %s | 429", shortName(id)))
 	sim.usage429(id, providerOf(id))
-	// 2: ai#2 429
 	id = sim.pick()
-	rows = append(rows, fmt.Sprintf("2 | %s | 429 insufficient_quota", shortName(id)))
+	rows = append(rows, fmt.Sprintf("2 | %s | 429", shortName(id)))
 	sim.usage429(id, providerOf(id))
-	// 3: my#2 429
 	id = sim.pick()
-	rows = append(rows, fmt.Sprintf("3 | %s | 429 insufficient_quota", shortName(id)))
+	rows = append(rows, fmt.Sprintf("3 | %s | 429", shortName(id)))
 	sim.usage429(id, providerOf(id))
-	// 4: ms#4 429
 	id = sim.pick()
-	rows = append(rows, fmt.Sprintf("4 | %s | 429 insufficient_quota", shortName(id)))
+	rows = append(rows, fmt.Sprintf("4 | %s | 429", shortName(id)))
 	sim.usage429(id, providerOf(id))
-	// 5: ai#3 200
 	id = sim.pick()
 	rows = append(rows, fmt.Sprintf("5 | %s | 200", shortName(id)))
 	sim.usage200(id, providerOf(id))
@@ -172,8 +163,8 @@ func TestRotationSim_UserScenario(t *testing.T) {
 		t.Log(row)
 	}
 
-	// Verify the exact sequence
-	want := []string{"modelscope-k1", "modelscope-ai-k1", "modelscope-my-k1", "modelscope-k2", "modelscope-k3", "modelscope-ai-k2", "modelscope-my-k2", "modelscope-k4", "modelscope-ai-k3"}
+	// Verify the exact sequence: exhaust each provider's keys before moving
+	want := []string{"modelscope-k1", "modelscope-k2", "modelscope-k3", "modelscope-k4", "modelscope-k1", "modelscope-k2", "modelscope-k3", "modelscope-k4", "modelscope-ai-k1"}
 	sim2 := newRotationSim(t, "modelscope", "modelscope-ai", "modelscope-my")
 	var got []string
 	for i := 0; i < len(want); i++ {
@@ -233,10 +224,10 @@ func TestRotationSim_MixedSuccess(t *testing.T) {
 	}{
 		{false}, // ms#1 200
 		{false}, // ms#2 200
-		{true},  // ms#3 429 -> rotate to ai
-		{true},  // ai#1 429 -> rotate to my
-		{false}, // my#1 200 -> reset to ms
-		{false}, // ms#4 200
+		{true},  // ms#3 429 -> stay on ms
+		{true},  // ms#4 429 -> stay on ms (exhausted) -> ai
+		{false}, // ai#1 200 -> reset to ms
+		{false}, // ms#1 200 (cursor continues)
 	}
 
 	for i, st := range steps {
@@ -257,8 +248,8 @@ func TestRotationSim_MixedSuccess(t *testing.T) {
 		t.Log(row)
 	}
 
-	// Verify: ms#1, ms#2, ms#3, ai#1, my#1, ms#4 (the my#1 200 resets to ms)
-	want := []string{"modelscope-k1", "modelscope-k2", "modelscope-k3", "modelscope-ai-k1", "modelscope-my-k1", "modelscope-k4"}
+	// Verify: skip OFF exhausts provider: ms#1, ms#2, ms#3, ms#4, then ai#1
+	want := []string{"modelscope-k1", "modelscope-k2", "modelscope-k3", "modelscope-k4", "modelscope-k1", "modelscope-k2"}
 	sim2 := newRotationSim(t, "modelscope", "modelscope-ai", "modelscope-my")
 	for i, st := range steps {
 		id := sim2.pick()
@@ -288,14 +279,14 @@ func TestRotationSim_BalanceExhausted(t *testing.T) {
 	rows = append(rows, fmt.Sprintf("1 | %s | 429 insufficient_balance (禁用)", shortName(id)))
 	sim.usageBalanceExhausted(id, providerOf(id))
 
-	// 2: ms#2 429 insufficient_quota -> rotate to ai
+	// 2: ms#2 429 insufficient_quota -> stay on ms
 	id = sim.pick()
 	rows = append(rows, fmt.Sprintf("2 | %s | 429 insufficient_quota", shortName(id)))
 	sim.usage429(id, providerOf(id))
 
-	// 3: ai#1 200 (cursor at ai) -> reset to ms
+	// 3: ms#3 200 -> reset
 	id = sim.pick()
-	rows = append(rows, fmt.Sprintf("3 | %s | 200 (cursor at ai -> reset)", shortName(id)))
+	rows = append(rows, fmt.Sprintf("3 | %s | 200 (reset)", shortName(id)))
 	sim.usage200(id, providerOf(id))
 
 	// 4: new request, ms#1 still disabled -> ms#3 200 (reset to first provider)
@@ -309,7 +300,7 @@ func TestRotationSim_BalanceExhausted(t *testing.T) {
 
 	// Verify key sequence
 	sim2 := newRotationSim(t, "modelscope", "modelscope-ai")
-	want := []string{"modelscope-k1", "modelscope-k2", "modelscope-ai-k1", "modelscope-k3"}
+	want := []string{"modelscope-k1", "modelscope-k2", "modelscope-k3", "modelscope-k4"}
 	for i, w := range want {
 		id := sim2.pick()
 		if id != w {

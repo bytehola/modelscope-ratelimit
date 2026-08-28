@@ -69,6 +69,14 @@ type Config struct {
 	// resource page. Storing it in config.yaml is the operator's responsibility;
 	// restrict the file's permissions accordingly.
 	ManagementKey string `json:"management_key" yaml:"management_key"`
+
+	// UseResponses enables the experimental Responses-API passthrough executor.
+	// When false (default), OpenAI Responses requests are not intercepted and
+	// the host handles them through its normal provider path. When true, the
+	// plugin routes Responses requests to its own executor, which forwards them
+	// to the upstream /v1/responses endpoint while reusing the existing
+	// key-rotation, cooldown, disable and usage logic.
+	UseResponses bool `json:"use_responses" yaml:"use_responses"`
 }
 
 // DefaultConfig returns the configuration tuned for the Modelscope
@@ -179,6 +187,9 @@ func ConfigFromMap(raw map[string]any) (*Config, error) {
 	}
 	if v, ok := raw["ms_proxy_url"].(string); ok {
 		cfg.MsProxyURL = strings.TrimSpace(v)
+	}
+	if v, ok := raw["use_responses"].(bool); ok {
+		cfg.UseResponses = v
 	}
 	return cfg, nil
 }
