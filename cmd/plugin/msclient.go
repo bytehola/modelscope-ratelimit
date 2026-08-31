@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -474,7 +473,7 @@ func refreshAccountsCache(resolved resolvedEntry) []accountSummary {
 			defer func() { <-sem }()
 			defer func() {
 				if rec := recover(); rec != nil {
-					log.Printf("modelscope-ratelimit: recovered panic in account worker: %v", rec)
+					logInfo("recovered panic in account worker: %v", rec)
 				}
 			}()
 			var s accountSummary
@@ -519,7 +518,7 @@ func refreshAccountsCache(resolved resolvedEntry) []accountSummary {
 				defer func() { <-sem2 }()
 				defer func() {
 					if rec := recover(); rec != nil {
-						log.Printf("modelscope-ratelimit: recovered panic in balance worker: %v", rec)
+						logInfo("recovered panic in balance worker: %v", rec)
 					}
 				}()
 				mc.fetchBalanceData(&results[idx], sessionID, siteBase)

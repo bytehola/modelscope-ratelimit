@@ -6,14 +6,15 @@
 ![CLIProxyAPI](https://img.shields.io/badge/CLIProxyAPI-v7.2.51+-blue)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
 ![Build](https://img.shields.io/badge/build-c--shared-black)
-![Version](https://img.shields.io/badge/version-2.3.1-green)
+![Version](https://img.shields.io/badge/version-2.4.0-green)
 
 ## 核心特性
 
 - 🔴 **限额账号禁用**：余额耗尽禁用该 key，次日 00:00（按配置时区）自动恢复，调度跳过禁用凭据。
 - 🔁 **凭据轮换**：支持 `round-robin` / `fill-first`。每次请求从第一个 provider 开始，429 切下一个 provider，200 后下一请求回到第一个 provider；key 在各 provider 内跨请求轮换。
 - ⚡ **skip_provider_on_429 兜底**：开启后 429 立即用非托管模型重试，避免等待，推荐打开。
-- 🧪 **use_responses 透传**：开启后将 OpenAI Responses API 请求透传到上游 /v1/responses，并复用现有限流/key 轮换；默认关闭。
+- 🧪 **use_responses 透传**：`"*"` 表示全部模型，具体上游模型名或数组表示指定模型，通过上游 /v1/responses 透传并复用现有限流/key 轮换；未列入的托管 provider 按 `providers` 顺序交由宿主以 Chat 协议兜底；上游用 HTTP 200 返回错误文档（`{"code","message"}` / 非空 `error`）时按失败处理并继续轮换，不会当成成功返回；默认关闭。
+- 📜 **日志接入宿主**：插件日志经 `host.log` 写入 CPA 自己的日志文件，`GET /v0/management/logs` 与管理中心可直接检索；明细调度为 debug 级，需打开 CPA 调试模式。
 - 🎲 **自动签到 + 魔粒监控**：每日 00:00 签到领取魔粒，定时拉取余额与消费流水。
 - 📊 **状态页**：管理中心查看掩码 key、余额、消耗，5 秒刷新；管理密钥不渲染。
 
@@ -65,7 +66,7 @@ plugins:
       priority: 10
       providers: ["modelscope"]
       skip_provider_on_429: false # 推荐 true
-      use_responses: false # 开启后 Responses API 请求透传到上游 /v1/responses
+      use_responses: "*" # "*"=全部模型；或 "Qwen/Qwen2.5-72B-Instruct" / ["Qwen/Qwen2.5-72B-Instruct", "Qwen/Qwen2.5-7B-Instruct"]
       host_base_url: "http://127.0.0.1:8317"
       management_key: "your-management-secret"
       credential_strategy: "round-robin" # round-robin | fill-first
@@ -86,6 +87,34 @@ plugins:
 ?api=checkin-all                 # 一键签到
 ?api=refresh-balance&key=xxx     # 刷新余额与消耗
 ```
+
+### 日志
+
+插件运行在自己的 Go runtime 里，早期版本的 `log.Printf` 只写到进程 stderr（即控制台窗口），
+`logging-to-file: true` 时不会进入 `main.log`，管理中心的日志页也搜不到。现在统一走宿主的
+`host.log` 回调：
+
+- `info` 级：禁用、冷却、provider 跳过、上游失败、200-错误响应体等运维事件，始终可见。
+- `debug` 级：每次 Responses 请求的候选顺序与实际命中 provider（`responses attempt/served`），
+  需要打开 CPA 调试模式（管理中心 → 调试模式，或 `debug: true`）。
+- 配置生效会打印一行 `configured v<版本> providers=... use_responses=...`。宿主在挂接日志文件之前
+  就加载插件，所以这一行推迟到首个运行期调用（或启动 10 秒后的后台拉取）才写，空闲服务也会记一次；
+  同一份配置重复 register/reconfigure 只打印一次，用来确认线上加载的是哪个构建。
+
+检索示例：`GET /v0/management/logs?limit=500` 后过滤 `modelscope-ratelimit:`。
+host.log 不可用（或宿主未就绪）时自动回退到进程 stderr，日志不会丢。
+
+### Responses 协议怎么选
+
+`/v1/responses` 由插件执行器接管后，按 `providers` 顺序逐个 provider 决定协议：
+
+1. 该 provider 命中 `use_responses` → 插件直连它的上游 `/v1/responses`（原生透传）。
+2. 未命中 → 交宿主按 Chat 协议兜底（宿主会为自己的嵌套执行重跑 scheduler.pick）。
+
+顺序优先于协议：只要排在前面的 provider 能用 chat 答出来，就不会走到后面 provider 的原生透传。
+兜底步骤会带上内部标记头 `X-Modelscope-Ratelimit-Provider` 把这次嵌套执行钉在该 provider 上：
+没有它，该 provider 在嵌套执行里 429 后宿主会直接用后面 provider 的凭据应答，导致本该走原生
+`/v1/responses` 的模型退化成 chat。钉住需要宿主标记的内部来源元数据，外部请求自带该头无效。
 
 ## 结构
 

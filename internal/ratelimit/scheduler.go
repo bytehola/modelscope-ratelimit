@@ -11,6 +11,13 @@ import (
 // non-managed provider can serve as a fallback.
 var ErrAllCredentialsDisabled = errors.New("all credentials disabled for model (daily rate limit exhausted)")
 
+// ErrPinnedProviderUnavailable is returned when a nested execution pinned one
+// managed provider (see PinnedProviderHeader) and that provider has no
+// credential it could serve the request with. The caller's own step must fail
+// rather than fall through to another provider, which is the whole point of the
+// pin; returning Handled=false would let the host pick someone else's key.
+var ErrPinnedProviderUnavailable = errors.New("pinned provider has no available credential")
+
 // SchedulerPick implements scheduler.pick. It cooperates with CLIProxyAPI's
 // multi-account rotation: disabled key/model pairs are skipped and the
 // request is routed to the next available account.
@@ -50,12 +57,29 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 	cfg := s.config()
 	now := s.now()
 
+	// Request-scoped pin from the Responses executor's nested chat call. When set,
+	// every stage below only considers that provider: no cooldown-block decision
+	// for others, no non-managed fallback, and no cross-provider rotation.
+	pinned := cfg.PinnedProvider(req)
+	pinnedIdx := -1
+	if pinned != "" {
+		pinnedIdx = cfg.ProviderIndex(pinned)
+	} else if raw := headerValue(req.Options.Headers, PinnedProviderHeader); raw != "" && !isInternalExecution(req.Options.Metadata) {
+		// Either a client guessed the header name (correctly ignored) or the host
+		// stopped flagging nested executions as internally originated, which would
+		// silently switch the protocol downgrade back on. Say so loudly.
+		s.log.Printf("modelscope-ratelimit: ignoring pin provider=%s without internal-source metadata", raw)
+	}
+
 	// Pre-scan: are there any managed candidates in this request? When all
 	// managed keys are in the host's "tried" set (absent from candidates), the
 	// request is falling through to a non-managed provider — the global
 	// cooldown block must not delay that fallback.
 	hasManaged := false
 	for _, c := range req.Candidates {
+		if pinnedIdx >= 0 && cfg.ProviderIndex(c.Provider) != pinnedIdx {
+			continue
+		}
 		if cfg.ManagesProvider(c.Provider) {
 			hasManaged = true
 			break
@@ -113,6 +137,11 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 	availableCount := 0
 	seenIDs := make([]string, 0, len(req.Candidates))
 	for _, c := range req.Candidates {
+		if pinnedIdx >= 0 && cfg.ProviderIndex(c.Provider) != pinnedIdx {
+			// The nested call is reserved for the pinned provider; other managed
+			// and non-managed providers get their own step in the executor loop.
+			continue
+		}
 		if !cfg.ManagesProvider(c.Provider) {
 			nonManaged = append(nonManaged, c)
 			continue
@@ -133,6 +162,13 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 		availableCount++
 	}
 	s.recordSeen(seenIDs)
+
+	// A pinned step must not quietly become somebody else's step: fail so the
+	// executor moves on to the next provider's own (possibly native Responses)
+	// attempt.
+	if pinnedIdx >= 0 && availableCount == 0 {
+		return SchedulerPickResponse{}, fmt.Errorf("%w: provider=%q model=%q", ErrPinnedProviderUnavailable, cfg.Providers[pinnedIdx], s.displayName(req.Model))
+	}
 
 	// No managed candidate => out of scope. Defer to the built-in scheduler.
 	if managed == 0 {

@@ -70,13 +70,14 @@ type Config struct {
 	// restrict the file's permissions accordingly.
 	ManagementKey string `json:"management_key" yaml:"management_key"`
 
-	// UseResponses enables the experimental Responses-API passthrough executor.
-	// When false (default), OpenAI Responses requests are not intercepted and
-	// the host handles them through its normal provider path. When true, the
-	// plugin routes Responses requests to its own executor, which forwards them
-	// to the upstream /v1/responses endpoint while reusing the existing
-	// key-rotation, cooldown, disable and usage logic.
-	UseResponses bool `json:"use_responses" yaml:"use_responses"`
+	// UseResponses controls the experimental Responses-API passthrough
+	// executor. It accepts an upstream model name, "*", or a list of upstream
+	// model names.
+	// "*" enables the executor for every Responses request; otherwise only
+	// matching requested models are routed through the upstream /v1/responses
+	// endpoint. The legacy boolean form is also accepted: true means "*" and
+	// false means disabled.
+	UseResponses []string `json:"use_responses" yaml:"use_responses"`
 }
 
 // DefaultConfig returns the configuration tuned for the Modelscope
@@ -152,6 +153,23 @@ func (c *Config) ManagesProvider(provider string) bool {
 	return c.ProviderIndex(provider) >= 0
 }
 
+// UsesResponses reports whether Responses-API passthrough is enabled for the
+// requested model. A "*" entry enables all models; otherwise matching is
+// case-insensitive and whitespace-insensitive.
+func (c *Config) UsesResponses(model string) bool {
+	if c == nil || len(c.UseResponses) == 0 {
+		return false
+	}
+	model = strings.ToLower(strings.TrimSpace(model))
+	for _, want := range c.UseResponses {
+		want = strings.ToLower(strings.TrimSpace(want))
+		if want == "*" || (model != "" && want == model) {
+			return true
+		}
+	}
+	return false
+}
+
 // ConfigFromMap builds a Config from a generic map (the glue parses the host
 // YAML into a map and delegates here). Missing or zero-value fields fall back
 // to DefaultConfig so partial configs stay valid across versions.
@@ -188,10 +206,34 @@ func ConfigFromMap(raw map[string]any) (*Config, error) {
 	if v, ok := raw["ms_proxy_url"].(string); ok {
 		cfg.MsProxyURL = strings.TrimSpace(v)
 	}
-	if v, ok := raw["use_responses"].(bool); ok {
-		cfg.UseResponses = v
+	if v, ok := raw["use_responses"]; ok {
+		cfg.UseResponses = useResponsesFromValue(v)
 	}
 	return cfg, nil
+}
+
+func useResponsesFromValue(v any) []string {
+	if enabled, ok := v.(bool); ok {
+		if enabled {
+			return []string{"*"}
+		}
+		return nil
+	}
+	values := toStringSlice(v)
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // toStringSlice coerces a YAML/JSON scalar or sequence into a []string.

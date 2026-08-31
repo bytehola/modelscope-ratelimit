@@ -92,6 +92,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	_ "time/tzdata"
 	"unsafe"
@@ -102,11 +103,11 @@ import (
 	modelscope "modelscope-ratelimit/internal/ratelimit"
 )
 
-// store holds the rate-limit state for the lifetime of the plugin. It uses a
-// stderr logger; wire host.log in if your SDK exposes a convenient bridge.
+// store holds the rate-limit state for the lifetime of the plugin. Its logger
+// forwards to host.log so state changes show up in the host's own log file.
 var store = modelscope.NewStore(stderrLogger{})
 
-const pluginVersion = "2.3.1"
+const pluginVersion = "2.4.0"
 
 var pluginHost *C.cliproxy_host_api
 
@@ -144,26 +145,178 @@ type strategyEntry struct {
 }
 
 type resolvedEntry struct {
-	masked         map[string]string
-	raw            map[string]string            // authID -> raw API key (m_session_id cookie value)
-	maskToRaw      map[string]string            // maskedKey -> raw API key (O(1) lookup)
-	maskToSite     map[string]string            // maskedKey -> site base URL (O(1) lookup)
-	siteBase       map[string]string            // authID -> Modelscope site base URL (cn/ai)
-	baseURL        map[string]string            // authID -> upstream OpenAI-compatible base URL
-	aliasToName    map[string]map[string]string // provider name -> client alias -> upstream model name
-	orderedAuthIDs []string                     // stable iteration order (deterministic idx)
-	dedupedAuthIDs []string                     // one auth ID per raw API key (first in config order)
-	rawToAuthIDs   map[string][]string          // raw API key -> auth IDs sharing this account
-	providerOrder  map[string][]string          // provider name -> auth IDs in config.yaml api-key order
+	masked     map[string]string
+	raw        map[string]string // authID -> raw API key (m_session_id cookie value)
+	maskToRaw  map[string]string // maskedKey -> raw API key (O(1) lookup)
+	maskToSite map[string]string // maskedKey -> site base URL (O(1) lookup)
+	siteBase   map[string]string // authID -> Modelscope site base URL (cn/ai)
+	baseURL    map[string]string // authID -> upstream OpenAI-compatible base URL
+	// routeToName maps a provider's host-routable model ID to the real upstream
+	// model name. The route ID is what CLIProxyAPI registers in its model
+	// registry: the configured alias when non-empty, otherwise the name
+	// (see sdk/cliproxy buildConfiguredModelInfo: ModelInfo.ID = alias || name).
+	routeToName map[string]map[string]string // provider name -> route model ID -> upstream model name
+	// nameToRoute is the reverse index (lowercased upstream model name or alias
+	// -> route model ID) so a client that asks for the raw upstream name can
+	// still be mapped back to the identifier the host can route.
+	nameToRoute    map[string]map[string]string
+	orderedAuthIDs []string            // stable iteration order (deterministic idx)
+	dedupedAuthIDs []string            // one auth ID per raw API key (first in config order)
+	rawToAuthIDs   map[string][]string // raw API key -> auth IDs sharing this account
+	providerOrder  map[string][]string // provider name -> auth IDs in config.yaml api-key order
 	realTotal      int
 	unmatched      []string // configured providers not found upstream
 	err            error
 	at             time.Time
 }
 
+// logPrefix marks every line the plugin emits, so plugin output can be grepped
+// out of the shared host log.
+const logPrefix = "modelscope-ratelimit: "
+
+// hostLogDisabled latches off host.log forwarding after a single failure. The
+// callback is best effort: a plugin that kept knocking on a broken door would
+// pay a failing cgo round trip on every log line.
+var hostLogDisabled atomic.Bool
+
+// hostLogCall is indirected so tests can drive both the forwarding path and the
+// fallback without a real host.
+var hostLogCall = callHost
+
+// hostReady reports whether the host callback table has been handed over yet.
+// Indirected (rather than reading the cgo pointer inline) so the logging seam is
+// exercisable from tests, which cannot reference the cgo pseudo-package.
+var hostReady = func() bool { return pluginHost != nil }
+
+// rpcHostLogRequest mirrors the host glue layer's rpcHostLogRequest.
+type rpcHostLogRequest struct {
+	HostCallbackID string         `json:"host_callback_id,omitempty"`
+	Level          string         `json:"level,omitempty"`
+	Message        string         `json:"message,omitempty"`
+	Fields         map[string]any `json:"fields,omitempty"`
+}
+
+// emitHostLog forwards one line into CLIProxyAPI's own logger.
+//
+// The plugin runs in its own Go runtime, so the stdlib logger writes to the
+// plugin's stderr — with logging-to-file enabled that is only the console
+// window, never main.log, and the management log API shows nothing. host.log
+// puts plugin diagnostics in the same rotating file; passing the caller's
+// host_callback_id also tags the line with the host request id. callbackID may
+// be empty (background workers have no request context).
+func emitHostLog(level, callbackID, message string) bool {
+	if !hostReady() || hostLogDisabled.Load() {
+		return false
+	}
+	raw, errMarshal := json.Marshal(rpcHostLogRequest{Level: level, Message: message, HostCallbackID: callbackID})
+	if errMarshal != nil {
+		return false
+	}
+	if _, errCall := hostLogCall(pluginabi.MethodHostLog, raw); errCall != nil {
+		hostLogDisabled.Store(true)
+		log.Print(logPrefix + "host.log unavailable, falling back to stderr: " + errCall.Error())
+		return false
+	}
+	return true
+}
+
+// logAt emits one plugin diagnostic. Level "info" is always visible; "debug"
+// needs the host's debug logging switched on. Both fall back to the process
+// logger until the host handle exists (early init) or once forwarding is off.
+func logAt(level, callbackID, format string, args ...any) {
+	message := format
+	if len(args) > 0 {
+		message = fmt.Sprintf(format, args...)
+	}
+	if !strings.HasPrefix(message, logPrefix) {
+		message = logPrefix + message
+	}
+	if emitHostLog(level, callbackID, message) {
+		return
+	}
+	log.Print(message)
+}
+
+func logInfo(format string, args ...any) { logAt("info", "", format, args...) }
+
+// maxLogBody bounds how much of an upstream error body reaches the log. Error
+// documents are short; the cap keeps a pathological body from bloating
+// main.log.
+const maxLogBody = 300
+
+// logBodyExcerpt returns a single-line, length-bounded excerpt of a response
+// body for diagnostics. Only error paths use it, so it never carries a
+// successful completion's content.
+func logBodyExcerpt(body string) string {
+	body = strings.TrimSpace(body)
+	body = strings.NewReplacer("\n", " ", "\r", " ", "\t", " ").Replace(body)
+	if len(body) > maxLogBody {
+		return body[:maxLogBody] + "..."
+	}
+	return body
+}
+
+func logDebug(format string, args ...any) { logAt("debug", "", format, args...) }
+
+// logInfoRequest and logDebugRequest attach the host callback id so the line is
+// tagged with the request id of the call that produced it.
+func logInfoRequest(callbackID, format string, args ...any) {
+	logAt("info", callbackID, format, args...)
+}
+
+// configBannerMu guards the banner bookkeeping below.
+var (
+	configBannerMu      sync.Mutex
+	lastConfigBanner    string
+	pendingConfigBanner string
+)
+
+// logConfigBanner records the effective settings for the next flush, once per
+// real change.
+//
+// It deliberately does not print: the host runs pluginhost.ApplyConfig (which
+// lands here through configure()) before logging.ConfigureLogOutput attaches the
+// rotating file, so a line written during configure only reaches the console and
+// never main.log. plugin.register and plugin.reconfigure also fire several times
+// per reload, so eager printing duplicated the line as well.
+func logConfigBanner(cfg *modelscope.Config) {
+	if cfg == nil {
+		return
+	}
+	// Never include the management key or any credential material here.
+	line := fmt.Sprintf("configured v%s providers=%s use_responses=%s skip_provider_on_429=%t cooldown=%.1fs host=%s",
+		pluginVersion, strings.Join(cfg.Providers, ","), strings.Join(cfg.UseResponses, ","),
+		cfg.SkipProviderOn429, cfg.InsufficientQuotaCooldown, cfg.HostBaseURL)
+	configBannerMu.Lock()
+	if line != lastConfigBanner {
+		lastConfigBanner = line
+		pendingConfigBanner = line
+	}
+	configBannerMu.Unlock()
+}
+
+// flushConfigBanner writes a recorded banner exactly once. Called from the first
+// runtime host call after configure and from the post-startup account fetch, so a
+// proxy that sees no traffic still reports what it loaded.
+func flushConfigBanner() {
+	configBannerMu.Lock()
+	line := pendingConfigBanner
+	pendingConfigBanner = ""
+	configBannerMu.Unlock()
+	if line != "" {
+		logInfo("%s", line)
+	}
+}
+
+func logDebugRequest(callbackID, format string, args ...any) {
+	logAt("debug", callbackID, format, args...)
+}
+
+// stderrLogger is the sink the core state machine logs into. The name is kept
+// for its history; it now routes through host.log.
 type stderrLogger struct{}
 
-func (stderrLogger) Printf(format string, args ...any) { log.Printf(format, args...) }
+func (stderrLogger) Printf(format string, args ...any) { logInfo(format, args...) }
 
 func main() {}
 
@@ -192,7 +345,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	// so it degrades to a 200 HTML page rather than an error envelope.
 	defer func() {
 		if rec := recover(); rec != nil {
-			log.Printf("modelscope-ratelimit: recovered panic in plugin call: %v", rec)
+			logInfo("recovered panic in plugin call: %v", rec)
 			writeResponse(response, errorEnvelope("plugin_panic", fmt.Sprintf("%v", rec)))
 		}
 	}()
@@ -233,6 +386,11 @@ func cliproxyPluginShutdown() {
 // {ok,result}/{ok:false,error} envelope bytes plus a Go error for transport
 // failures (which are also wrapped as an error envelope by the caller).
 func handleMethod(method string, request []byte) ([]byte, error) {
+	if method != pluginabi.MethodPluginRegister && method != pluginabi.MethodPluginReconfigure {
+		// A runtime method means the host is past startup and its log sink is
+		// attached, so the deferred configuration banner can be written.
+		flushConfigBanner()
+	}
 	switch method {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
 		if err := configure(request); err != nil {
@@ -384,6 +542,12 @@ func configure(raw []byte) error {
 		return err
 	}
 	store.Reconfigure(cfg)
+	// One line per real configuration change so the host log shows which build
+	// answered and with what effective settings. The host calls both
+	// plugin.register and plugin.reconfigure, so an unguarded banner would print
+	// several identical lines per reload. Never log the management key or any
+	// credential material here.
+	logConfigBanner(cfg)
 	// TODO: remove after debugging. Routes Modelscope API calls through proxy.
 	SetMSProxy(cfg.MsProxyURL)
 	store.Start()
@@ -428,7 +592,7 @@ func configure(raw []byte) error {
 				defer func() { <-sem }()
 				defer func() {
 					if rec := recover(); rec != nil {
-						log.Printf("modelscope-ratelimit: recovered panic in sign-in worker: %v", rec)
+						logInfo("recovered panic in sign-in worker: %v", rec)
 					}
 				}()
 				sc, _, err := mc.getWithRetry(sbCopy, "/api/v1/users/login/info", sid)
@@ -473,7 +637,7 @@ func configure(raw []byte) error {
 			}
 			defer func() {
 				if rec := recover(); rec != nil {
-					log.Printf("modelscope-ratelimit: recovered panic in midnight refresh: %v", rec)
+					logInfo("recovered panic in midnight refresh: %v", rec)
 				}
 				markRefreshDone()
 			}()
@@ -499,12 +663,15 @@ func configure(raw []byte) error {
 	// After this, refreshes only fetch balance + rate-limit (no login/info).
 	go func() {
 		time.Sleep(10 * time.Second)
+		// Startup logging is attached by now even if no request has arrived, so an
+		// idle proxy still reports the configuration it loaded.
+		flushConfigBanner()
 		if !forceBackgroundRefresh() {
 			return
 		}
 		defer func() {
 			if rec := recover(); rec != nil {
-				log.Printf("modelscope-ratelimit: recovered panic in startup fetch: %v", rec)
+				logInfo("recovered panic in startup fetch: %v", rec)
 			}
 			markRefreshDone()
 		}()
@@ -633,24 +800,24 @@ func (g *stableIDGen) Next(kind string, parts ...string) string {
 // each api-key with stableIDGen (the host's StableIDGenerator algorithm), so
 // no auth-files join is needed (auth-files omits config-based api-keys). The
 // management key stays server-side; nothing sensitive reaches the browser.
-func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string]string, raw map[string]string, siteBase map[string]string, orderedAuthIDs []string, providerOrder map[string][]string, realTotal int, unmatched []string, baseURLs map[string]string, aliasToName map[string]map[string]string, err error) {
+func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string]string, raw map[string]string, siteBase map[string]string, orderedAuthIDs []string, providerOrder map[string][]string, realTotal int, unmatched []string, baseURLs map[string]string, routeToName map[string]map[string]string, nameToRoute map[string]map[string]string, err error) {
 	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if base == "" {
-		return nil, nil, nil, nil, nil, 0, nil, nil, nil, errors.New("host_base_url is empty")
+		return nil, nil, nil, nil, nil, 0, nil, nil, nil, nil, errors.New("host_base_url is empty")
 	}
 
 	sc, body, err := httpDo("GET", base+"/v0/management/openai-compatibility", mgmtKey)
 	if err != nil {
-		return nil, nil, nil, nil, nil, 0, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, 0, nil, nil, nil, nil, err
 	}
 	if sc != 200 {
-		return nil, nil, nil, nil, nil, 0, nil, nil, nil, fmt.Errorf("openai-compatibility: HTTP %d", sc)
+		return nil, nil, nil, nil, nil, 0, nil, nil, nil, nil, fmt.Errorf("openai-compatibility: HTTP %d", sc)
 	}
 	var oc struct {
 		List []mgmtOpenAICompatEntry `json:"openai-compatibility"`
 	}
 	if err := json.Unmarshal(body, &oc); err != nil {
-		return nil, nil, nil, nil, nil, 0, nil, nil, nil, fmt.Errorf("decode openai-compatibility: %w", err)
+		return nil, nil, nil, nil, nil, 0, nil, nil, nil, nil, fmt.Errorf("decode openai-compatibility: %w", err)
 	}
 
 	want := make(map[string]bool, len(providers))
@@ -664,7 +831,8 @@ func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string
 	raw = make(map[string]string)
 	siteBase = make(map[string]string)
 	baseURLs = make(map[string]string)
-	aliasToName = make(map[string]map[string]string)
+	routeToName = make(map[string]map[string]string)
+	nameToRoute = make(map[string]map[string]string)
 	orderedAuthIDs = make([]string, 0)
 	providerOrder = make(map[string][]string)
 	realTotal = 0
@@ -704,13 +872,27 @@ func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string
 			orderedAuthIDs = append(orderedAuthIDs, authID)
 			providerOrder[nm] = append(providerOrder[nm], authID)
 		}
-		providerModels := make(map[string]string)
+		// Build the route-ID <-> upstream-name indexes. Every configured model
+		// is indexed, not just aliased ones: the host registers the alias as the
+		// model ID when one is set and the name otherwise, so the two must never
+		// be used interchangeably when the plugin asks the host to execute.
+		routes := make(map[string]string)
+		toRoute := make(map[string]string)
 		for _, m := range e.Models {
-			if m.Alias != "" && m.Name != "" {
-				providerModels[strings.TrimSpace(m.Alias)] = strings.TrimSpace(m.Name)
+			name := strings.TrimSpace(m.Name)
+			if name == "" {
+				continue
 			}
+			routeID := strings.TrimSpace(m.Alias)
+			if routeID == "" {
+				routeID = name
+			}
+			routes[routeID] = name
+			toRoute[strings.ToLower(name)] = routeID
+			toRoute[strings.ToLower(routeID)] = routeID
 		}
-		aliasToName[nm] = providerModels
+		routeToName[nm] = routes
+		nameToRoute[nm] = toRoute
 	}
 
 	// Configured providers that no upstream openai-compatibility entry matches.
@@ -719,7 +901,7 @@ func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string
 			unmatched = append(unmatched, p)
 		}
 	}
-	return masked, raw, siteBase, orderedAuthIDs, providerOrder, realTotal, unmatched, baseURLs, aliasToName, nil
+	return masked, raw, siteBase, orderedAuthIDs, providerOrder, realTotal, unmatched, baseURLs, routeToName, nameToRoute, nil
 }
 
 // resolveRefreshMu guards resolveRefreshing, the singleflight flag that
@@ -750,9 +932,9 @@ func resolvedExpired(c resolvedEntry) bool {
 // returning the fresh entry. Shared by the sync (resolveKeysCached) and async
 // (startResolveRefresh) paths so the store logic lives in one place.
 func performResolve(baseURL, mgmtKey string, providers []string) resolvedEntry {
-	masked, raw, siteBase, orderedAuthIDs, providerOrder, realTotal, unmatched, baseURLs, aliasToName, err := resolveKeys(baseURL, mgmtKey, providers)
+	masked, raw, siteBase, orderedAuthIDs, providerOrder, realTotal, unmatched, baseURLs, routeToName, nameToRoute, err := resolveKeys(baseURL, mgmtKey, providers)
 	dedupedAuthIDs, rawToAuthIDs, maskToRaw, maskToSite := buildDedupMaps(orderedAuthIDs, raw, siteBase)
-	refreshed := resolvedEntry{masked: masked, raw: raw, maskToRaw: maskToRaw, maskToSite: maskToSite, siteBase: siteBase, baseURL: baseURLs, aliasToName: aliasToName, orderedAuthIDs: orderedAuthIDs, dedupedAuthIDs: dedupedAuthIDs, rawToAuthIDs: rawToAuthIDs, providerOrder: providerOrder, realTotal: realTotal, unmatched: unmatched, err: err, at: time.Now()}
+	refreshed := resolvedEntry{masked: masked, raw: raw, maskToRaw: maskToRaw, maskToSite: maskToSite, siteBase: siteBase, baseURL: baseURLs, routeToName: routeToName, nameToRoute: nameToRoute, orderedAuthIDs: orderedAuthIDs, dedupedAuthIDs: dedupedAuthIDs, rawToAuthIDs: rawToAuthIDs, providerOrder: providerOrder, realTotal: realTotal, unmatched: unmatched, err: err, at: time.Now()}
 	resolvedMu.Lock()
 	resolvedCache = refreshed
 	resolvedMu.Unlock()
@@ -962,7 +1144,7 @@ func pluginRegistration() any {
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "providers", Type: pluginapi.ConfigFieldTypeArray, Description: "监控的提供商名称（必填）。填入顺序决定轮换顺序：skip_provider_on_429 关闭时，单次请求内 429 后切下一个 provider，任意 200 后下一次请求回到第一个 provider；只有 key 在各 provider 内跨请求轮换。"},
 				{Name: "skip_provider_on_429", Type: pluginapi.ConfigFieldTypeBoolean, Description: "关闭时（默认）：429+insufficient_quota 单次请求内切下一个 provider + 全局退避冷却，任意 200 回到第一个 provider；开启时：429 后直接用非托管模型兜底。"},
-				{Name: "use_responses", Type: pluginapi.ConfigFieldTypeBoolean, Description: "开启后将 OpenAI Responses API 请求透传到上游 /v1/responses，并复用现有限流、禁用、统计与 key 轮换；默认关闭。"},
+				{Name: "use_responses", Type: pluginapi.ConfigFieldTypeString, Description: "打开 Responses API 接口：填写“*”表示全部模型，填写具体上游模型名表示仅该模型；YAML 中也支持数组，例如 [“ZhipuAI/GLM-5.2”, “Qwen/Qwen2.5-72B-Instruct”]。未列入的托管 provider 按 providers 顺序交由宿主以 Chat 协议兜底。默认关闭。"},
 				{Name: "host_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "CPA 链接地址，默认 http://127.0.0.1:8317。"},
 				{Name: "management_key", Type: pluginapi.ConfigFieldTypeString, Description: "CPA 管理密钥。（必填）"},
 				{Name: "credential_strategy", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"round-robin", "fill-first"}, Description: "凭据选择策略（仅对监控的 provider 生效）：round-robin=轮询（默认），fill-first=填充优先"},
@@ -1047,7 +1229,7 @@ type managementResponse struct {
 func safeHandleManagement(request []byte) (resp managementResponse) {
 	defer func() {
 		if rec := recover(); rec != nil {
-			log.Printf("modelscope-ratelimit: recovered panic in handleManagement: %v", rec)
+			logInfo("recovered panic in handleManagement: %v", rec)
 			resp = mgmtHTML(statusOrGuidance())
 		}
 	}()
@@ -1171,7 +1353,7 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 					go func() {
 						defer func() {
 							if rec := recover(); rec != nil {
-								log.Printf("modelscope-ratelimit: recovered panic in refresh: %v", rec)
+								logInfo("recovered panic in refresh: %v", rec)
 							}
 							markRefreshDone()
 						}()
@@ -1192,7 +1374,7 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 				go func() {
 					defer func() {
 						if rec := recover(); rec != nil {
-							log.Printf("modelscope-ratelimit: recovered panic in refresh: %v", rec)
+							logInfo("recovered panic in refresh: %v", rec)
 						}
 						markRefreshDone()
 					}()
@@ -1287,7 +1469,7 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 				defer func() { <-csem }()
 				defer func() {
 					if rec := recover(); rec != nil {
-						log.Printf("modelscope-ratelimit: recovered panic in checkin worker: %v", rec)
+						logInfo("recovered panic in checkin worker: %v", rec)
 					}
 				}()
 				sc, _, err := mc.getWithRetry(sbCopy, "/api/v1/users/login/info", sid)
@@ -1312,7 +1494,7 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 			go func() {
 				defer func() {
 					if rec := recover(); rec != nil {
-						log.Printf("modelscope-ratelimit: recovered panic in checkin refresh: %v", rec)
+						logInfo("recovered panic in checkin refresh: %v", rec)
 					}
 					markRefreshDone()
 				}()
@@ -1711,19 +1893,55 @@ func routeResponsesRequest(req pluginapi.ModelRouteRequest) pluginapi.ModelRoute
 	if cfg == nil || len(cfg.Providers) == 0 {
 		return pluginapi.ModelRouteResponse{Handled: false}
 	}
-	if !cfg.UseResponses {
-		return pluginapi.ModelRouteResponse{Handled: false}
-	}
 	switch strings.ToLower(strings.TrimSpace(req.SourceFormat)) {
 	case "openai-response", "responses", "codex":
-		return pluginapi.ModelRouteResponse{
-			Handled:    true,
-			TargetKind: pluginapi.ModelRouteTargetSelf,
-			Reason:     "responses-passthrough",
-		}
 	default:
 		return pluginapi.ModelRouteResponse{Handled: false}
 	}
+	if !responsesRouteModelEnabled(cfg, req.RequestedModel) {
+		return pluginapi.ModelRouteResponse{Handled: false}
+	}
+	return pluginapi.ModelRouteResponse{
+		Handled:    true,
+		TargetKind: pluginapi.ModelRouteTargetSelf,
+		Reason:     "responses-passthrough",
+	}
+}
+
+func responsesRouteModelEnabled(cfg *modelscope.Config, requestedModel string) bool {
+	if cfg == nil {
+		return false
+	}
+	if len(cfg.UseResponses) == 0 {
+		return false
+	}
+	if cfg.UsesResponses("*") {
+		return true
+	}
+	alias := strings.TrimSpace(requestedModel)
+	resolved := ensureResolved()
+	mapped := false
+	for _, name := range cfg.Providers {
+		provider := strings.ToLower(strings.TrimSpace(name))
+		if resolved.routeToName == nil {
+			break
+		}
+		// Match on the upstream name (use_responses documents upstream names),
+		// accepting both the host route ID and the raw upstream name.
+		upstream, route := resolveProviderModel(resolved, provider, alias)
+		if upstream == "" || route == "" {
+			continue
+		}
+		mapped = true
+		if cfg.UsesResponses(upstream) {
+			return true
+		}
+	}
+	if mapped {
+		return false
+	}
+	// Without a managed-model mapping, alias and upstream model are equivalent.
+	return cfg.UsesResponses(alias)
 }
 
 func ensureResolved() resolvedEntry {
@@ -1825,12 +2043,59 @@ func upstreamModelForAuth(authID string, req pluginapi.ExecutorRequest) string {
 	if provider == "" {
 		return alias
 	}
-	if resolved := getResolved(); resolved.aliasToName != nil {
-		if upstream, ok := resolved.aliasToName[provider][alias]; ok && upstream != "" {
+	if resolved := getResolved(); resolved.routeToName != nil {
+		if upstream, ok := resolved.routeToName[provider][alias]; ok && upstream != "" {
 			return upstream
 		}
 	}
 	return alias
+}
+
+// resolveProviderModel translates the client-requested model into the two
+// different identifiers a managed provider step needs:
+//
+//   - upstream: the real model name to put in the body of a direct upstream
+//     /v1/responses call (what the Modelscope API expects).
+//   - route: the model ID CLIProxyAPI can route (the configured alias when one
+//     exists, otherwise the name). host.model.execute resolves the provider
+//     list from the model registry with an exact lookup, so passing `upstream`
+//     for an aliased model fails with model_not_found.
+//
+// A provider with no known model list (management API error, or a compat entry
+// without a models: block) maps to itself, which keeps the pre-index behaviour.
+func resolveProviderModel(resolved resolvedEntry, provider, requested string) (upstream string, route string) {
+	p := strings.ToLower(strings.TrimSpace(provider))
+	requested = strings.TrimSpace(requested)
+	if requested == "" {
+		return "", ""
+	}
+	routes := resolved.routeToName[p]
+	toRoute := resolved.nameToRoute[p]
+	if len(routes) == 0 {
+		// No model index for this provider: identity mapping, still routable.
+		return requested, requested
+	}
+	if name, ok := routes[requested]; ok && strings.TrimSpace(name) != "" {
+		return strings.TrimSpace(name), requested
+	}
+	if routeID, ok := toRoute[strings.ToLower(requested)]; ok {
+		if name, okName := routes[routeID]; okName && strings.TrimSpace(name) != "" {
+			return strings.TrimSpace(name), routeID
+		}
+		return requested, routeID
+	}
+	// The provider lists models and none matches: only a direct upstream call
+	// could still serve it, so there is no host route for the chat fallback.
+	return requested, ""
+}
+
+func upstreamModelForRetryStep(step retryStep, resolved resolvedEntry, alias string) string {
+	upstream, _ := resolveProviderModel(resolved, step.provider, alias)
+	return upstream
+}
+
+func responsesProtocolEnabled(cfg *modelscope.Config, model string) bool {
+	return cfg != nil && cfg.UsesResponses(model)
 }
 
 func withModel(body []byte, model string) []byte {
@@ -1859,12 +2124,10 @@ type retryCandidate struct {
 }
 
 // buildRetrySequence returns an ordered list of managed-provider steps.
-// Only managed providers are tried via the Responses passthrough executor;
-// each step calls Store.NextProviderKey to resolve the actual auth ID from the
-// per-provider cursor, so key order persists across requests. When all
-// managed providers are exhausted the executor defers to the host's built-in
-// path (host.model.execute) so non-managed providers serve the request through
-// the normal chat protocol with Responses<->Chat translation.
+// Responses-enabled candidates use Store.NextProviderKey for direct upstream
+// /v1/responses calls. Non-Responses candidates are sent through the host
+// built-in chat path once per provider; the host handles Responses<->Chat
+// translation and key rotation for those providers.
 //
 // skip ON: try one key per managed provider.
 // skip OFF: exhaust all keys per managed provider.
@@ -1900,12 +2163,7 @@ func resolveStep(step retryStep, resolved resolvedEntry, alias string) (retryCan
 	}
 	apiKey := resolved.raw[authID]
 	baseURL := resolved.baseURL[authID]
-	model := alias
-	if models := resolved.aliasToName[step.provider]; models != nil {
-		if upstream, ok := models[alias]; ok && upstream != "" {
-			model = upstream
-		}
-	}
+	model := upstreamModelForRetryStep(step, resolved, alias)
 	return retryCandidate{
 		authID:   authID,
 		provider: step.provider,
@@ -1913,6 +2171,72 @@ func resolveStep(step retryStep, resolved resolvedEntry, alias string) (retryCan
 		baseURL:  baseURL,
 		model:    model,
 	}, true
+}
+
+func hostModelRequestForCandidate(req executorRequestWithCallback, model string) executorRequestWithCallback {
+	out := req
+	out.Model = strings.TrimSpace(model)
+	return out
+}
+
+// hostModelRequestForProvider builds one provider's nested chat call and pins it
+// to that provider with the internal marker header, so a 429 inside the nested
+// execution cannot make the host answer with another provider's credential.
+//
+// The header set is copied: the caller's headers belong to the outer request,
+// which later reuses them for the direct upstream calls and the final
+// unconstrained host fallback.
+func hostModelRequestForProvider(req executorRequestWithCallback, model, provider string) executorRequestWithCallback {
+	out := hostModelRequestForCandidate(req, model)
+	if strings.TrimSpace(provider) == "" {
+		return out
+	}
+	headers := make(http.Header, len(out.Headers)+1)
+	for key, values := range out.Headers {
+		headers[key] = append([]string(nil), values...)
+	}
+	headers.Set(modelscope.PinnedProviderHeader, provider)
+	out.Headers = headers
+	return out
+}
+
+// providerHasUsableCredential reports whether the plugin's own scheduler would
+// still hand this provider's request to one of its credentials.
+//
+// The chat-fallback step asks the host to execute the *shared* route model, and
+// the host re-runs scheduler.pick over every provider serving that alias. If the
+// preferred provider is in the skip set (429) or has only daily-disabled keys,
+// the host answers that nested call with a different provider's credential —
+// which silently downgrades a later, Responses-enabled provider to the chat
+// protocol because its own native step never gets a chance to run. Checking the
+// same conditions the scheduler applies keeps the fallback on the provider it is
+// meant to test.
+func providerHasUsableCredential(provider string, resolved resolvedEntry) bool {
+	cfg := currentConfig()
+	if cfg == nil {
+		return true
+	}
+	if cfg.SkipProviderOn429 && store.IsProviderSkipped(provider) {
+		return false
+	}
+	ids := resolved.providerOrder[strings.ToLower(strings.TrimSpace(provider))]
+	if len(ids) == 0 {
+		// Key set unknown (cold resolution): let the host decide.
+		return true
+	}
+	now := store.Now()
+	for _, id := range ids {
+		if !store.IsKeyDisabled(id, "", now) {
+			return true
+		}
+	}
+	return false
+}
+
+func retryableResponsesStatus(statusCode int) bool {
+	return statusCode == http.StatusTooManyRequests ||
+		statusCode == http.StatusMethodNotAllowed ||
+		statusCode >= http.StatusInternalServerError
 }
 
 func executeResponsesPassthrough(req executorRequestWithCallback) (pluginapi.ExecutorResponse, error) {
@@ -1926,7 +2250,60 @@ func executeResponsesPassthrough(req executorRequestWithCallback) (pluginapi.Exe
 		originalBody = req.Payload
 	}
 
+	unsupportedProviders := make(map[string]bool)
+	chatProviderAttempted := make(map[string]bool)
 	for _, step := range steps {
+		providerName := strings.ToLower(strings.TrimSpace(step.provider))
+		if unsupportedProviders[providerName] {
+			continue
+		}
+		candidateModel, routeModel := resolveProviderModel(resolved, step.provider, alias)
+		if candidateModel == "" {
+			continue
+		}
+		if !responsesProtocolEnabled(cfg, candidateModel) {
+			if chatProviderAttempted[providerName] {
+				continue
+			}
+			// Only run the chat fallback for a provider that can actually answer
+			// it; otherwise the host would satisfy this step with another
+			// provider's credential and lose that provider's native protocol.
+			if !providerHasUsableCredential(step.provider, resolved) {
+				logInfoRequest(req.HostCallbackID, "responses chat fallback skipped provider=%s (in 429 skip set or all credentials disabled)", step.provider)
+				continue
+			}
+			chatProviderAttempted[providerName] = true
+
+			// Without a host-routable ID for this provider there is no chat
+			// fallback to try: the direct upstream call below is the only route.
+			if routeModel == "" {
+				logInfoRequest(req.HostCallbackID, "responses skip provider=%s model=%s (no host-routable model, Responses passthrough disabled for it)", step.provider, alias)
+				continue
+			}
+			// The host resolves providers from its model registry by exact ID, and
+			// an aliased compat model is registered under the alias only: send the
+			// route ID, never the upstream name. The host then rewrites the
+			// per-auth upstream name itself, and the plugin scheduler still runs
+			// for the nested call, so providers keep their configured order.
+			logDebugRequest(req.HostCallbackID, "responses attempt provider=%s mode=chat-fallback pinned=true model=%s upstream=%s", step.provider, routeModel, candidateModel)
+			hostResp, errHost := hostModelExecute(hostModelRequestForProvider(req, routeModel, step.provider))
+			if errHost != nil {
+				logInfoRequest(req.HostCallbackID, "responses chat fallback failed provider=%s model=%s: %v", step.provider, routeModel, errHost)
+				continue
+			}
+			if hostResp.StatusCode < 200 || hostResp.StatusCode >= 300 {
+				logInfoRequest(req.HostCallbackID, "responses chat fallback provider=%s model=%s -> HTTP %d", step.provider, routeModel, hostResp.StatusCode)
+				if retryableResponsesStatus(hostResp.StatusCode) {
+					continue
+				}
+				return pluginapi.ExecutorResponse{}, fmt.Errorf("host chat fallback: HTTP %d: %s", hostResp.StatusCode, string(hostResp.Body))
+			}
+			// The host's own scheduler picks the credential for the nested call, so
+			// this only proves the preferred provider accepted it; the `schedule`
+			// line under the same request id names the auth actually used.
+			logDebugRequest(req.HostCallbackID, "responses served via=host-chat-fallback preferred_provider=%s model=%s (credential chosen by host scheduler)", step.provider, routeModel)
+			return pluginapi.ExecutorResponse{Payload: hostResp.Body, Headers: hostResp.Headers}, nil
+		}
 		cand, ok := resolveStep(step, resolved, alias)
 		if !ok {
 			continue
@@ -1936,24 +2313,41 @@ func executeResponsesPassthrough(req executorRequestWithCallback) (pluginapi.Exe
 		}
 		upstreamBody := withModel(originalBody, cand.model)
 		upstreamReq := responsesUpstreamRequest(req.Headers, cand.apiKey, strings.TrimSuffix(cand.baseURL, "/")+"/responses", upstreamBody)
+		logDebugRequest(req.HostCallbackID, "responses attempt provider=%s mode=passthrough model=%s key=%s", cand.provider, cand.model, maskKey(cand.apiKey))
 		resp, errDo := hostHTTPDo(upstreamReq, req.HostCallbackID)
 		if errDo != nil {
+			logInfoRequest(req.HostCallbackID, "responses upstream request failed provider=%s model=%s: %v", cand.provider, cand.model, errDo)
 			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, errDo.Error(), cand.provider, cand.model))
 			continue
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			logInfoRequest(req.HostCallbackID, "responses upstream HTTP %d provider=%s model=%s body=%s", resp.StatusCode, cand.provider, cand.model, logBodyExcerpt(string(resp.Body)))
 			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, resp.StatusCode, string(resp.Body), cand.provider, cand.model))
-			if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+			if retryableResponsesStatus(resp.StatusCode) {
+				if resp.StatusCode == http.StatusMethodNotAllowed && cfg.SkipProviderOn429 {
+					unsupportedProviders[providerName] = true
+				}
 				continue
 			}
 			return pluginapi.ExecutorResponse{}, fmt.Errorf("upstream responses: HTTP %d: %s", resp.StatusCode, string(resp.Body))
 		}
-		if modelscope.IsResponsesRateLimitExceeded(string(resp.Body)) {
+		respBody := string(resp.Body)
+		if modelscope.IsResponsesRateLimitExceeded(respBody) {
+			logInfoRequest(req.HostCallbackID, "responses rate limited provider=%s model=%s, rotating", cand.provider, cand.model)
 			store.ApplyResponsesRateLimit(cand.authID, "openai-compatible-"+cand.provider, req.Model, string(resp.Body), store.Now())
 			continue
 		}
-		if modelscope.IsResponsesFailed(string(resp.Body)) {
-			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, resp.StatusCode, string(resp.Body), cand.provider, cand.model))
+		if modelscope.IsResponsesFailed(respBody) {
+			logInfoRequest(req.HostCallbackID, "responses failed provider=%s model=%s body=%s", cand.provider, cand.model, logBodyExcerpt(respBody))
+			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, resp.StatusCode, respBody, cand.provider, cand.model))
+			continue
+		}
+		// Modelscope answers some rejections with HTTP 200 plus a bare error
+		// document. Treat it as this provider failing instead of handing the
+		// client a body that is not a Response resource.
+		if modelscope.IsResponsesErrorPayload(respBody) {
+			logInfoRequest(req.HostCallbackID, "responses provider=%s model=%s returned an error payload with HTTP 200: %s", cand.provider, cand.model, logBodyExcerpt(respBody))
+			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, resp.StatusCode, respBody, cand.provider, cand.model))
 			continue
 		}
 		store.OnUsage(modelscope.UsageRecord{
@@ -1962,6 +2356,7 @@ func executeResponsesPassthrough(req executorRequestWithCallback) (pluginapi.Exe
 			Model:    cand.model,
 			Alias:    req.Model,
 		})
+		logDebugRequest(req.HostCallbackID, "responses served provider=%s mode=passthrough model=%s", cand.provider, cand.model)
 		return pluginapi.ExecutorResponse{Payload: resp.Body, Headers: headerMapToHTTP(resp.Headers)}, nil
 	}
 
@@ -1988,6 +2383,9 @@ const (
 	responsesStreamPreflightOK responsesStreamPreflightStatus = iota
 	responsesStreamPreflightFailed
 	responsesStreamPreflightRateLimited
+	// responsesStreamPreflightErrorPayload marks a stream that opened with HTTP
+	// 200 but delivered an error document rather than SSE events.
+	responsesStreamPreflightErrorPayload
 )
 
 type responsesStreamPreflightResult struct {
@@ -2008,7 +2406,58 @@ func executeResponsesPassthroughStream(req executorRequestWithCallback) (plugina
 		originalBody = req.Payload
 	}
 
+	unsupportedProviders := make(map[string]bool)
+	chatProviderAttempted := make(map[string]bool)
 	for _, step := range steps {
+		providerName := strings.ToLower(strings.TrimSpace(step.provider))
+		if unsupportedProviders[providerName] {
+			continue
+		}
+		candidateModel, routeModel := resolveProviderModel(resolved, step.provider, alias)
+		if candidateModel == "" {
+			continue
+		}
+		if !responsesProtocolEnabled(cfg, candidateModel) {
+			if chatProviderAttempted[providerName] {
+				continue
+			}
+			if !providerHasUsableCredential(step.provider, resolved) {
+				logInfoRequest(req.HostCallbackID, "responses stream chat fallback skipped provider=%s (in 429 skip set or all credentials disabled)", step.provider)
+				continue
+			}
+			chatProviderAttempted[providerName] = true
+
+			// Without a host-routable ID for this provider there is no chat
+			// fallback to try: the direct upstream stream is the only route.
+			if routeModel == "" {
+				logInfoRequest(req.HostCallbackID, "responses stream skip provider=%s model=%s (no host-routable model, Responses passthrough disabled for it)", step.provider, alias)
+				continue
+			}
+			// Route model, not upstream model: see executeResponsesPassthrough.
+			logDebugRequest(req.HostCallbackID, "responses stream attempt provider=%s mode=chat-fallback pinned=true model=%s upstream=%s", step.provider, routeModel, candidateModel)
+			hostStream, errHost := hostModelExecuteStream(hostModelRequestForProvider(req, routeModel, step.provider))
+			if errHost != nil {
+				logInfoRequest(req.HostCallbackID, "responses chat fallback stream failed provider=%s model=%s: %v", step.provider, routeModel, errHost)
+				continue
+			}
+			if hostStream.StatusCode != http.StatusOK {
+				logInfoRequest(req.HostCallbackID, "responses chat fallback stream provider=%s model=%s -> HTTP %d", step.provider, routeModel, hostStream.StatusCode)
+				if retryableResponsesStatus(hostStream.StatusCode) {
+					hostModelStreamClose(hostStream.StreamID)
+					continue
+				}
+				hostModelStreamClose(hostStream.StreamID)
+				return pluginapi.ExecutorStreamResponse{}, fmt.Errorf("host chat fallback stream: HTTP %d", hostStream.StatusCode)
+			}
+			first, done, errRead := readHostModelStreamChunk(hostStream.StreamID)
+			if errRead != nil {
+				hostModelStreamClose(hostStream.StreamID)
+				continue
+			}
+			logDebugRequest(req.HostCallbackID, "responses stream served via=host-chat-fallback preferred_provider=%s model=%s (credential chosen by host scheduler)", step.provider, routeModel)
+			go forwardHostModelStream(req, hostStream.StreamID, first, done)
+			return pluginapi.ExecutorStreamResponse{Headers: hostStream.Headers}, nil
+		}
 		cand, ok := resolveStep(step, resolved, alias)
 		if !ok {
 			continue
@@ -2019,20 +2468,26 @@ func executeResponsesPassthroughStream(req executorRequestWithCallback) (plugina
 		upstreamBody := withModel(originalBody, cand.model)
 		upstreamReq := responsesUpstreamRequest(req.Headers, cand.apiKey, strings.TrimSuffix(cand.baseURL, "/")+"/responses", upstreamBody)
 		upstreamReq.Headers.Set("Accept", "text/event-stream")
+		logDebugRequest(req.HostCallbackID, "responses stream attempt provider=%s mode=passthrough model=%s key=%s", cand.provider, cand.model, maskKey(cand.apiKey))
 		stream, errStream := hostHTTPDoStream(upstreamReq, req.HostCallbackID)
 		if errStream != nil {
+			logInfoRequest(req.HostCallbackID, "responses upstream stream open failed provider=%s model=%s: %v", cand.provider, cand.model, errStream)
 			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, errStream.Error(), cand.provider, cand.model))
 			continue
 		}
 		if stream.StatusCode != 200 {
 			bodyBytes, _, errRead := readHostStream(stream.StreamID, false)
 			hostHTTPStreamClose(stream.StreamID)
+			logInfoRequest(req.HostCallbackID, "responses upstream stream HTTP %d provider=%s model=%s body=%s", stream.StatusCode, cand.provider, cand.model, logBodyExcerpt(string(bodyBytes)))
 			if errRead != nil {
 				store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, stream.StatusCode, errRead.Error(), cand.provider, cand.model))
 			} else {
 				store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, stream.StatusCode, string(bodyBytes), cand.provider, cand.model))
 			}
-			if stream.StatusCode == 429 || stream.StatusCode >= 500 {
+			if retryableResponsesStatus(stream.StatusCode) {
+				if stream.StatusCode == http.StatusMethodNotAllowed && cfg.SkipProviderOn429 {
+					unsupportedProviders[providerName] = true
+				}
 				continue
 			}
 			return pluginapi.ExecutorStreamResponse{}, fmt.Errorf("upstream responses stream: HTTP %d: %s", stream.StatusCode, string(bodyBytes))
@@ -2052,14 +2507,25 @@ func executeResponsesPassthroughStream(req executorRequestWithCallback) (plugina
 		}
 		switch preflight.status {
 		case responsesStreamPreflightRateLimited:
+			logInfoRequest(req.HostCallbackID, "responses stream rate limited provider=%s model=%s, rotating", cand.provider, cand.model)
 			hostHTTPStreamClose(stream.StreamID)
 			store.ApplyResponsesRateLimit(cand.authID, "openai-compatible-"+cand.provider, req.Model, preflight.reason, store.Now())
 			continue
 		case responsesStreamPreflightFailed:
+			logInfoRequest(req.HostCallbackID, "responses stream failed provider=%s model=%s: %s", cand.provider, cand.model, logBodyExcerpt(preflight.reason))
+			hostHTTPStreamClose(stream.StreamID)
+			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, stream.StatusCode, preflight.reason, cand.provider, cand.model))
+			continue
+		case responsesStreamPreflightErrorPayload:
+			// Modelscope answers some rejections with HTTP 200 plus a bare error
+			// document instead of an SSE stream. Forwarding that as a completed
+			// stream would hand the client a body that is not a Response resource.
+			logInfoRequest(req.HostCallbackID, "responses stream provider=%s model=%s returned an error payload with HTTP 200: %s", cand.provider, cand.model, logBodyExcerpt(preflight.reason))
 			hostHTTPStreamClose(stream.StreamID)
 			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, stream.StatusCode, preflight.reason, cand.provider, cand.model))
 			continue
 		}
+		logDebugRequest(req.HostCallbackID, "responses stream served provider=%s mode=passthrough model=%s", cand.provider, cand.model)
 		go forwardResponsesStream(req, cand, stream.StreamID, pluginapi.ExecutorStreamChunk{Payload: preflight.payload}, preflight.done)
 		return pluginapi.ExecutorStreamResponse{Headers: headerMapToHTTP(stream.Headers)}, nil
 	}
@@ -2155,6 +2621,15 @@ func preflightResponsesStream(streamID string, first pluginapi.ExecutorStreamChu
 			return result, nil
 		}
 		if done {
+			// The stream ended without ever producing an SSE data event: what we
+			// accumulated is a plain JSON body, so check it for an error document.
+			if modelscope.IsResponsesErrorPayload(string(payload)) {
+				return responsesStreamPreflightResult{
+					status: responsesStreamPreflightErrorPayload,
+					done:   true,
+					reason: string(payload),
+				}, nil
+			}
 			return responsesStreamPreflightResult{
 				status:  responsesStreamPreflightOK,
 				payload: payload,

@@ -1007,7 +1007,11 @@
         color: #86868b;
       "
     >
-      Modelscope 限流管理后台插件 v<span id="plugin-version">加载中</span> · 构建于 2026-08-28 18:47:02 CST · Responses 接口：<span id="responses-status">加载中</span>
+      Modelscope 限流管理后台插件 v<span id="plugin-version">加载中</span> ·
+      构建于 2026-08-30 23:16:28 CST · Responses 接口：<span
+        id="responses-status"
+        >加载中</span
+      >
     </div>
     <div class="toast" id="toast"></div>
     <script>
@@ -1196,7 +1200,7 @@
           consumed.toLocaleString() +
           '</div><div class="sub-v">平台累计数据 · 更新于 ' +
           lastRefreshTime +
-          '</div></div>' +
+          "</div></div>" +
           '<div class="card"><div class="k">今日签到账号</div><div class="v blue">' +
           checkedCount +
           '</div><div class="sub-v">共 ' +
@@ -1237,8 +1241,12 @@
           }
           if (!el) return;
           if (sc === 200 && d) {
-            el.textContent = d.use_responses ? "已开启" : "未开启";
-            el.className = d.use_responses ? "green" : "";
+            var value = Array.isArray(d.use_responses)
+              ? d.use_responses.join(", ")
+              : d.use_responses;
+            var enabled = !!value && value !== "";
+            el.textContent = enabled ? value : "未开启";
+            el.className = enabled ? "green" : "";
           } else {
             el.textContent = "未知";
           }

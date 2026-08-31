@@ -1,6 +1,7 @@
 package ratelimit
 
 import (
+	"encoding/json"
 	"strings"
 	"time"
 )
@@ -55,6 +56,63 @@ func IsResponsesFailed(body string) bool {
 		return false
 	}
 	return strings.Contains(body, `"response.failed"`)
+}
+
+// responsesErrorProbe reads just enough of a top-level JSON document to tell an
+// upstream error body apart from a valid Responses payload. Only top-level
+// members are considered, so nested "code"/"message" fields inside tool calls or
+// message content cannot produce a false positive.
+type responsesErrorProbe struct {
+	Object  *string          `json:"object"`
+	Error   *json.RawMessage `json:"error"`
+	Code    *string          `json:"code"`
+	Message *string          `json:"message"`
+}
+
+// IsResponsesErrorPayload reports whether a body that arrived with HTTP 200 is
+// really an error document rather than a Response resource. Modelscope answers
+// some rejections (invalid parameter, unsupported model) with 200 plus a bare
+// {"code":...,"message":...}, and the Responses protocol itself keeps
+// "error":null on completed objects, so neither a substring test on "error" nor
+// the status code is enough on its own. Callers use this to stop presenting
+// upstream failures as successful responses.
+func IsResponsesErrorPayload(body string) bool {
+	body = strings.TrimSpace(body)
+	if !strings.HasPrefix(body, "{") {
+		return false
+	}
+	// Cheap gate before the decode: real response bodies are large and, unless
+	// they mention an error or an error code at all, cannot be error payloads.
+	if !strings.Contains(body, `"error"`) && !strings.Contains(body, `"code"`) {
+		return false
+	}
+	var probe responsesErrorProbe
+	if err := json.Unmarshal([]byte(body), &probe); err != nil {
+		return false
+	}
+	if hasJSONErrorValue(probe.Error) {
+		return true
+	}
+	if probe.Object != nil && strings.EqualFold(strings.TrimSpace(*probe.Object), "response") {
+		// A Response resource with a null/empty error is a genuine success.
+		return false
+	}
+	return probe.Code != nil && strings.TrimSpace(*probe.Code) != "" &&
+		probe.Message != nil && strings.TrimSpace(*probe.Message) != ""
+}
+
+// hasJSONErrorValue reports whether an "error" member carries a payload. Null,
+// an empty object/array and an empty string all mean "no error".
+func hasJSONErrorValue(raw *json.RawMessage) bool {
+	if raw == nil {
+		return false
+	}
+	switch strings.TrimSpace(string(*raw)) {
+	case "", "null", "{}", "[]", `""`:
+		return false
+	default:
+		return true
+	}
 }
 
 // ResponsesFirstDataEvent returns the bytes through the end of the first

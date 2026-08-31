@@ -30,8 +30,9 @@ plugins:
 
       # ---- 必填 ----
       providers: ["modelscope"] # 监控的 provider 名称；顺序决定轮换顺序。示例: ["modelscope", "modelscope-ai"]
-     skip_provider_on_429: false # 关闭：429 切下一个 provider + 退避冷却，200 回第一个 provider；开启：429 直接用非托管模型兜底（推荐打开）
-      use_responses: false # 开启后将 OpenAI Responses API 请求透传到上游 /v1/responses，并复用现有限流/key 轮换；默认关闭
+      skip_provider_on_429: false # 关闭：429 切下一个 provider + 退避冷却，200 回第一个 provider；开启：429 直接用非托管模型兜底（推荐打开）
+      use_responses: "*" # "*"=全部模型走 Responses；也可填写上游模型名，例如 ["Qwen/Qwen2.5-72B-Instruct"]；留空/删除=关闭
+      # 未列入的托管 provider 由宿主按 providers 顺序以 Chat 协议兜底（配了 alias 的模型宿主只认 alias，插件内部已处理）
       host_base_url: "http://127.0.0.1:8317" # CPA 管理 API 地址，默认 127.0.0.1:8317
       management_key: "your-management-secret" # CPA 管理密钥，仅服务端使用
 

@@ -32,6 +32,40 @@ func TestSkipProviderOn429Parsed(t *testing.T) {
 	})
 }
 
+func TestUseResponsesParsingAndMatching(t *testing.T) {
+	tests := []struct {
+		name  string
+		raw   any
+		model string
+		want  bool
+	}{
+		{"default_disabled", nil, "glm-5.2", false},
+		{"empty_array", []any{}, "glm-5.2", false},
+		{"wildcard_string", "*", "any-model", true},
+		{"specific_string", "glm-5.2", "glm-5.2", true},
+		{"specific_string_other", "glm-5.2", "qwen-code", false},
+		{"array", []any{"glm-5.2", "qwen-code"}, "qwen-code", true},
+		{"array_other", []any{"glm-5.2", "qwen-code"}, "other", false},
+		{"legacy_true", true, "any-model", true},
+		{"legacy_false", false, "any-model", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := map[string]any{}
+			if tt.raw != nil {
+				m["use_responses"] = tt.raw
+			}
+			c, err := ConfigFromMap(m)
+			if err != nil {
+				t.Fatalf("ConfigFromMap: %v", err)
+			}
+			if got := c.UsesResponses(tt.model); got != tt.want {
+				t.Fatalf("UsesResponses(%q) = %v, want %v", tt.model, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestToFloat64EdgeCases verifies the toFloat64 helper handles all common
 // YAML/JSON numeric representations.
 func TestToFloat64EdgeCases(t *testing.T) {
