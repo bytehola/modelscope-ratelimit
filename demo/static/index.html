@@ -231,7 +231,7 @@ function renderCubeCards(){
     if(a.balance)avail+=a.balance.available;
     platformUsage+=a.usagePerDay||0;
   });
-  // consume & earn computed from today's transactions (loaded separately)
+  // consume 与 earn 由当日流水算出（流水单独加载）
   document.getElementById('cube-cards').innerHTML=
     '<div class="card"><div class="k">可用魔粒总额</div><div class="v green">'+avail.toLocaleString()+'</div><div class="sub-v">含短期+长期魔粒</div></div>'
    +'<div class="card"><div class="k">今日已消耗魔粒</div><div class="v orange">'+consume+'</div><div class="sub-v">SPEND_CONFIRM 累计</div></div>'
@@ -465,7 +465,7 @@ function setupSorting(){
   });
 }
 
-// init
+// 初始化
 setupSorting();
 updateToolbarBtn();
 xhr('GET','/api/accounts',null,function(sc,d){

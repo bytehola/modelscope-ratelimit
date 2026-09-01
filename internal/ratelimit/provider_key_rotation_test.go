@@ -5,33 +5,32 @@ import (
 	"time"
 )
 
-// insufficientQuotaBody is a 429 body containing "insufficient_quota" so
-// isInsufficientQuota detects it.
+// insufficientQuotaBody 是一个带 "insufficient_quota" 的 429 body，便于 isInsufficientQuota 识别。
 const insufficientQuotaBody = `{"error":{"code":"insufficient_quota"}}`
 
-// TestProviderKeyRotationNoSkip verifies the simultaneous provider+key
-// rotation when skip_provider_on_429 is OFF:
+// TestProviderKeyRotationNoSkip 验证 skip_provider_on_429 关闭时的轮换顺序：先把排在前面那家
+// 的 key 逐个试完，才轮到下一家。
 //
-//	Providers: modelscope, modelscope-ai, modelscope-my (4 keys each).
+// 配置顺序：modelscope、modelscope-ai、modelscope-my，每家 4 把 key。
 //
-// First response cycle:
-//  1. modelscope key1 -> 429
-//  2. modelscope-ai  key1 -> 429
-//  3. modelscope-my  key1 -> 429
-//  4. modelscope key2 -> 200
+// 第一个请求：
+//  1. modelscope 第 1 把 -> 429
+//  2. modelscope 第 2 把 -> 429
+//  3. modelscope 第 3 把 -> 429
+//  4. modelscope 第 4 把 -> 200
 //
-// Second response cycle (next request, same global provider cursor reused):
-//  1. modelscope key3 -> 429
-//  2. modelscope-ai  key2 -> 429
-//  3. modelscope-my  key2 -> 429
-//  4. modelscope key4 -> 429
-//  5. modelscope-ai  key3 -> 200
+// 第二个请求（任意 200 之后重新从第一家开始，该家的 key 游标继续往后走）：
+//  1. modelscope 第 1 把 -> 429
+//  2. modelscope 第 2 把 -> 429
+//  3. modelscope 第 3 把 -> 429
+//  4. modelscope 第 4 把 -> 429
+//  5. modelscope-ai 第 1 把 -> 200（modelscope 已无可用 key，才换到第二家）
 func TestProviderKeyRotationNoSkip(t *testing.T) {
 	loc := time.FixedZone("CST", 8*3600)
 	now := time.Date(2026, 7, 8, 10, 0, 0, 0, loc)
 	s, _ := newTestStore(now)
 	cfg := cfgWith("modelscope", "modelscope-ai", "modelscope-my")
-	cfg.InsufficientQuotaCooldown = 0 // no blocking sleeps; advance is independent
+	cfg.InsufficientQuotaCooldown = 0 // 不产生阻塞睡眠，只观察轮换
 	cfg.SkipProviderOn429 = false
 	s.Reconfigure(cfg)
 
@@ -85,22 +84,22 @@ func TestProviderKeyRotationNoSkip(t *testing.T) {
 
 	type step struct {
 		wantID    string
-		exclude   []string // candidate IDs excluded by host so far
+		exclude   []string // 到目前为止宿主已排除的候选 ID
 		failed    bool
 		fprovider string
 	}
 	steps := []step{
-		// skip OFF: exhaust m first (4 keys), then a, then y
+		// skip OFF：先把 m 家 4 把 key 试完，再轮到 a 家、y 家
 		{wantID: "m-1", exclude: nil, failed: true, fprovider: "modelscope"},
 		{wantID: "m-2", exclude: []string{"m-1"}, failed: true, fprovider: "modelscope"},
 		{wantID: "m-3", exclude: []string{"m-1", "m-2"}, failed: true, fprovider: "modelscope"},
 		{wantID: "m-4", exclude: []string{"m-1", "m-2", "m-3"}, failed: false, fprovider: "modelscope"},
-		// 200 reset; next request starts at m again (key cursor continues)
+		// 200 复位；下一个请求重新从 m 家开始（key 游标继续往后走）
 		{wantID: "m-1", exclude: nil, failed: true, fprovider: "modelscope"},
 		{wantID: "m-2", exclude: []string{"m-1"}, failed: true, fprovider: "modelscope"},
 		{wantID: "m-3", exclude: []string{"m-1", "m-2"}, failed: true, fprovider: "modelscope"},
 		{wantID: "m-4", exclude: []string{"m-1", "m-2", "m-3"}, failed: true, fprovider: "modelscope"},
-		// m exhausted -> a
+		// m 家已无可用 key -> 换到 a 家
 		{wantID: "a-1", exclude: []string{"m-1", "m-2", "m-3", "m-4"}, failed: false, fprovider: "modelscope-ai"},
 	}
 	for i, st := range steps {
@@ -120,10 +119,8 @@ func TestProviderKeyRotationNoSkip(t *testing.T) {
 	}
 }
 
-// TestProviderRotationResetsOnSuccess verifies that any 200 resets the
-// within-request cross-provider cursor to 0, so the next request always
-// starts from the first managed provider; only per-provider key cursors keep
-// rotating across requests.
+// TestProviderRotationResetsOnSuccess 验证任意 200 都会把跨 provider 游标复位，于是下一次请求
+// 总是从第一个托管 provider 重新开始；跨请求继续轮转的只有各家的 key 游标。
 func TestProviderRotationResetsOnSuccess(t *testing.T) {
 	loc := time.FixedZone("CST", 8*3600)
 	now := time.Date(2026, 7, 8, 10, 0, 0, 0, loc)
@@ -151,7 +148,7 @@ func TestProviderRotationResetsOnSuccess(t *testing.T) {
 	if err != nil || r1.AuthID != "m-1" {
 		t.Fatalf("1st pick: want m-1, got %+v err=%v", r1, err)
 	}
-	// Request 1: ms#1 429 -> cursor advances to ai.
+	// 请求 1 的第一次挑选拿到 ms#1，随后它返回 429。
 	s.OnUsage(UsageRecord{
 		AuthID: "m-1", Provider: "modelscope", Model: "Qwen-72B", Alias: "Qwen-72B",
 		Failed: true, Failure: &UsageFailure{StatusCode: 429, Body: insufficientQuotaBody},
@@ -166,9 +163,9 @@ func TestProviderRotationResetsOnSuccess(t *testing.T) {
 		t.Fatalf("2nd pick: want m-2 (exhaust m keys first), got %+v err=%v", r2, err)
 	}
 
-	// ai#1 200 -> cursor resets to 0; next request starts at ms (not ai).
+	// 某次 200 -> 游标复位；下一次请求重新从 ms 家开始（而不是留在 ai 家）。
 	s.OnUsage(UsageRecord{AuthID: "a-1", Provider: "modelscope-ai", Model: "Qwen-72B", Alias: "Qwen-72B"})
-	// Request 2: cursor reset -> ms#1 (ms key cursor wrapped around).
+	// 请求 2：游标已复位 -> 重新从 ms 家开始挑（ms 的 key 游标此时正好回绕）。
 	r3, err := s.SchedulerPick(mkReq(
 		Candidate{ID: "m-1", Provider: "modelscope", Priority: 1},
 		Candidate{ID: "m-2", Provider: "modelscope", Priority: 1},
@@ -179,15 +176,13 @@ func TestProviderRotationResetsOnSuccess(t *testing.T) {
 	}
 }
 
-// TestProviderKeyRotationResetsOnSuccess_UserExample reproduces the documented
-// per-request rotation: each request starts from the first provider, a 429
-// advances to the next provider within the same request, and any 200 resets
-// so the next request starts from the first provider again. Only keys keep
-// rotating across requests.
+// TestProviderKeyRotationResetsOnSuccess_UserExample 复现文档里描述的每次请求的轮换形态：请求
+// 从第一个 provider 开始，429 时先把本家剩下的 key 逐个试完，本家没有可用 key 才换下一家；任意
+// 200 之后，下一次请求重新从第一个 provider 开始。跨请求继续轮转的只有各家的 key 游标。
 //
-//	第一轮：ms#1 429 -> ai#1 429 -> my#1 200
-//	第二轮：ms#2 429 -> ai#2 200
-//	第三轮：ms#3 200
+//	第一轮：m#1 429 -> m#2 429 -> m#3 429（m 家已无可用 key）-> ai#1 429 -> ai#2 200
+//	第二轮：m#1 429 -> m#2 429 -> m#3 429 -> ai#3 200（ai 家的 key 游标继续往后）
+//	第三轮：m#1 200
 func TestProviderKeyRotationResetsOnSuccess_UserExample(t *testing.T) {
 	loc := time.FixedZone("CST", 8*3600)
 	now := time.Date(2026, 7, 8, 10, 0, 0, 0, loc)
@@ -244,7 +239,7 @@ func TestProviderKeyRotationResetsOnSuccess_UserExample(t *testing.T) {
 		return resp.AuthID
 	}
 
-	// 第一轮
+	// 第一轮：先耗尽 modelscope 的 key
 	if id := pick(); id != "m-1" {
 		t.Fatalf("r1#1: want m-1, got %s", id)
 	}
@@ -266,7 +261,7 @@ func TestProviderKeyRotationResetsOnSuccess_UserExample(t *testing.T) {
 	}
 	usage200("a-2", "modelscope-ai")
 
-	// 第二轮
+	// 第二轮：200 之后重新从 modelscope 开始
 	if id := pick(); id != "m-1" {
 		t.Fatalf("r2#1: want m-1, got %s", id)
 	}
@@ -284,7 +279,7 @@ func TestProviderKeyRotationResetsOnSuccess_UserExample(t *testing.T) {
 	}
 	usage200("a-2", "modelscope-ai")
 
-	// 第三轮
+	// 第三轮：再次从第一家开始
 	if id := pick(); id != "m-1" {
 		t.Fatalf("r3#1: want m-1, got %s", id)
 	}

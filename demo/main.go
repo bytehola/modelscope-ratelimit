@@ -19,7 +19,7 @@ import (
 //go:embed static/index.html
 var indexHTML []byte
 
-// ---- config / keys ----
+// 配置与密钥
 
 type keyConfig struct {
 	BaseURL  string
@@ -67,14 +67,14 @@ func maskKey(k string) string {
 	return k[len(k)-12:]
 }
 
-// ---- Modelscope API client (uses token as m_session_id cookie) ----
+// Modelscope API 客户端（把 token 当作 m_session_id cookie 使用）
 
 var httpClient = &http.Client{Timeout: 15 * time.Second}
 
-// apiGet calls a Modelscope API and normalizes the dual response format.
-// /api/v1/*  → {"Code":200,"Data":{...},"Success":true}  (CamelCase)
-// /openapi/* → {"success":true,"data":{...}}              (snake_case)
-// Returns HTTP status, the inner Data payload (raw JSON), and error.
+// apiGet 调用 Modelscope 接口并归一化它的两种响应格式。
+// /api/v1/*  ->  {"Code":200,"Data":{...},"Success":true}（大驼峰）
+// /openapi/* ->  {"success":true,"data":{...}}（小写下划线）
+// 返回 HTTP 状态码、内层 Data 载荷（原始 JSON）和错误。
 func apiGet(siteBase, path, token string) (httpStatus int, data json.RawMessage, err error) {
 	req, err := http.NewRequest("GET", siteBase+path, nil)
 	if err != nil {
@@ -89,7 +89,7 @@ func apiGet(siteBase, path, token string) (httpStatus int, data json.RawMessage,
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
-	// Try CamelCase
+	// 先试大驼峰
 	var camel struct {
 		Code    int             `json:"Code"`
 		Data    json.RawMessage `json:"Data"`
@@ -98,7 +98,7 @@ func apiGet(siteBase, path, token string) (httpStatus int, data json.RawMessage,
 	if json.Unmarshal(body, &camel) == nil && (camel.Code != 0 || camel.Success) {
 		return resp.StatusCode, camel.Data, nil
 	}
-	// Try snake_case
+	// 再试小写下划线
 	var snake struct {
 		Success bool            `json:"success"`
 		Data    json.RawMessage `json:"data"`
@@ -109,25 +109,25 @@ func apiGet(siteBase, path, token string) (httpStatus int, data json.RawMessage,
 	return resp.StatusCode, nil, fmt.Errorf("unparseable response (status=%d)", resp.StatusCode)
 }
 
-// ---- response types (what the frontend sees) ----
+// 响应结构（前端看到的部分）
 
 type accountResp struct {
-	Index       int     `json:"index"`
-	MaskedKey   string  `json:"maskedKey"`
-	Site        string  `json:"site"`
-	Name        string  `json:"name"`
-	NickName    string  `json:"nickName"`
-	Email       string  `json:"email"`
-	Phone       string  `json:"phone"`
-	HavanaID    string  `json:"havanaId"`
-	FromSite    string  `json:"fromSite"`
-	IsRealName  bool    `json:"isRealName"`
-	CheckedIn   bool    `json:"checkedIn"`
-	LastCheckIn string  `json:"lastCheckIn"`
+	Index       int          `json:"index"`
+	MaskedKey   string       `json:"maskedKey"`
+	Site        string       `json:"site"`
+	Name        string       `json:"name"`
+	NickName    string       `json:"nickName"`
+	Email       string       `json:"email"`
+	Phone       string       `json:"phone"`
+	HavanaID    string       `json:"havanaId"`
+	FromSite    string       `json:"fromSite"`
+	IsRealName  bool         `json:"isRealName"`
+	CheckedIn   bool         `json:"checkedIn"`
+	LastCheckIn string       `json:"lastCheckIn"`
 	Balance     *balanceData `json:"balance"`
-	UsagePerDay int     `json:"usagePerDay"`
-	Schedule    string  `json:"schedule"`
-	Error       string  `json:"error,omitempty"`
+	UsagePerDay int          `json:"usagePerDay"`
+	Schedule    string       `json:"schedule"`
+	Error       string       `json:"error,omitempty"`
 }
 
 type balanceData struct {
@@ -140,28 +140,28 @@ type balanceData struct {
 }
 
 type detailResp struct {
-	Index        int         `json:"index"`
-	Name         string      `json:"name"`
-	NickName     string      `json:"nickName"`
-	Email        string      `json:"email"`
-	Phone        string     `json:"phone"`
-	HavanaID     string      `json:"havanaId"`
-	FromSite     string     `json:"fromSite"`
-	IsRealName   bool        `json:"isRealName"`
-	Org          string      `json:"org"`
-	School       string      `json:"school"`
-	Industry     string      `json:"industry"`
-	Level        string      `json:"level"`
-	ExpiryAt     string      `json:"expiryAt"`
-	ExpiryAmt    int         `json:"expiryAmt"`
-	UsagePerDay  int         `json:"usagePerDay"`
-	SdkToken     string      `json:"sdkToken"`
-	AliyunBound  bool        `json:"aliyunBound"`
-	AliyunAID    string      `json:"aliyunAid"`
-	AliyunNick   string      `json:"aliyunNick"`
-	Site         string      `json:"site"`
-	Tokens       []tokenInfo  `json:"tokens"`
-	Error        string      `json:"error,omitempty"`
+	Index       int         `json:"index"`
+	Name        string      `json:"name"`
+	NickName    string      `json:"nickName"`
+	Email       string      `json:"email"`
+	Phone       string      `json:"phone"`
+	HavanaID    string      `json:"havanaId"`
+	FromSite    string      `json:"fromSite"`
+	IsRealName  bool        `json:"isRealName"`
+	Org         string      `json:"org"`
+	School      string      `json:"school"`
+	Industry    string      `json:"industry"`
+	Level       string      `json:"level"`
+	ExpiryAt    string      `json:"expiryAt"`
+	ExpiryAmt   int         `json:"expiryAmt"`
+	UsagePerDay int         `json:"usagePerDay"`
+	SdkToken    string      `json:"sdkToken"`
+	AliyunBound bool        `json:"aliyunBound"`
+	AliyunAID   string      `json:"aliyunAid"`
+	AliyunNick  string      `json:"aliyunNick"`
+	Site        string      `json:"site"`
+	Tokens      []tokenInfo `json:"tokens"`
+	Error       string      `json:"error,omitempty"`
 }
 
 type tokenInfo struct {
@@ -172,11 +172,11 @@ type tokenInfo struct {
 	Expires string `json:"expires"`
 }
 
-// ---- server ----
+// 服务
 
 type server struct {
-	cfg      *keyConfig
-	mu       sync.Mutex
+	cfg *keyConfig
+	mu  sync.Mutex
 }
 
 func (s *server) fetchAccountSummary(idx int) accountResp {
@@ -189,15 +189,15 @@ func (s *server) fetchAccountSummary(idx int) accountResp {
 		Schedule:  "normal",
 	}
 
-	// 1. login/info (also performs daily sign-in)
+	// 1. login/info（同时完成每日签到）
 	if sc, data, err := apiGet(sb, "/api/v1/users/login/info", token); err == nil && sc == 200 {
 		var info struct {
-			Name        string `json:"Name"`
-			NickName    string `json:"NickName"`
-			Email       string `json:"Email"`
-			HavanaID    string `json:"HavanaId"`
-			FromSite    string `json:"FromSite"`
-			IsRealName  bool   `json:"is_real_name"`
+			Name       string `json:"Name"`
+			NickName   string `json:"NickName"`
+			Email      string `json:"Email"`
+			HavanaID   string `json:"HavanaId"`
+			FromSite   string `json:"FromSite"`
+			IsRealName bool   `json:"is_real_name"`
 		}
 		if json.Unmarshal(data, &info) == nil {
 			a.Name = info.Name
@@ -215,12 +215,12 @@ func (s *server) fetchAccountSummary(idx int) accountResp {
 		return a
 	}
 
-	// 2. balance
+	// 2. 余额
 	if sc, data, err := apiGet(sb, "/openapi/v1/magicubes/balance", token); err == nil && sc == 200 {
 		var b struct {
-			Total     int    `json:"total_balance"`
-			Available int    `json:"available_balance"`
-			Frozen    int    `json:"frozen_amount"`
+			Total     int `json:"total_balance"`
+			Available int `json:"available_balance"`
+			Frozen    int `json:"frozen_amount"`
 		}
 		if json.Unmarshal(data, &b) == nil {
 			a.Balance = &balanceData{
@@ -232,7 +232,7 @@ func (s *server) fetchAccountSummary(idx int) accountResp {
 		}
 	}
 
-	// 3. inference rate-limit
+	// 3. 推理限流
 	if sc, data, err := apiGet(sb, "/api/v1/inference/rate-limit", token); err == nil && sc == 200 {
 		var rl struct {
 			CurrentUsagePerDay int `json:"currentUsagePerDay"`
@@ -266,14 +266,14 @@ func (s *server) handleAccountDetail(w http.ResponseWriter, r *http.Request) {
 	// users/info
 	if sc, data, err := apiGet(sb, "/api/v1/users/info", token); err == nil && sc == 200 {
 		var info struct {
-			UserName    string `json:"user_name"`
-			NickName    string `json:"user_nickname"`
-			Email       string `json:"email"`
-			Phone       string `json:"phone_no"`
-			IsRealName  bool   `json:"is_real_name"`
-			Org         string `json:"Organization"`
-			School      string `json:"School"`
-			Industry    string `json:"industry"`
+			UserName   string `json:"user_name"`
+			NickName   string `json:"user_nickname"`
+			Email      string `json:"email"`
+			Phone      string `json:"phone_no"`
+			IsRealName bool   `json:"is_real_name"`
+			Org        string `json:"Organization"`
+			School     string `json:"School"`
+			Industry   string `json:"industry"`
 		}
 		if json.Unmarshal(data, &info) == nil {
 			d.Name = info.UserName
@@ -317,12 +317,12 @@ func (s *server) handleAccountDetail(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// balance (for level, expiry)
+	// 余额（用于等级和有效期）
 	if sc, data, err := apiGet(sb, "/openapi/v1/magicubes/balance", token); err == nil && sc == 200 {
 		var b struct {
-			Level           string `json:"user_level"`
-			ExpiryAt        string `json:"nearest_expiry_at"`
-			ExpiryAmt       int    `json:"nearest_expiry_amount"`
+			Level     string `json:"user_level"`
+			ExpiryAt  string `json:"nearest_expiry_at"`
+			ExpiryAmt int    `json:"nearest_expiry_amount"`
 		}
 		if json.Unmarshal(data, &b) == nil {
 			d.Level = b.Level
@@ -345,11 +345,11 @@ func (s *server) handleAccountDetail(w http.ResponseWriter, r *http.Request) {
 	if sc, data, err := apiGet(sb, "/api/v1/users/tokens/list", token); err == nil && sc == 200 {
 		var tl struct {
 			Tokens []struct {
-				ID        int    `json:"Id"`
-				Name      string `json:"SdkTokenName"`
-				Token     string `json:"SdkToken"`
-				Valid     string `json:"Valid"`
-				Expires   string `json:"ExpiresAt"`
+				ID      int    `json:"Id"`
+				Name    string `json:"SdkTokenName"`
+				Token   string `json:"SdkToken"`
+				Valid   string `json:"Valid"`
+				Expires string `json:"ExpiresAt"`
 			} `json:"SdkTokens"`
 		}
 		if json.Unmarshal(data, &tl) == nil {
@@ -387,7 +387,7 @@ func (s *server) handleTransactions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"error": fmt.Sprintf("transactions fetch failed (status=%d)", sc), "records": []any{}})
 		return
 	}
-	// Pass through the raw data (already normalized)
+	// 原样透传已归一化的数据
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Write(data)
 }
@@ -409,11 +409,11 @@ func (s *server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Write(indexHTML)
 }
 
-// ---- helpers ----
+// 工具函数
 
 func extractIdx(r *http.Request) int {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	// /api/account/{idx}/... → parts = ["api", "account", "{idx}", ...]
+	// 形如 /api/account/3/xxx 的路径会被拆成 parts = ["api", "account", "3", "xxx"]。
 	if len(parts) >= 3 {
 		idx, err := strconv.Atoi(parts[2])
 		if err == nil {

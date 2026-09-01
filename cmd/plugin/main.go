@@ -1,17 +1,15 @@
-// Command plugin is the CLIProxyAPI dynamic-library plugin that implements
-// Modelscope account-level magic-cube rate-limit control.
+// Command plugin 是 CLIProxyAPI 的动态库插件，实现 Modelscope 账号级魔粒限流控制。
 //
-// The rate-limit state machine lives in modelscope-ratelimit/internal/ratelimit
-// (stdlib-only, unit-tested). This file is the native C-ABI adapter: it maps
-// the documented plugin methods (see docs/cn/plugin and sdk/pluginabi) to the
-// core helpers and exports cliproxy_plugin_init. It also exposes a
-// management resource page ("Modelscope 限流") showing the live disable list.
+// 限流状态机位于 modelscope-ratelimit/internal/ratelimit（仅用标准库、可单测）。本文件是
+// 原生 C-ABI 适配层：把文档约定的插件方法（见 docs/cn/plugin 与 sdk/pluginabi）映射到核心
+// helper，并导出 cliproxy_plugin_init；同时提供一个管理资源页（“Modelscope 限流”）展示实时
+// 禁用列表。
 //
-// Build (CGO required):
+// 构建（需要 CGO）：
 //
 //	cd plugins/modelscope-ratelimit
 //	GOPROXY=https://goproxy.cn,direct go build -buildmode=c-shared -o cmd/plugin/modelscope-ratelimit.so ./cmd/plugin
-//	# macOS: .dylib, Windows: .dll (cross-compile needs a C cross-compiler)
+//	# macOS 是 .dylib，Windows 是 .dll（交叉编译需要 C 交叉编译器）
 package main
 
 /*
@@ -41,12 +39,12 @@ typedef struct {
 	cliproxy_plugin_shutdown_fn shutdown;
 } cliproxy_plugin_api;
 
-// Host callback function-pointer types (see loader_unix.go cliproxyHostCall).
+// 宿主回调的函数指针类型（见 loader_unix.go 的 cliproxyHostCall）。
 typedef int (*cliproxy_host_call_fn)(void*, const char*, const uint8_t*, size_t, cliproxy_buffer*);
 typedef void (*cliproxy_host_free_fn)(void*, size_t);
 
-// cliproxy_call_host invokes a host callback method synchronously. It does not
-// retain any pointer. Returns the host's return code (0 = success).
+// cliproxy_call_host 同步调用一个宿主回调方法，不保存任何指针，返回宿主的返回码（0 表示成
+// 功）。
 static int cliproxy_call_host(const cliproxy_host_api* h, const char* method,
                               const uint8_t* req, size_t req_len, cliproxy_buffer* resp) {
 	if (h == NULL || h->call == NULL) {
@@ -55,16 +53,14 @@ static int cliproxy_call_host(const cliproxy_host_api* h, const char* method,
 	return ((cliproxy_host_call_fn)h->call)(h->host_ctx, method, req, req_len, resp);
 }
 
-// cliproxy_free_host frees a buffer returned by the host.
+// cliproxy_free_host 释放宿主返回的缓冲区。
 static void cliproxy_free_host(const cliproxy_host_api* h, void* ptr, size_t len) {
 	if (h != NULL && h->free_buffer != NULL) {
 		((cliproxy_host_free_fn)h->free_buffer)(ptr, len);
 	}
 }
 
-// cliproxy_copy_host copies the host API struct into plugin-owned memory so the
-// function pointers remain valid for the plugin's lifetime. Caller frees with
-// free().
+// cliproxy_copy_host 把宿主 API 结构体复制到插件自有内存，使函数指针在插件生命周期内持续有效；调用方用 free() 释放。
 static cliproxy_host_api* cliproxy_copy_host(const cliproxy_host_api* src) {
 	cliproxy_host_api* dst = (cliproxy_host_api*)malloc(sizeof(cliproxy_host_api));
 	if (dst != NULL && src != NULL) {
@@ -103,11 +99,11 @@ import (
 	modelscope "modelscope-ratelimit/internal/ratelimit"
 )
 
-// store holds the rate-limit state for the lifetime of the plugin. Its logger
-// forwards to host.log so state changes show up in the host's own log file.
+// store 在插件的整个生命周期内持有；它的 logger 转发到 host.log，因此状态变化会
+// 出现在宿主自己的日志文件里。
 var store = modelscope.NewStore(stderrLogger{})
 
-const pluginVersion = "2.4.0"
+const pluginVersion = "2.4.5"
 
 var pluginHost *C.cliproxy_host_api
 
@@ -116,27 +112,24 @@ var statusPageHTML []byte
 
 var (
 	refreshMu sync.Mutex
-	// pluginCfg is the last applied plugin config, used by the management
-	// resource page to decide server-side vs browser-side key resolution.
+	// pluginCfg 是最近一次生效的插件配置，管理资源页用它决定走服务端解析还是浏览器端解析 key。
 	pluginCfg *modelscope.Config
 	cfgMu     sync.Mutex
 
-	// resolvedCache memoizes server-side key resolution so the auto-refresh
-	// does not hammer the management API. Invalidated on reconfigure.
+	// resolvedCache 缓存服务端的 key 解析结果，避免页面自动刷新把管理 API 打爆。reconfigure 时失效。
 	resolvedMu    sync.Mutex
 	resolvedCache resolvedEntry
 
-	// strategyCache memoizes the host's built-in routing strategy so the
-	// scheduler.pick fallback path does not query the management API on every
-	// request. Invalidated on reconfigure (same TTL as resolvedCache).
+	// strategyCache 缓存宿主内置的路由策略，避免 scheduler.pick 的兜底路径每个请求都查管理 API。
+	// reconfigure 时失效（TTL 与 resolvedCache 相同）。
 	strategyMu    sync.Mutex
 	strategyCache strategyEntry
 )
 
 const (
-	resolvedCacheTTL = 60 * time.Second // refresh resolved view at most once/min
-	resolvedErrTTL   = 5 * time.Minute  // back off on failure to avoid auth-ban
-	strategyCacheTTL = 60 * time.Second // refresh host strategy at most once/min
+	resolvedCacheTTL = 60 * time.Second // 解析视图最多每分钟刷新一次
+	resolvedErrTTL   = 5 * time.Minute  // 失败后退避，避免触发风控封禁
+	strategyCacheTTL = 60 * time.Second // 宿主策略最多每分钟刷新一次
 )
 
 type strategyEntry struct {
@@ -146,49 +139,43 @@ type strategyEntry struct {
 
 type resolvedEntry struct {
 	masked     map[string]string
-	raw        map[string]string // authID -> raw API key (m_session_id cookie value)
-	maskToRaw  map[string]string // maskedKey -> raw API key (O(1) lookup)
-	maskToSite map[string]string // maskedKey -> site base URL (O(1) lookup)
-	siteBase   map[string]string // authID -> Modelscope site base URL (cn/ai)
-	baseURL    map[string]string // authID -> upstream OpenAI-compatible base URL
-	// routeToName maps a provider's host-routable model ID to the real upstream
-	// model name. The route ID is what CLIProxyAPI registers in its model
-	// registry: the configured alias when non-empty, otherwise the name
-	// (see sdk/cliproxy buildConfiguredModelInfo: ModelInfo.ID = alias || name).
-	routeToName map[string]map[string]string // provider name -> route model ID -> upstream model name
-	// nameToRoute is the reverse index (lowercased upstream model name or alias
-	// -> route model ID) so a client that asks for the raw upstream name can
-	// still be mapped back to the identifier the host can route.
+	raw        map[string]string // authID 到原始 API key（即 m_session_id cookie 值）
+	maskToRaw  map[string]string // maskedKey 到原始 API key（O(1) 查找）
+	maskToSite map[string]string // maskedKey 到站点基础地址（O(1) 查找）
+	siteBase   map[string]string // authID 到 Modelscope 站点基础地址（cn/ai）
+	baseURL    map[string]string // authID 到上游 OpenAI 兼容基础地址
+	// routeToName 把某个 provider 可被宿主路由的模型 ID 映射到真正的上游模型名。路由 ID 就是
+	// CLIProxyAPI 注册进模型注册表的那个名字：alias 非空时是 alias，否则是 name（见 sdk/cliproxy
+	// 的 buildConfiguredModelInfo：ModelInfo.ID = alias || name）。
+	routeToName map[string]map[string]string // provider 名称 到 路由模型 ID 到 上游模型名
+	// nameToRoute 是反向索引（小写后的上游模型名或别名 到 路由模型 ID），这样客户端直接请求原始
+	// 上游名时也能映射回宿主可路由的那个标识。
 	nameToRoute    map[string]map[string]string
-	orderedAuthIDs []string            // stable iteration order (deterministic idx)
-	dedupedAuthIDs []string            // one auth ID per raw API key (first in config order)
-	rawToAuthIDs   map[string][]string // raw API key -> auth IDs sharing this account
-	providerOrder  map[string][]string // provider name -> auth IDs in config.yaml api-key order
+	orderedAuthIDs []string            // 稳定的遍历顺序（确定性的 idx）
+	dedupedAuthIDs []string            // 每个原始 API key 只保留一个 auth ID（配置顺序里的第一个）
+	rawToAuthIDs   map[string][]string // 原始 API key 到共享该账号的所有 auth ID
+	providerOrder  map[string][]string // provider 名称到按 config.yaml 里 api-key 顺序排列的 auth ID
 	realTotal      int
-	unmatched      []string // configured providers not found upstream
+	unmatched      []string // 配置里但上游找不到的 provider
 	err            error
 	at             time.Time
 }
 
-// logPrefix marks every line the plugin emits, so plugin output can be grepped
-// out of the shared host log.
+// logPrefix 给插件输出的每一行打上前缀，方便在共享的宿主日志里 grep 出来。
 const logPrefix = "modelscope-ratelimit: "
 
-// hostLogDisabled latches off host.log forwarding after a single failure. The
-// callback is best effort: a plugin that kept knocking on a broken door would
-// pay a failing cgo round trip on every log line.
+// hostLogDisabled 在一次失败后就锁死 host.log 转发。这个回调是尽力而为：如果插件一直敲一扇坏掉的
+// 门，每条日志都要付出一次失败的 cgo 往返代价。
 var hostLogDisabled atomic.Bool
 
-// hostLogCall is indirected so tests can drive both the forwarding path and the
-// fallback without a real host.
+// hostLogCall 做了一层间接，便于测试在没有真实宿主的情况下同时覆盖转发路径和回退路径。
 var hostLogCall = callHost
 
-// hostReady reports whether the host callback table has been handed over yet.
-// Indirected (rather than reading the cgo pointer inline) so the logging seam is
-// exercisable from tests, which cannot reference the cgo pseudo-package.
+// hostReady 判断宿主的回调表是否已经交付。这里做成间接调用（而不是就地读 cgo 指针），因为测试无法
+// 引用 cgo 伪包，这样日志这条接缝也能被测试覆盖。
 var hostReady = func() bool { return pluginHost != nil }
 
-// rpcHostLogRequest mirrors the host glue layer's rpcHostLogRequest.
+// rpcHostLogRequest 与宿主胶水层的 rpcHostLogRequest 保持一致。
 type rpcHostLogRequest struct {
 	HostCallbackID string         `json:"host_callback_id,omitempty"`
 	Level          string         `json:"level,omitempty"`
@@ -196,14 +183,12 @@ type rpcHostLogRequest struct {
 	Fields         map[string]any `json:"fields,omitempty"`
 }
 
-// emitHostLog forwards one line into CLIProxyAPI's own logger.
+// emitHostLog 把一行日志转发进 CLIProxyAPI 自己的 logger。
 //
-// The plugin runs in its own Go runtime, so the stdlib logger writes to the
-// plugin's stderr — with logging-to-file enabled that is only the console
-// window, never main.log, and the management log API shows nothing. host.log
-// puts plugin diagnostics in the same rotating file; passing the caller's
-// host_callback_id also tags the line with the host request id. callbackID may
-// be empty (background workers have no request context).
+// 插件跑在自己的 Go runtime 里，标准库 logger 只会写到插件的 stderr。开启 logging-to-file 之后那
+// 只出现在控制台窗口，永远进不了 main.log，管理端的日志接口也就什么都看不到。host.log 能把插件的诊
+// 断信息写进同一个滚动文件；带上调用方的 host_callback_id 还能给这行打上宿主请求 id。callbackID 可
+// 以为空（后台协程没有请求上下文）。
 func emitHostLog(level, callbackID, message string) bool {
 	if !hostReady() || hostLogDisabled.Load() {
 		return false
@@ -220,9 +205,8 @@ func emitHostLog(level, callbackID, message string) bool {
 	return true
 }
 
-// logAt emits one plugin diagnostic. Level "info" is always visible; "debug"
-// needs the host's debug logging switched on. Both fall back to the process
-// logger until the host handle exists (early init) or once forwarding is off.
+// logAt 输出一条插件诊断。info 级始终可见；debug 级需要打开宿主的调试日志。在宿主句柄出现之前（早
+// 期初始化）或者转发已被关闭时，两者都退回进程自身的 logger。
 func logAt(level, callbackID, format string, args ...any) {
 	message := format
 	if len(args) > 0 {
@@ -239,14 +223,12 @@ func logAt(level, callbackID, format string, args ...any) {
 
 func logInfo(format string, args ...any) { logAt("info", "", format, args...) }
 
-// maxLogBody bounds how much of an upstream error body reaches the log. Error
-// documents are short; the cap keeps a pathological body from bloating
-// main.log.
+// maxLogBody 限制上游错误体有多少内容进入日志。错误文档通常很短，加上限是为了防止异常巨大的响应体
+// 把 main.log 撑爆。
 const maxLogBody = 300
 
-// logBodyExcerpt returns a single-line, length-bounded excerpt of a response
-// body for diagnostics. Only error paths use it, so it never carries a
-// successful completion's content.
+// logBodyExcerpt 返回响应体的单行、限长摘要，用于诊断。只有错误路径会用到它，因此不会带上正常完成
+// 响应的内容。
 func logBodyExcerpt(body string) string {
 	body = strings.TrimSpace(body)
 	body = strings.NewReplacer("\n", " ", "\r", " ", "\t", " ").Replace(body)
@@ -258,32 +240,30 @@ func logBodyExcerpt(body string) string {
 
 func logDebug(format string, args ...any) { logAt("debug", "", format, args...) }
 
-// logInfoRequest and logDebugRequest attach the host callback id so the line is
-// tagged with the request id of the call that produced it.
+// logInfoRequest 与 logDebugRequest 会带上宿主回调 id，于是这一行就被打上了产生它的那次请求的请求
+// id。
 func logInfoRequest(callbackID, format string, args ...any) {
 	logAt("info", callbackID, format, args...)
 }
 
-// configBannerMu guards the banner bookkeeping below.
+// configBannerMu 保护下面的横幅记账状态。
 var (
 	configBannerMu      sync.Mutex
 	lastConfigBanner    string
 	pendingConfigBanner string
 )
 
-// logConfigBanner records the effective settings for the next flush, once per
-// real change.
+// logConfigBanner 在每次配置真正变化时记下生效参数，留待下一次输出。
 //
-// It deliberately does not print: the host runs pluginhost.ApplyConfig (which
-// lands here through configure()) before logging.ConfigureLogOutput attaches the
-// rotating file, so a line written during configure only reaches the console and
-// never main.log. plugin.register and plugin.reconfigure also fire several times
-// per reload, so eager printing duplicated the line as well.
+// 它故意不直接打印：宿主在 logging.ConfigureLogOutput 挂上滚动日志文件之前就会执行
+// pluginhost.ApplyConfig（经由 configure() 落到这里），所以在 configure 期间写的行只能到控制台，
+// 永远进不了 main.log。并且 plugin.register 与 plugin.reconfigure 每次重载都会触发好几次，急着打印
+// 还会把这一行重复输出。
 func logConfigBanner(cfg *modelscope.Config) {
 	if cfg == nil {
 		return
 	}
-	// Never include the management key or any credential material here.
+	// 这里绝不能包含管理密钥或任何凭据内容。
 	line := fmt.Sprintf("configured v%s providers=%s use_responses=%s skip_provider_on_429=%t cooldown=%.1fs host=%s",
 		pluginVersion, strings.Join(cfg.Providers, ","), strings.Join(cfg.UseResponses, ","),
 		cfg.SkipProviderOn429, cfg.InsufficientQuotaCooldown, cfg.HostBaseURL)
@@ -295,9 +275,8 @@ func logConfigBanner(cfg *modelscope.Config) {
 	configBannerMu.Unlock()
 }
 
-// flushConfigBanner writes a recorded banner exactly once. Called from the first
-// runtime host call after configure and from the post-startup account fetch, so a
-// proxy that sees no traffic still reports what it loaded.
+// flushConfigBanner 把已记录的横幅恰好输出一次。触发点是 configure 之后第一次运行期宿主调用，以及
+// 启动后的账号拉取，因此即使代理没有流量也会报告它加载了什么配置。
 func flushConfigBanner() {
 	configBannerMu.Lock()
 	line := pendingConfigBanner
@@ -312,8 +291,7 @@ func logDebugRequest(callbackID, format string, args ...any) {
 	logAt("debug", callbackID, format, args...)
 }
 
-// stderrLogger is the sink the core state machine logs into. The name is kept
-// for its history; it now routes through host.log.
+// stderrLogger 是核心状态机的日志出口。名字沿用历史，实际现在走 host.log。
 type stderrLogger struct{}
 
 func (stderrLogger) Printf(format string, args ...any) { logInfo(format, args...) }
@@ -325,9 +303,8 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	if plugin == nil {
 		return 1
 	}
-	// Store host.* callback pointers for executor HTTP/streaming. Management
-	// API key resolution still uses net/http direct (see httpDo) to avoid
-	// cgo panics on the status-page auto-refresh path.
+	// 保存 host.* 回调指针，供执行器做 HTTP 和流式调用。管理 API 的 key 解析仍然直接用
+	// net/http（见 httpDo），以避免状态页自动刷新那条路径上出现 cgo panic。
 	pluginHost = C.cliproxy_copy_host(host)
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
@@ -338,11 +315,10 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 
 //export cliproxyPluginCall
 func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
-	// Top-level safety net: a panic anywhere in plugin Go code must never cross
-	// the cgo boundary, or the host fuses the plugin and browsers see a 502
-	// "plugin resource handler failed". Catch it and return a valid error
-	// envelope. The status page additionally wraps itself (safeHandleManagement)
-	// so it degrades to a 200 HTML page rather than an error envelope.
+	// 顶层保险：插件 Go 代码里任何位置的 panic 都不能越过 cgo 边界，否则宿主会把整个插件
+	// fuse 掉，浏览器上就是一个 502 "plugin resource handler failed"。这里捕获后返回一个合法的
+	// 错误信封。状态页另外还有一层 safeHandleManagement 包裹，保证它退化成一页 200 的 HTML 而不是
+	// 错误信封。
 	defer func() {
 		if rec := recover(); rec != nil {
 			logInfo("recovered panic in plugin call: %v", rec)
@@ -382,13 +358,11 @@ func cliproxyPluginShutdown() {
 	store.Shutdown()
 }
 
-// handleMethod dispatches the documented plugin methods. It returns the full
-// {ok,result}/{ok:false,error} envelope bytes plus a Go error for transport
-// failures (which are also wrapped as an error envelope by the caller).
+// handleMethod 分发文档里约定的插件方法。返回完整的 {ok,result} / {ok:false,error} 信封字节，
+// 传输层失败则返回 Go error（调用方同样会把它包成错误信封）。
 func handleMethod(method string, request []byte) ([]byte, error) {
 	if method != pluginabi.MethodPluginRegister && method != pluginabi.MethodPluginReconfigure {
-		// A runtime method means the host is past startup and its log sink is
-		// attached, so the deferred configuration banner can be written.
+		// 出现运行期方法调用说明宿主已经过了启动阶段、日志出口也已挂好，此时可以补写那条被推迟的配置横幅。
 		flushConfigBanner()
 	}
 	switch method {
@@ -430,8 +404,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Async streaming: return headers only; chunks are pushed via
-		// host.stream.emit using the stream_id from the request.
+		// 异步流式：这里只返回响应头，数据块通过 host.stream.emit 按请求里的 stream_id 推送。
 		return okEnvelope(struct {
 			Headers http.Header `json:"headers,omitempty"`
 		}{Headers: resp.Headers})
@@ -473,18 +446,13 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			return nil, err
 		}
 		store.OnUsage(r)
-		// If the response was 429 + "insufficient balance", the account's
-		// magic cube is exhausted. Update the accounts cache immediately so
-		// the frontend reflects the real balance without waiting for refresh.
-		// Magic cubes are account-scoped on the server, so propagate the core
-		// disable to every auth ID that shares the same raw API key across
-		// providers. This avoids trying the same exhausted account through a
-		// second managed provider.
+		// 如果响应是 429 + "insufficient balance"，说明该账号魔粒已耗尽。立刻更新账号缓存，让前端不
+		// 必等待刷新就能看到真实余额。魔粒在服务端是账号维度的，所以要把核心层的禁用传播给跨 provider
+		// 共享同一原始 api key 的所有 auth ID，避免用第二个托管 provider 去撞同一个耗尽账号。
 		if r.Failed && r.Failure != nil && modelscope.IsInsufficientBalance(r.Failure.StatusCode, r.Failure.Body) {
-			// resolved.masked maps authID -> maskKey(apiKey), which is the
-			// same MaskedKey stored in accountsCache.results. Using
-			// maskKey(r.AuthID) directly would give the auth ID's 12-hex
-			// suffix, which never matches the API key's last 12 chars.
+			// resolved.masked 是 authID 到 maskKey(apiKey) 的映射，与 accountsCache.results 里存的
+			// MaskedKey 同源。若直接用 maskKey(r.AuthID) 得到的是 auth ID 自己的 12 位十六进制后缀，跟
+			// api key 的末 12 位永远对不上。
 			resolved := getResolved()
 			if mk, ok := resolved.masked[r.AuthID]; ok && mk != "" {
 				markAccountExhausted(mk)
@@ -506,18 +474,16 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okEnvelope(struct{}{})
 
 	case pluginabi.MethodManagementRegister:
-		// Request carries host context (BasePath/ResourceBasePath) which we
-		// don't need; we just declare our resource page.
+		// 请求里带有宿主上下文（BasePath/ResourceBasePath），本插件用不到，只需要声明自己的资源页。
 		return okEnvelope(managementRegistration())
 
 	case pluginabi.MethodManagementHandle:
-		// The status page is unauthenticated and must ALWAYS render: never
-		// return an error envelope (which the host turns into a 502). Parse
-		// failures and panics degrade to a valid 200 HTML page.
+		// 状态页无需鉴权且必须永远能渲染出来：绝不返回错误信封（宿主会把它变成 502）。解析失败或 panic
+		// 都退化成一页合法的 200 HTML。
 		return okEnvelope(safeHandleManagement(request))
 
 	default:
-		// Unknown method: return an envelope-level error (not a transport error).
+		// 未知方法：返回信封级错误（不是传输层错误）。
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
 }
@@ -542,34 +508,29 @@ func configure(raw []byte) error {
 		return err
 	}
 	store.Reconfigure(cfg)
-	// One line per real configuration change so the host log shows which build
-	// answered and with what effective settings. The host calls both
-	// plugin.register and plugin.reconfigure, so an unguarded banner would print
-	// several identical lines per reload. Never log the management key or any
-	// credential material here.
+	// 每次配置真正变化只打印一行，便于从宿主日志里看出是哪个构建、按什么生效参数在应答。宿主会同时调
+	// 用 plugin.register 和 plugin.reconfigure，没有保护的横幅会在一次重载里重复多行。这里绝不打印
+	// 管理密钥或任何凭据内容。
 	logConfigBanner(cfg)
-	// TODO: remove after debugging. Routes Modelscope API calls through proxy.
+	// TODO：调试结束后移除。让 Modelscope API 调用改走代理。
 	SetMSProxy(cfg.MsProxyURL)
 	store.Start()
-	// Inject the host-strategy fetcher so non-managed fallback candidates use
-	// the host's own routing semantics (fetched via the management API).
+	// 注入宿主策略取数函数，让非托管兜底候选也遵循宿主自己的路由语义（通过管理 API 获取）。
 	store.SetStrategyFetcher(func() string {
 		return fetchHostStrategyCached(cfg.HostBaseURL, cfg.ManagementKey)
 	})
 	store.SetProviderOrderFetcher(func() map[string][]string {
 		return fetchProviderOrderCached(cfg.HostBaseURL, cfg.ManagementKey, cfg.Providers)
 	})
-	// Inject the midnight auto sign-in function: at the daily boundary
-	// (PruneAll dayChanged), iterate all resolved auth IDs, call
-	// /api/v1/users/login/info for each (activates daily magic cube),
-	// then fetch balance and rate-limit to update core state.
+	// 注入午夜自动签到函数：在跨日边界（PruneAll 的 dayChanged）遍历所有已解析的 auth ID，逐个调
+	// /api/v1/users/login/info（激活当日魔粒），再拉取余额和限流以更新核心状态。
 	mc := &msClient{}
 	store.SetMidnightSignInFunc(func() {
 		cfg := currentConfig()
 		if cfg == nil || len(cfg.Providers) == 0 || cfg.ManagementKey == "" {
 			return
 		}
-		// Force a fresh resolve so we have the latest raw keys + site base URLs.
+		// 强制重新解析一次，拿到最新的原始 key 与站点基础地址。
 		resolveKeysCached(cfg.HostBaseURL, cfg.ManagementKey, cfg.Providers)
 		resolved := getResolved()
 		if resolved.raw == nil {
@@ -629,8 +590,7 @@ func configure(raw []byte) error {
 			}()
 		}
 		swg.Wait()
-		// Refresh the accounts cache so the first page load is instant.
-		// Use forceBackgroundRefresh to avoid racing with an in-progress refresh.
+		// 刷新账号缓存，让首次打开页面就能拿到数据。用 forceBackgroundRefresh 避免与正在进行的刷新争抢。
 		go func() {
 			if !forceBackgroundRefresh() {
 				return
@@ -649,8 +609,7 @@ func configure(raw []byte) error {
 	cfgMu.Lock()
 	pluginCfg = cfg
 	cfgMu.Unlock()
-	// Config changed: drop the resolved + strategy caches so the next request
-	// / page load refetches.
+	// 配置已变：丢掉解析结果和策略缓存，让下一次请求或页面加载重新取数。
 	resolvedMu.Lock()
 	resolvedCache = resolvedEntry{}
 	resolvedMu.Unlock()
@@ -658,13 +617,11 @@ func configure(raw []byte) error {
 	strategyMu.Lock()
 	strategyCache = strategyEntry{}
 	strategyMu.Unlock()
-	// 10s after startup: fetch login/info (daily sign-in) + balance for all
-	// accounts so the management page has data ready before first access.
-	// After this, refreshes only fetch balance + rate-limit (no login/info).
+	// 启动 10 秒后：给所有账号拉取 login/info（当日签到）和余额，使管理页面在首次访问前就有数据。此
+	// 后的刷新只取余额和限流（不再调 login/info）。
 	go func() {
 		time.Sleep(10 * time.Second)
-		// Startup logging is attached by now even if no request has arrived, so an
-		// idle proxy still reports the configuration it loaded.
+		// 到这儿宿主的启动日志已经挂好，即使还没有任何请求进来，空闲的代理也会报告它加载的配置。
 		flushConfigBanner()
 		if !forceBackgroundRefresh() {
 			return
@@ -683,27 +640,23 @@ func configure(raw []byte) error {
 	return nil
 }
 
-// currentConfig returns the last applied plugin config (nil before configure).
+// currentConfig 返回最近一次生效的插件配置（configure 之前为 nil）。
 func currentConfig() *modelscope.Config {
 	cfgMu.Lock()
 	defer cfgMu.Unlock()
 	return pluginCfg
 }
 
-// ---- Server-side key resolution (direct net/http, no cgo callback) ----
+// ---- 服务端 key 解析（直连 net/http，不走 cgo 回调）----
 
-// resolveHTTPClient is the outbound client for server-side key resolution.
-// It talks DIRECTLY to the local management API rather than via the host.http.do
-// cgo callback: the plugin is a c-shared library with its own Go runtime, so a
-// panic inside a host callback would cross the runtime boundary and be
-// unrecoverable by any plugin-level recover(), fusing the plugin and surfacing
-// as a 502 on the (auto-refreshing) status page. A direct localhost HTTP call
-// can only ever return errors, which degrade to a 200 guidance page.
+// resolveHTTPClient 是服务端 key 解析使用的出站客户端。它直连本机管理 API，而不是走
+// host.http.do 的 cgo 回调：插件是带自己 Go runtime 的 c-shared 库，宿主回调里的 panic 会跨越
+// runtime 边界、插件层的 recover() 无法挽回，结果是插件被 fuse、自动刷新的状态页上表现为 502。
+// 直连本机 HTTP 只会返回错误，最多退化成一页引导提示。
 var resolveHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
-// httpDo issues an HTTP request from the plugin's own runtime and returns the
-// status code and body. Used only for the local management API, so no proxy or
-// host transport policy is required.
+// httpDo 在插件自己的 runtime 里发起 HTTP 请求，返回状态码和响应体。只用于本机管理 API，因此不需
+// 要代理或宿主的传输策略。
 func httpDo(method, url, bearerKey string) (int, []byte, error) {
 	req, err := http.NewRequest(method, url, nil)
 	if err != nil {
@@ -731,9 +684,8 @@ func maskKey(k string) string {
 	return k[len(k)-12:]
 }
 
-// maskToken masks a token for safe display: first 6 + "..." + last 4.
-// Used for SdkToken and Token fields in API responses to prevent
-// raw credential leakage to the unauthenticated status page.
+// maskToken 以安全方式掩码 token：前 6 位 + "..." + 末 4 位。用于 API 响应里的 SdkToken 和
+// Token 字段，避免把原始凭据泄露给无需鉴权的状态页。
 func maskToken(k string) string {
 	if len(k) <= 10 {
 		return k
@@ -755,15 +707,11 @@ type mgmtOpenAICompatEntry struct {
 	} `json:"models"`
 }
 
-// stableIDGen replicates the host's synthesizer.StableIDGenerator exactly,
-// including the per-(kind:short) collision counter that appends a "-N" suffix
-// (e.g. "1ae0d269c959-1") when two distinct api-key entries hash to the same
-// 12-hex short. Without the counter, colliding keys collapse to one masked
-// entry and the suffixed counterpart never appears in the key-detail table.
-// Entries are processed in config order (the management API preserves it) and
-// disabled compat entries are skipped, matching synthesizeOpenAICompat, so the
-// derived IDs are byte-for-byte identical to the real auth IDs the plugin sees
-// in scheduler/usage requests.
+// stableIDGen 完整复刻宿主的 synthesizer.StableIDGenerator，包括按 (kind:short) 维护的碰撞计数
+// 器：当两条不同的 api-key 哈希出同一个 12 位十六进制 short 时，会追加 "-N" 后缀（例如
+// "1ae0d269c959-1"）。没有这个计数器时，碰撞的 key 会合并成一条掩码条目，带后缀的那条永远不出现在
+// key 明细表里。条目按配置顺序处理（管理 API 保持该顺序），并跳过 disabled 的兼容配置，与
+// synthesizeOpenAICompat 一致，因此推导出的 ID 与插件实际看到的 auth ID 逐字节相同。
 type stableIDGen struct {
 	counters map[string]int
 }
@@ -772,7 +720,7 @@ func newStableIDGen() *stableIDGen {
 	return &stableIDGen{counters: make(map[string]int)}
 }
 
-// Next mirrors synthesizer.StableIDGenerator.Next.
+// Next 复刻 synthesizer.StableIDGenerator.Next。
 func (g *stableIDGen) Next(kind string, parts ...string) string {
 	h := sha256.New()
 	h.Write([]byte(kind))
@@ -794,12 +742,10 @@ func (g *stableIDGen) Next(kind string, parts ...string) string {
 	return kind + ":" + short
 }
 
-// resolveKeys fetches /v0/management/openai-compatibility via direct net/http
-// and returns masked keys (authID -> masked), the real configured key count,
-// and the configured providers NOT found upstream. The auth ID is derived from
-// each api-key with stableIDGen (the host's StableIDGenerator algorithm), so
-// no auth-files join is needed (auth-files omits config-based api-keys). The
-// management key stays server-side; nothing sensitive reaches the browser.
+// resolveKeys 用直连 net/http 拉取 /v0/management/openai-compatibility，返回掩码 key
+// （authID 到掩码）、真实配置的 key 数量，以及在上游找不到的配置 provider。auth ID 由每把
+// api-key 经 stableIDGen（宿主的 StableIDGenerator 算法）推导，因此不需要再去 join auth-files
+// （auth-files 不含配置式 api-key）。管理密钥只留在服务端，任何敏感内容都不会进浏览器。
 func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string]string, raw map[string]string, siteBase map[string]string, orderedAuthIDs []string, providerOrder map[string][]string, realTotal int, unmatched []string, baseURLs map[string]string, routeToName map[string]map[string]string, nameToRoute map[string]map[string]string, err error) {
 	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if base == "" {
@@ -841,16 +787,14 @@ func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string
 	for _, e := range oc.List {
 		nm := strings.ToLower(strings.TrimSpace(e.Name))
 		if len(want) > 0 && !want[nm] {
-			// Non-managed provider: not collected. The Responses executor
-			// only tries managed providers; non-managed providers are served
-			// by the host's built-in path (host.model.execute) via chat.
+			// 非托管 provider：不收集。Responses 执行器只尝试托管 provider，非托管 provider 由宿主的内置
+			// 路径（host.model.execute）按 chat 服务。
 			continue
 		}
 		matched[nm] = true
-		// Skip disabled compat entries: the host synthesizer does the same
-		// (if compat.Disabled { continue }), so their keys never receive auth
-		// IDs and must be excluded to keep the collision-counter ordering
-		// identical to the real auth IDs the plugin observes.
+		// 跳过 disabled 的兼容配置：宿主的合成器也是这样处理（if compat.Disabled { continue }），所以他
+		// 们的 key 永远不会获得 auth ID；这里必须同样排除，才能让碰撞计数器的顺序与插件实际观察到的 auth
+		// ID 完全一致。
 		if e.Disabled {
 			continue
 		}
@@ -872,10 +816,8 @@ func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string
 			orderedAuthIDs = append(orderedAuthIDs, authID)
 			providerOrder[nm] = append(providerOrder[nm], authID)
 		}
-		// Build the route-ID <-> upstream-name indexes. Every configured model
-		// is indexed, not just aliased ones: the host registers the alias as the
-		// model ID when one is set and the name otherwise, so the two must never
-		// be used interchangeably when the plugin asks the host to execute.
+		// 建立 路由ID 与 上游模型名 的双向索引。所有配置的模型都进索引，不只是有别名的：宿主设置了 alias
+		// 时注册的是 alias，否则注册的是 name，因此插件请求宿主执行时两者绝不可互换使用。
 		routes := make(map[string]string)
 		toRoute := make(map[string]string)
 		for _, m := range e.Models {
@@ -895,7 +837,7 @@ func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string
 		nameToRoute[nm] = toRoute
 	}
 
-	// Configured providers that no upstream openai-compatibility entry matches.
+	// 配置里写了、但没有任何上游 openai-compatibility 条目能匹配上的 provider。
 	for _, p := range providers {
 		if w := strings.ToLower(strings.TrimSpace(p)); w != "" && !matched[w] {
 			unmatched = append(unmatched, p)
@@ -904,19 +846,16 @@ func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string
 	return masked, raw, siteBase, orderedAuthIDs, providerOrder, realTotal, unmatched, baseURLs, routeToName, nameToRoute, nil
 }
 
-// resolveRefreshMu guards resolveRefreshing, the singleflight flag that
-// deduplicates concurrent resolveKeys calls so a cache miss under load fires
-// at most one management-API request. The scheduler hot path is non-blocking
-// (fetchProviderOrderCached); only the management page / midnight sign-in use
-// the synchronous resolveKeysCached.
+// resolveRefreshMu 保护 resolveRefreshing，即给并发 resolveKeys 调用去重的 singleflight 标记，
+// 使负载下的缓存未命中最多只发一次管理 API 请求。调度器热路径是非阻塞的（fetchProviderOrderCached），
+// 只有管理页面和午夜签到使用同步的 resolveKeysCached。
 var (
 	resolveRefreshMu  sync.Mutex
 	resolveRefreshing bool
 )
 
-// resolvedExpired reports whether the cached entry is past its TTL. Error
-// entries use a longer backoff TTL to avoid hammering the management API on
-// auth failures.
+// resolvedExpired 判断缓存条目是否已过 TTL。出错条目使用更长的退避 TTL，避免鉴权失败时反复敲管理
+// API 的门。
 func resolvedExpired(c resolvedEntry) bool {
 	if c.at.IsZero() {
 		return true
@@ -928,9 +867,8 @@ func resolvedExpired(c resolvedEntry) bool {
 	return c.at.Add(ttl).Before(time.Now())
 }
 
-// performResolve does the management-API fetch and stores the result,
-// returning the fresh entry. Shared by the sync (resolveKeysCached) and async
-// (startResolveRefresh) paths so the store logic lives in one place.
+// performResolve 执行管理 API 取数并存下结果，返回新条目。同步路径（resolveKeysCached）与异步路
+// 径（startResolveRefresh）共用它，保证写缓存的逻辑只有一处。
 func performResolve(baseURL, mgmtKey string, providers []string) resolvedEntry {
 	masked, raw, siteBase, orderedAuthIDs, providerOrder, realTotal, unmatched, baseURLs, routeToName, nameToRoute, err := resolveKeys(baseURL, mgmtKey, providers)
 	dedupedAuthIDs, rawToAuthIDs, maskToRaw, maskToSite := buildDedupMaps(orderedAuthIDs, raw, siteBase)
@@ -941,10 +879,8 @@ func performResolve(baseURL, mgmtKey string, providers []string) resolvedEntry {
 	return refreshed
 }
 
-// startResolveRefresh launches a singleflight background refresh if one is not
-// already running. Used by the scheduler hot path: it never blocks the caller,
-// which returns stale (or nil) data immediately and lets the async refresh
-// warm the cache for subsequent picks.
+// startResolveRefresh 在没有正在运行的刷新时启动一次 singleflight 后台刷新。供调度器热路径使用：
+// 它绝不阻塞调用方，调用方立刻拿到过期（或 nil）数据，由异步刷新为后续挑选预热缓存。
 func startResolveRefresh(baseURL, mgmtKey string, providers []string) {
 	resolveRefreshMu.Lock()
 	if resolveRefreshing {
@@ -968,9 +904,8 @@ func resolveKeysCached(baseURL, mgmtKey string, providers []string) (map[string]
 	if !resolvedExpired(c) {
 		return c.masked, c.providerOrder, c.realTotal, c.unmatched, c.err
 	}
-	// Singleflight: only one caller performs the HTTP fetch; concurrent
-	// callers get the (possibly stale) cached entry instead of firing
-	// duplicate management-API requests.
+	// singleflight：只有一个调用方真正去做 HTTP 取数；并发调用方拿到（可能过期的）缓存条目，不再重复
+	// 发管理 API 请求。
 	resolveRefreshMu.Lock()
 	if resolveRefreshing {
 		resolveRefreshMu.Unlock()
@@ -987,13 +922,10 @@ func resolveKeysCached(baseURL, mgmtKey string, providers []string) (map[string]
 	return c.masked, c.providerOrder, c.realTotal, c.unmatched, c.err
 }
 
-// buildDedupMaps constructs the deduplication and lookup maps from the
-// resolved key data. It is extracted as a pure function so it can be
-// unit-tested without HTTP. When the same raw API key appears in multiple
-// providers (different auth IDs), only the first occurrence (first provider in
-// config order) is kept in dedupedAuthIDs / maskToRaw / maskToSite, while
-// rawToAuthIDs groups every auth ID that shares the raw key for disable
-// propagation.
+// buildDedupMaps 从解析出的 key 数据构建去重与查找映射。单独抽成纯函数是为了不依赖 HTTP 也能单测。
+// 同一把原始 api key 出现在多个 provider（不同 auth ID）时，dedupedAuthIDs、maskToRaw、
+// maskToSite 只保留第一次出现的那条（配置顺序里的第一家），而 rawToAuthIDs 会把共享该原始 key 的
+// 所有 auth ID 归组，用于禁用传播。
 func buildDedupMaps(orderedAuthIDs []string, raw map[string]string, siteBase map[string]string) (dedupedAuthIDs []string, rawToAuthIDs map[string][]string, maskToRaw map[string]string, maskToSite map[string]string) {
 	maskToRaw = make(map[string]string, len(raw))
 	maskToSite = make(map[string]string, len(raw))
@@ -1015,39 +947,31 @@ func buildDedupMaps(orderedAuthIDs []string, raw map[string]string, siteBase map
 	return dedupedAuthIDs, rawToAuthIDs, maskToRaw, maskToSite
 }
 
-// getResolved returns a value copy of the cached resolved entry. The maps are
-// immutable after construction, so copying the struct is cheap and prevents a
-// caller from reading fields of a racing global replacement.
+// getResolved 返回缓存解析条目的值拷贝。这些 map 在构造之后不再修改，所以拷贝结构体开销很小，还能避
+// 免调用方读到正在被全局替换竞争中的字段。
 func getResolved() resolvedEntry {
 	resolvedMu.Lock()
 	defer resolvedMu.Unlock()
 	return resolvedCache
 }
 
-// fetchProviderOrderCached is the scheduler.hot-path reader for the per-
-// provider config-ordered auth-ID list (including keys that may currently be
-// disabled). The scheduler indexes the round-robin cursor into this FULL list
-// so 429 retries and disabled keys don't corrupt the rotation order.
+// fetchProviderOrderCached 是调度器热路径上读取“按 provider 的配置顺序 auth ID 列表”（含当前可能被
+// 禁用的 key）的入口。调度器把轮询游标索引到这份完整列表上，因此 429 重试和禁用 key 不会打乱轮换顺序。
 //
-// It is NON-BLOCKING: it returns the cached list immediately (stale entries
-// are fine for key ordering) and only triggers a singleflight async refresh
-// when the cache is expired. On a cold cache it returns nil so pickManaged
-// falls back to its observed-order snapshot — a request never stalls on a
-// management-API HTTP call.
+// 它不阻塞：立刻返回缓存列表（过期条目对 key 排序无碍），只在缓存已到期时触发一次 singleflight 异步刷
+// 新。冷缓存时返回 nil，于是 pickManaged 退回自己的观测顺序快照，任何请求都不会卡在管理 API 的 HTTP 调用
+// 上。
 func fetchProviderOrderCached(baseURL, mgmtKey string, providers []string) map[string][]string {
 	c := getResolved()
 	if resolvedExpired(c) {
 		startResolveRefresh(baseURL, mgmtKey, providers)
 	}
-	return c.providerOrder // nil when cold/error; stale otherwise
+	return c.providerOrder // 冷启动或出错时为 nil，其余情况可能是过期数据
 }
 
-// fetchHostStrategy queries GET /v0/management/routing/strategy and returns
-// the host's built-in credential selection strategy ("round-robin" or
-// "fill-first"). The result is cached for strategyCacheTTL so the scheduler.pick
-// fallback path does not hit the management API on every request. On any error
-// it defaults to "round-robin" (the host's own default) so the plugin never
-// blocks on strategy resolution.
+// fetchHostStrategy 查询 GET /v0/management/routing/strategy，返回宿主内置的凭据选择策略
+// （"round-robin" 或 "fill-first"）。结果按 strategyCacheTTL 缓存，避免 scheduler.pick 的兜底路径每
+// 个请求都打管理 API。任何错误都退回 "round-robin"（宿主自己的默认值），因此插件绝不会卡在策略解析上。
 func fetchHostStrategy(baseURL, mgmtKey string) string {
 	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if base == "" {
@@ -1071,15 +995,14 @@ func fetchHostStrategy(baseURL, mgmtKey string) string {
 	}
 }
 
-// strategyRefreshMu guards strategyRefreshing, the singleflight flag for
-// background strategy refreshes so the fallback path never fires concurrent
-// management-API requests.
+// strategyRefreshMu 保护 strategyRefreshing，即后台策略刷新的 singleflight 标记，保证兜底路径不会并发
+// 发起多次刷新。
 var (
 	strategyRefreshMu  sync.Mutex
 	strategyRefreshing bool
 )
 
-// strategyExpired reports whether the cached strategy is past its TTL.
+// strategyExpired 判断缓存的策略是否已过 TTL。
 func strategyExpired(c strategyEntry) bool {
 	if c.at.IsZero() {
 		return true
@@ -1087,9 +1010,8 @@ func strategyExpired(c strategyEntry) bool {
 	return c.at.Add(strategyCacheTTL).Before(time.Now())
 }
 
-// startStrategyRefresh launches a singleflight background strategy refresh if
-// one is not already running. Non-blocking: callers return the stale/default
-// strategy immediately.
+// startStrategyRefresh 在没有正在运行的刷新时启动一次 singleflight 后台策略刷新。非阻塞：调用方立刻拿
+// 到过期值或默认值。
 func startStrategyRefresh(baseURL, mgmtKey string) {
 	strategyRefreshMu.Lock()
 	if strategyRefreshing {
@@ -1118,8 +1040,7 @@ func fetchHostStrategyCached(baseURL, mgmtKey string) string {
 	if !strategyExpired(c) {
 		return c.strategy
 	}
-	// Non-blocking: trigger an async refresh and return stale-or-default so
-	// the scheduler.pick fallback path never stalls on a management-API call.
+	// 非阻塞：触发一次异步刷新并立刻返回过期值或默认值，让 scheduler.pick 的兜底路径绝不卡在管理 API 上。
 	startStrategyRefresh(baseURL, mgmtKey)
 	if c.strategy != "" {
 		return c.strategy
@@ -1127,8 +1048,7 @@ func fetchHostStrategyCached(baseURL, mgmtKey string) string {
 	return "round-robin"
 }
 
-// pluginRegistration builds the plugin.register result: metadata, config
-// fields and declared capabilities.
+// pluginRegistration 构造 plugin.register 的返回结果：元数据、配置字段声明和能力声明。
 func pluginRegistration() any {
 	return struct {
 		SchemaVersion uint32                   `json:"schema_version"`
@@ -1142,9 +1062,9 @@ func pluginRegistration() any {
 			Author:           "k452b",
 			GitHubRepository: "https://github.com/bytehola/modelscope-ratelimit",
 			ConfigFields: []pluginapi.ConfigField{
-				{Name: "providers", Type: pluginapi.ConfigFieldTypeArray, Description: "监控的提供商名称（必填）。填入顺序决定轮换顺序：skip_provider_on_429 关闭时，单次请求内 429 后切下一个 provider，任意 200 后下一次请求回到第一个 provider；只有 key 在各 provider 内跨请求轮换。"},
-				{Name: "skip_provider_on_429", Type: pluginapi.ConfigFieldTypeBoolean, Description: "关闭时（默认）：429+insufficient_quota 单次请求内切下一个 provider + 全局退避冷却，任意 200 回到第一个 provider；开启时：429 后直接用非托管模型兜底。"},
-				{Name: "use_responses", Type: pluginapi.ConfigFieldTypeString, Description: "打开 Responses API 接口：填写“*”表示全部模型，填写具体上游模型名表示仅该模型；YAML 中也支持数组，例如 [“ZhipuAI/GLM-5.2”, “Qwen/Qwen2.5-72B-Instruct”]。未列入的托管 provider 按 providers 顺序交由宿主以 Chat 协议兜底。默认关闭。"},
+				{Name: "providers", Type: pluginapi.ConfigFieldTypeArray, Description: "监控的提供商名称（必填）。填入顺序决定轮换顺序：请求先在本 provider 内逐个 key 轮换（insufficient balance 这类 key 级 429 只禁用当前 key），本家没有可用凭据了才切下一个 provider；任意 200 后下一次请求回到第一个 provider。"},
+				{Name: "skip_provider_on_429", Type: pluginapi.ConfigFieldTypeBoolean, Description: "只管池级 429（insufficient_quota）：开启时该 provider 整家进 skip 集，立即切下一个 provider / 非托管模型兜底（推荐打开）；关闭时按 insufficient_quota_cooldown 逐 key 退避。两种模式都先在本 provider 内换 key，本家 key 用尽才换家。任意 200 清空 skip 集并回到第一个 provider。"},
+				{Name: "use_responses", Type: pluginapi.ConfigFieldTypeString, Description: "打开 Responses API 接口（填上游模型 name，不是 alias）：填 “*” 或 “true” 表示全部模型；填 “false” 或任意匹配不到模型的字符串表示关闭；填单个上游模型名表示仅该模型；多个模型写在一行即可，例如 [\"ZhipuAI/GLM-5.2\", \"Qwen/Qwen2.5-72B-Instruct\"] 或 ZhipuAI/GLM-5.2, Qwen/Qwen2.5-72B-Instruct；YAML 数组写法同样有效。未列入的托管 provider 按 providers 顺序交由宿主以 Chat 协议兜底。默认关闭。"},
 				{Name: "host_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "CPA 链接地址，默认 http://127.0.0.1:8317。"},
 				{Name: "management_key", Type: pluginapi.ConfigFieldTypeString, Description: "CPA 管理密钥。（必填）"},
 				{Name: "credential_strategy", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"round-robin", "fill-first"}, Description: "凭据选择策略（仅对监控的 provider 生效）：round-robin=轮询（默认），fill-first=填充优先"},
@@ -1181,10 +1101,9 @@ type registrationCapabilities struct {
 	ExecutorOutputFormats     []string `json:"executor_output_formats"`
 }
 
-// ---- Management API: one resource page showing the live disable list ----
+// ---- 管理 API：一个展示实时禁用列表的资源页 ----
 
-// managementRegistration declares the browser resource page that appears as a
-// side-menu entry "Modelscope 限流" in the management center.
+// managementRegistration 声明浏览器侧的资源页，它在管理界面里以“Modelscope 限流”这个标签出现。
 func managementRegistration() any {
 	return struct {
 		Resources []managementResource `json:"resources"`
@@ -1205,7 +1124,7 @@ type managementResource struct {
 	Description string `json:"Description"`
 }
 
-// managementRequest mirrors pluginapi.ManagementRequest (wire-compatible).
+// managementRequest 与 pluginapi.ManagementRequest 保持一致（线上格式兼容）。
 type managementRequest struct {
 	Method  string              `json:"Method"`
 	Path    string              `json:"Path"`
@@ -1214,18 +1133,16 @@ type managementRequest struct {
 	Body    []byte              `json:"Body,omitempty"`
 }
 
-// managementResponse mirrors pluginapi.ManagementResponse (wire-compatible).
+// managementResponse 与 pluginapi.ManagementResponse 保持一致（线上格式兼容）。
 type managementResponse struct {
 	StatusCode int                 `json:"StatusCode"`
 	Headers    map[string][]string `json:"Headers,omitempty"`
 	Body       []byte              `json:"Body,omitempty"`
 }
 
-// safeHandleManagement wraps handleManagement so that any panic or request
-// parse error degrades to a valid 200 HTML page instead of an error envelope.
-// The host renders a 502 "plugin resource handler failed" whenever the
-// management.handle RPC returns ok:false, so the status page must never do
-// that — even mid-auto-refresh if resolution panics.
+// safeHandleManagement 包住 handleManagement，任何 panic 或请求解析错误都退化成一页合法的 200
+// HTML，而不是错误信封。宿主只要看到 management.handle 返回 ok:false 就会渲染 502 "plugin resource
+// handler failed"，所以状态页绝不能这么干，哪怕自动刷新途中解析 panic 也一样。
 func safeHandleManagement(request []byte) (resp managementResponse) {
 	defer func() {
 		if rec := recover(); rec != nil {
@@ -1235,44 +1152,32 @@ func safeHandleManagement(request []byte) (resp managementResponse) {
 	}()
 	var r managementRequest
 	if err := json.Unmarshal(request, &r); err != nil {
-		// Malformed envelope: assume the status route and render the safe view.
+		// 信封格式不合法：按状态页路由处理，渲染安全视图。
 		r = managementRequest{Method: "GET", Path: "/status"}
 	}
 	return handleManagement(r)
 }
 
-// statusOrGuidance renders the configuration guide when the plugin is not yet
-// usable, otherwise the unresolved status page. It performs NO HTTP call,
-// so it is safe to use as a panic-fallback. Used only when server-side
-// resolution is skipped or fails.
+// statusOrGuidance 在插件还不可用时渲染配置引导页，否则渲染未解析状态的状态页。它不发起任何 HTTP 调
+// 用，因此可以安全地作为 panic 兜底。只在服务端解析被跳过或失败时使用。
 func statusOrGuidance() string {
 	cfg := currentConfig()
 	if cfg == nil || len(cfg.Providers) == 0 || cfg.ManagementKey == "" {
 		return modelscope.RenderGuidanceHTML(cfg, modelscope.GuidanceMissing, "")
 	}
-	// Panic fallback: cannot safely resolve here, so show a guidance-style
-	// error page instead of an unresolved status page (RenderStatusHTML is gone).
+	// panic 兜底：这里无法安全地做解析，所以显示一页引导式错误提示，而不是一页没有数据的状态页（已没有
+	// RenderStatusHTML）。
 	return modelscope.RenderGuidanceHTML(cfg, modelscope.GuidanceResolutionFailed, "内部错误，请稍后刷新")
 }
 
-// handleManagement serves the resource page. The resource GET is not
-// management-authenticated, so only non-sensitive status is rendered.
-//
-//   - providers or management_key missing -> guidance (fill them via 编辑配置)
-//   - resolution fails (wrong key / host)  -> guidance (fix management_key / host_base_url)
-//   - configured providers not upstream    -> guidance (providers setting wrong)
-//   - otherwise                            -> full status page (masked keys, magic balance, usage and account status)
-//
-// Key resolution runs server-side via direct net/http, so the management key
-// never reaches the browser and the page is immune to browser same-origin /
-// third-party port-mismatch issues.
+// handleManagement 提供资源页。资源 GET 不走管理鉴权，因此只渲染非敏感状态。
 func handleManagement(r managementRequest) managementResponse {
-	// Route API endpoints via query parameter: ?api=accounts|account|transactions|checkin-all
+	// 通过查询参数分流接口：?api=accounts|account|transactions|checkin-all|refresh-balance|stats|config
 	api := getQuery(r, "api")
 	if api != "" {
 		return handleStatusAPI(r, api)
 	}
-	// Serve the embedded status page HTML (no query → HTML shell)
+	// 返回内嵌的状态页 HTML（无查询参数时给出 HTML 骨架）
 	path := r.Path
 	if r.Method != "GET" || !strings.HasSuffix(path, "/status") {
 		return managementResponse{StatusCode: 404, Headers: map[string][]string{"content-type": {"text/plain; charset=utf-8"}}, Body: []byte("not found")}
@@ -1298,10 +1203,8 @@ func handleManagement(r managementRequest) managementResponse {
 	return mgmtHTML(string(statusPageHTML))
 }
 
-// syncFetchAccounts fetches account data synchronously, guarding against
-// concurrent refreshes (e.g. the 10s startup goroutine). If another refresh
-// is already running, waits for it and returns the cache; otherwise acquires
-// refreshMu and does the fetch.
+// syncFetchAccounts 同步拉取账号数据，并防止并发刷新（例如启动后 10 秒的那个协程）。如果已经有刷新在
+// 跑，就等它完成并返回缓存；否则自己拿 refreshMu 去做这次拉取。
 func syncFetchAccounts(resolved resolvedEntry) managementResponse {
 	if forceBackgroundRefresh() {
 		defer markRefreshDone()
@@ -1310,13 +1213,13 @@ func syncFetchAccounts(resolved resolvedEntry) managementResponse {
 		fresh := refreshAccountsCache(resolved)
 		return mgmtJSON(map[string]any{"accounts": fresh, "fetchedAt": time.Now().Format("15:04:05")})
 	}
-	// Another refresh is running. Wait for it to complete.
+	// 已有别的刷新在跑，等它完成。
 	refreshMu.Lock()
 	refreshMu.Unlock()
 	if cached := getStaleAccountsCache(); cached != nil {
 		return mgmtJSON(map[string]any{"accounts": cached, "fetchedAt": getAccountsCacheTime()})
 	}
-	// Cache still empty after wait (other refresh failed) — direct fetch.
+	// 等待之后缓存仍为空（说明那次刷新失败），这里直接自己拉取。
 	fresh := refreshAccountsCache(resolved)
 	return mgmtJSON(map[string]any{"accounts": fresh, "fetchedAt": time.Now().Format("15:04:05")})
 }
@@ -1344,11 +1247,10 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 	case "accounts":
 		refresh := getQuery(r, "refresh")
 		if refresh == "1" {
-			// Force a background refresh and return stale data immediately.
-			// The frontend's 5s polling will pick up fresh data when ready.
+			// 强制后台刷新，并立刻返回旧数据。前端 5 秒轮询会在数据就绪后拿到新内容。
 			stale := getStaleAccountsCache()
 			if stale != nil {
-				// Have stale data: return it immediately, refresh in background.
+				// 有旧数据：立刻返回，并在后台刷新。
 				if forceBackgroundRefresh() {
 					go func() {
 						defer func() {
@@ -1364,12 +1266,12 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 				}
 				return mgmtJSON(map[string]any{"accounts": stale, "fetchedAt": getAccountsCacheTime()})
 			}
-			// No cache at all (first load): fetch synchronously with guard.
+			// 完全没有缓存（首次加载）：加锁同步拉取。
 			return syncFetchAccounts(resolved)
 		}
 		stale := getStaleAccountsCache()
 		if stale != nil {
-			// Return stale data immediately; trigger background refresh if expired
+			// 立刻返回旧数据；若已过期则触发后台刷新
 			if shouldBackgroundRefresh() {
 				go func() {
 					defer func() {
@@ -1385,7 +1287,7 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 			}
 			return mgmtJSON(map[string]any{"accounts": stale, "fetchedAt": getAccountsCacheTime()})
 		}
-		// No cache at all: fetch synchronously with guard.
+		// 完全没有缓存：加锁同步拉取。
 		return syncFetchAccounts(resolved)
 	case "account":
 		mk := getQuery(r, "key")
@@ -1403,8 +1305,7 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 		if d, ok := getCachedDetail(mk); ok {
 			return mgmtJSON(d)
 		}
-		// Look up the cached account summary to populate profile fields
-		// without calling users/info + login/info again.
+		// 复用缓存里的账号概况填充资料字段，避免再次调用 users/info 和 login/info。
 		var src *accountSummary
 		accountsCacheMu.Lock()
 		for i := range accountsCache.results {
@@ -1441,8 +1342,7 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 		}
 		return mgmtJSONRaw(data)
 	case "checkin-all":
-		// Sign in all accounts (concurrent), then refresh the accounts cache
-		// so the next ?api=accounts call returns fresh data instantly.
+		// 并发给所有账号签到，然后刷新账号缓存，让下一次 ?api=accounts 立刻拿到新数据。
 		type checkinResult struct {
 			idx int
 			ok  bool
@@ -1488,7 +1388,7 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 				ok++
 			}
 		}
-		// Refresh the accounts cache so the next ?api=accounts is instant.
+		// 刷新账号缓存，让下一次 ?api=accounts 立刻返回。
 		clearAllCaches()
 		if forceBackgroundRefresh() {
 			go func() {
@@ -1514,7 +1414,7 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 			return mgmtJSONError(404, "key not found")
 		}
 		mc := &msClient{}
-		// Fetch balance + transactions concurrently
+		// 并发拉取余额与流水
 		var (
 			bSc, txSc   int
 			bRaw, txRaw []byte
@@ -1536,9 +1436,8 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 			var b modelscope.MagicCubeBalance
 			if json.Unmarshal(bRaw, &b) == nil {
 				result["balance"] = map[string]any{"total": b.TotalBalance, "available": b.AvailableBalance, "frozen": b.FrozenAmount}
-				// Update the accounts cache so the next ?api=accounts
-				// reflects the real balance (fixes markAccountExhausted
-				// having set available=0 / schedule=exhausted).
+				// 更新账号缓存，让下一次 ?api=accounts 显示真实余额（修正 markAccountExhausted 之前把
+				// available=0、schedule=exhausted 写死的问题）。
 				accountsCacheMu.Lock()
 				for i := range accountsCache.results {
 					if accountsCache.results[i].MaskedKey == mk {
@@ -1559,7 +1458,7 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 		if txErr == nil && txSc == 200 {
 			var tx modelscope.TransactionsResp
 			if json.Unmarshal(txRaw, &tx) == nil {
-				// Calculate todayConsumed from SPEND_CONFIRM records
+				// 用 SPEND_CONFIRM 流水推算当日已消耗
 				today := time.Now().Format("2006-01-02")
 				consumed := 0
 				for _, rec := range tx.Records {
@@ -1568,8 +1467,7 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 					}
 				}
 				result["todayConsumed"] = consumed
-				// Update the accounts cache with today's consumed amount
-				// so the next ?api=accounts reflects the fresh value.
+				// 把当日已消耗写回账号缓存，让下一次 ?api=accounts 反映最新值。
 				accountsCacheMu.Lock()
 				for i := range accountsCache.results {
 					if accountsCache.results[i].MaskedKey == mk {
@@ -1578,7 +1476,7 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 					}
 				}
 				accountsCacheMu.Unlock()
-				// Serialize tx.Records as []any for JSON response
+				// 把 tx.Records 序列化成 []any 以放进 JSON 响应
 				recsJSON, _ := json.Marshal(tx.Records)
 				var recs []any
 				if json.Unmarshal(recsJSON, &recs) == nil {
@@ -1604,7 +1502,7 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 	return mgmtJSONError(404, "unknown api: "+api)
 }
 
-// getQuery returns the first value of a query parameter.
+// getQuery 返回某个查询参数的第一个值。
 func getQuery(r managementRequest, key string) string {
 	if vals, ok := r.Query[key]; ok && len(vals) > 0 {
 		return vals[0]
@@ -1612,7 +1510,7 @@ func getQuery(r managementRequest, key string) string {
 	return ""
 }
 
-// getQueryInt returns the first value of a query parameter as an int, or -1 if absent.
+// getQueryInt 以 int 返回某个查询参数的第一个值，缺省时返回 -1。
 func getQueryInt(r managementRequest, key string) int {
 	s := getQuery(r, key)
 	if s == "" {
@@ -1623,8 +1521,8 @@ func getQueryInt(r managementRequest, key string) int {
 	return n
 }
 
-// getKeysByMask finds the raw session ID and site base by masked key (last 12 chars).
-// O(1) lookup using pre-built maskToRaw + maskToSite maps.
+// getKeysByMask 按掩码 key（末 12 位）找到原始 session id 与站点基础地址，用预先建好的
+// maskToRaw、maskToSite 做 O(1) 查找。
 func getKeysByMask(r resolvedEntry, maskedKey string) (string, string) {
 	return r.maskToRaw[maskedKey], r.maskToSite[maskedKey]
 }
@@ -1646,8 +1544,7 @@ func mgmtJSONError(code int, msg string) managementResponse {
 func mgmtHTML(html string) managementResponse {
 	return managementResponse{
 		StatusCode: 200,
-		// no-store forces a fresh refetch on every 5s auto-refresh; without it
-		// the browser heuristically caches and the status page looks stale.
+		// no-store 保证每 5 秒的自动刷新都会重新取一次；否则浏览器会按启发式规则缓存，状态页看起来是旧的。
 		Headers: map[string][]string{
 			"content-type":  {"text/html; charset=utf-8"},
 			"cache-control": {"no-store, no-cache, must-revalidate"},
@@ -1658,7 +1555,7 @@ func mgmtHTML(html string) managementResponse {
 	}
 }
 
-// okEnvelope marshals a result value into the success envelope.
+// okEnvelope 把结果值序列化进成功信封。
 func okEnvelope(v any) ([]byte, error) {
 	raw, err := json.Marshal(v)
 	if err != nil {
@@ -1667,13 +1564,13 @@ func okEnvelope(v any) ([]byte, error) {
 	return json.Marshal(pluginabi.Envelope{OK: true, Result: raw})
 }
 
-// errorEnvelope builds an error envelope.
+// errorEnvelope 构造一个错误信封。
 func errorEnvelope(code, message string) []byte {
 	raw, _ := json.Marshal(pluginabi.Envelope{OK: false, Error: &pluginabi.Error{Code: code, Message: message}})
 	return raw
 }
 
-// writeResponse copies envelope bytes into the host-provided cliproxy_buffer.
+// writeResponse 把信封字节拷贝进宿主提供的 cliproxy_buffer。
 func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 	if response == nil || len(raw) == 0 {
 		return
@@ -1686,18 +1583,17 @@ func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 	response.len = C.size_t(len(raw))
 }
 
-// ---- Responses passthrough executor ----
+// ---- Responses 透传执行器 ----
 
-// executorRequestWithCallback mirrors rpcExecutorRequest so the glue layer can
-// preserve host_callback_id (needed for host.http.* context) and stream_id
-// (needed for async host.stream.emit).
+// executorRequestWithCallback 与 rpcExecutorRequest 一致，让胶水层能保留 host_callback_id（宿主
+// host.http.* 需要它做上下文）和 stream_id（异步 host.stream.emit 需要）。
 type executorRequestWithCallback struct {
 	pluginapi.ExecutorRequest
 	HostCallbackID string `json:"host_callback_id,omitempty"`
 	StreamID       string `json:"stream_id,omitempty"`
 }
 
-// hostHTTPRequest is the wire shape expected by host.http.do.
+// hostHTTPRequest 是 host.http.do 期望的线上格式。
 type hostHTTPRequest struct {
 	Method         string              `json:"method,omitempty"`
 	URL            string              `json:"url,omitempty"`
@@ -1706,28 +1602,28 @@ type hostHTTPRequest struct {
 	HostCallbackID string              `json:"host_callback_id,omitempty"`
 }
 
-// hostHTTPResponse mirrors pluginapi.HTTPResponse JSON shape.
+// hostHTTPResponse 与 pluginapi.HTTPResponse 的 JSON 结构一致。
 type hostHTTPResponse struct {
 	StatusCode int                 `json:"StatusCode"`
 	Headers    map[string][]string `json:"Headers,omitempty"`
 	Body       []byte              `json:"Body,omitempty"`
 }
 
-// hostHTTPStreamResponse mirrors rpcHostHTTPStreamResponse.
+// hostHTTPStreamResponse 与 rpcHostHTTPStreamResponse 一致。
 type hostHTTPStreamResponse struct {
 	StatusCode int                 `json:"status_code"`
 	Headers    map[string][]string `json:"headers,omitempty"`
 	StreamID   string              `json:"stream_id,omitempty"`
 }
 
-// hostStreamReadResponse mirrors rpcHostHTTPStreamReadResponse.
+// hostStreamReadResponse 与 rpcHostHTTPStreamReadResponse 一致。
 type hostStreamReadResponse struct {
 	Payload []byte `json:"payload,omitempty"`
 	Error   string `json:"error,omitempty"`
 	Done    bool   `json:"done,omitempty"`
 }
 
-// callHost invokes a host.* callback and returns the decoded result bytes.
+// callHost 调用一次 host.* 回调，并返回解码后的结果字节。
 func callHost(method string, payload []byte) ([]byte, error) {
 	if pluginHost == nil {
 		return nil, errors.New("host callback API is unavailable")
@@ -1761,8 +1657,7 @@ func callHost(method string, payload []byte) ([]byte, error) {
 	return env.Result, nil
 }
 
-// hostHTTPDo performs a non-streaming upstream HTTP request through the host
-// transport/proxy/request-log policy.
+// hostHTTPDo 通过宿主的传输策略执行一次非流式上游 HTTP 请求，返回状态码、响应头和响应体。
 var hostHTTPDo = func(req pluginapi.HTTPRequest, callbackID string) (hostHTTPResponse, error) {
 	payload, err := json.Marshal(hostHTTPRequest{
 		Method:         req.Method,
@@ -1785,8 +1680,7 @@ var hostHTTPDo = func(req pluginapi.HTTPRequest, callbackID string) (hostHTTPRes
 	return out, nil
 }
 
-// hostHTTPDoStream performs a streaming upstream HTTP request through the host
-// transport policy and returns the host-managed stream id for later reads.
+// hostHTTPDoStream 通过宿主的传输策略执行一次流式上游 HTTP 请求，并返回宿主管理的 stream id 供后续读取。
 var hostHTTPDoStream = func(req pluginapi.HTTPRequest, callbackID string) (hostHTTPStreamResponse, error) {
 	payload, err := json.Marshal(hostHTTPRequest{
 		Method:         req.Method,
@@ -1812,7 +1706,7 @@ var hostHTTPDoStream = func(req pluginapi.HTTPRequest, callbackID string) (hostH
 	return out, nil
 }
 
-// hostHTTPStreamRead reads one chunk from a host-managed HTTP stream.
+// hostHTTPStreamRead 从宿主托管的 HTTP 流里读取一个数据块。
 var hostHTTPStreamRead = func(streamID string) (hostStreamReadResponse, error) {
 	raw, err := callHost(pluginabi.MethodHostHTTPStreamRead, mustJSONMarshal(rpcHostHTTPStreamReadRequest{StreamID: streamID}))
 	if err != nil {
@@ -1825,12 +1719,12 @@ var hostHTTPStreamRead = func(streamID string) (hostStreamReadResponse, error) {
 	return out, nil
 }
 
-// hostHTTPStreamClose closes a host-managed HTTP stream.
+// hostHTTPStreamClose 关闭宿主托管的 HTTP 流。
 func hostHTTPStreamClose(streamID string) {
 	_, _ = callHost(pluginabi.MethodHostHTTPStreamClose, mustJSONMarshal(rpcHostHTTPStreamCloseRequest{StreamID: streamID}))
 }
 
-// hostStreamEmit pushes one executor stream chunk to the host stream bridge.
+// hostStreamEmit 把执行器的一个流数据块推给宿主的流通道。
 func hostStreamEmit(streamID string, payload []byte, errMsg string) error {
 	_, err := callHost(pluginabi.MethodHostStreamEmit, mustJSONMarshal(rpcStreamEmitRequest{
 		StreamID: streamID,
@@ -1840,7 +1734,7 @@ func hostStreamEmit(streamID string, payload []byte, errMsg string) error {
 	return err
 }
 
-// hostStreamClose closes the executor stream bridge with an optional error.
+// hostStreamClose 关闭执行器的流通道，可附带一个错误。
 func hostStreamClose(streamID, errMsg string) {
 	_, _ = callHost(pluginabi.MethodHostStreamClose, mustJSONMarshal(rpcStreamCloseRequest{
 		StreamID: streamID,
@@ -1875,19 +1769,17 @@ type rpcStreamCloseRequest struct {
 	Error    string `json:"error,omitempty"`
 }
 
-// rpcHostModelExecutionRequest mirrors the host glue layer's
-// rpcHostModelExecutionRequest: the embedded HostModelExecutionRequest plus
-// host_callback_id, so the host can resolve the caller context and set
-// SkipRouterPluginID/SkipInterceptorPluginID for non-recursive fallback.
+// rpcHostModelExecutionRequest 与宿主胶水层的同名结构一致：内嵌 HostModelExecutionRequest 外加
+// host_callback_id，宿主由此解析调用方上下文，并为非递归的兜底设置
+// SkipRouterPluginID/SkipInterceptorPluginID。
 type rpcHostModelExecutionRequest struct {
 	pluginapi.HostModelExecutionRequest
 	HostCallbackID string `json:"host_callback_id,omitempty"`
 }
 
-// routeResponsesRequest routes OpenAI Responses API requests to the plugin's
-// own executor so they can be forwarded to the upstream /v1/responses
-// endpoint. Chat Completions requests fall through to the host's normal
-// provider path (openai-compatibility /chat/completions).
+// routeResponsesRequest 把 OpenAI Responses API 请求路由到插件自己的执行器，以便转发给上游
+// /v1/responses。Chat Completions 请求继续走宿主的常规 provider 路径（openai-compatibility
+// /chat/completions）。
 func routeResponsesRequest(req pluginapi.ModelRouteRequest) pluginapi.ModelRouteResponse {
 	cfg := currentConfig()
 	if cfg == nil || len(cfg.Providers) == 0 {
@@ -1926,8 +1818,7 @@ func responsesRouteModelEnabled(cfg *modelscope.Config, requestedModel string) b
 		if resolved.routeToName == nil {
 			break
 		}
-		// Match on the upstream name (use_responses documents upstream names),
-		// accepting both the host route ID and the raw upstream name.
+		// 按上游模型名匹配（use_responses 文档里记录的就是上游名），同时接受宿主的路由 ID 和原始上游名。
 		upstream, route := resolveProviderModel(resolved, provider, alias)
 		if upstream == "" || route == "" {
 			continue
@@ -1940,7 +1831,7 @@ func responsesRouteModelEnabled(cfg *modelscope.Config, requestedModel string) b
 	if mapped {
 		return false
 	}
-	// Without a managed-model mapping, alias and upstream model are equivalent.
+	// 没有托管模型映射可查时，别名与上游模型名是等价的。
 	return cfg.UsesResponses(alias)
 }
 
@@ -2051,18 +1942,24 @@ func upstreamModelForAuth(authID string, req pluginapi.ExecutorRequest) string {
 	return alias
 }
 
-// resolveProviderModel translates the client-requested model into the two
-// different identifiers a managed provider step needs:
+// resolveProviderModel 把客户端请求的模型翻译成托管 provider 那一步需要的两个不同标识：
 //
-//   - upstream: the real model name to put in the body of a direct upstream
-//     /v1/responses call (what the Modelscope API expects).
-//   - route: the model ID CLIProxyAPI can route (the configured alias when one
-//     exists, otherwise the name). host.model.execute resolves the provider
-//     list from the model registry with an exact lookup, so passing `upstream`
-//     for an aliased model fails with model_not_found.
+//   - upstream：直连上游 /v1/responses 时写进请求体的真实模型名（Modelscope API 期望的值）。
+//   - route：CLIProxyAPI 能路由的模型 ID（配了 alias 就是 alias，否则是 name）。
+//     host.model.execute 是用精确查找在模型注册表里解析 provider 列表的，所以对配了别名的模型
+//     传 `upstream` 会得到 model_not_found。
 //
-// A provider with no known model list (management API error, or a compat entry
-// without a models: block) maps to itself, which keeps the pre-index behaviour.
+// 同一个上游模型在不同 provider 上的别名可以完全不同（modelscope 把
+// deepseek-ai/DeepSeek-V4-Pro-0813 注册成 deepseek-v4-pro，而 modelscope-my 把同一个模型注册成
+// glm-5.2），因此一家的别名并不是下一家的索引里存在的名字。本地查找落空时，会先经其它托管
+// provider 把请求解析成规范的上游模型名，再回到这里查一次。
+//
+// 当该 provider 有索引、但既不提供请求名也不提供规范名时，两个结果都返回空，执行器必须跳过它。
+// 若改为把客户端别名转发出去，只会换来上游 400 "Invalid model id"，而该状态不可重试，于是整个
+// 请求被终止，轮换也就不会继续到下一个 provider。
+//
+// 完全拿不到模型列表的 provider（管理接口出错，或兼容条目没有 models: 段）按自身映射，保留建索
+// 引之前的行为。
 func resolveProviderModel(resolved resolvedEntry, provider, requested string) (upstream string, route string) {
 	p := strings.ToLower(strings.TrimSpace(provider))
 	requested = strings.TrimSpace(requested)
@@ -2070,23 +1967,63 @@ func resolveProviderModel(resolved resolvedEntry, provider, requested string) (u
 		return "", ""
 	}
 	routes := resolved.routeToName[p]
-	toRoute := resolved.nameToRoute[p]
 	if len(routes) == 0 {
-		// No model index for this provider: identity mapping, still routable.
+		// 该 provider 没有模型索引：按自身映射，仍可路由。
 		return requested, requested
 	}
+	if upstream, route, found := providerModelLookup(resolved, p, requested); found {
+		return upstream, route
+	}
+	cfg := currentConfig()
+	if cfg == nil {
+		// 没有 provider 列表可做交叉解析：保持旧形态，即只有直连上游调用还可能服务该模型。
+		return requested, ""
+	}
+	name := canonicalUpstreamModel(resolved, cfg.Providers, requested)
+	if name == "" || strings.EqualFold(name, requested) {
+		return "", ""
+	}
+	if upstream, route, found := providerModelLookup(resolved, p, name); found {
+		return upstream, route
+	}
+	// 这个上游模型由别的 provider 提供，这一家不提供。
+	return "", ""
+}
+
+// providerModelLookup 只针对某个 provider 自己的模型索引解析 requested。found 为 false 表示该家
+// 根本没登记这个模型，调用方由此得知这里没有答案，而不是拿到一个形状未知的结果。
+func providerModelLookup(resolved resolvedEntry, lowerProvider, requested string) (upstream string, route string, found bool) {
+	routes := resolved.routeToName[lowerProvider]
+	toRoute := resolved.nameToRoute[lowerProvider]
 	if name, ok := routes[requested]; ok && strings.TrimSpace(name) != "" {
-		return strings.TrimSpace(name), requested
+		return strings.TrimSpace(name), requested, true
 	}
 	if routeID, ok := toRoute[strings.ToLower(requested)]; ok {
 		if name, okName := routes[routeID]; okName && strings.TrimSpace(name) != "" {
-			return strings.TrimSpace(name), routeID
+			return strings.TrimSpace(name), routeID, true
 		}
-		return requested, routeID
+		return requested, routeID, true
 	}
-	// The provider lists models and none matches: only a direct upstream call
-	// could still serve it, so there is no host route for the chat fallback.
-	return requested, ""
+	return "", "", false
+}
+
+// canonicalUpstreamModel 按配置顺序找到第一个认识该模型的托管 provider，把客户端请求的模型映射成
+// 真实的上游模型名。
+func canonicalUpstreamModel(resolved resolvedEntry, providers []string, requested string) string {
+	requested = strings.TrimSpace(requested)
+	if requested == "" {
+		return ""
+	}
+	for _, provider := range providers {
+		p := strings.ToLower(strings.TrimSpace(provider))
+		if len(resolved.routeToName[p]) == 0 {
+			continue
+		}
+		if upstream, _, found := providerModelLookup(resolved, p, requested); found && strings.TrimSpace(upstream) != "" {
+			return strings.TrimSpace(upstream)
+		}
+	}
+	return ""
 }
 
 func upstreamModelForRetryStep(step retryStep, resolved resolvedEntry, alias string) string {
@@ -2123,52 +2060,77 @@ type retryCandidate struct {
 	model    string
 }
 
-// buildRetrySequence returns an ordered list of managed-provider steps.
-// Responses-enabled candidates use Store.NextProviderKey for direct upstream
-// /v1/responses calls. Non-Responses candidates are sent through the host
-// built-in chat path once per provider; the host handles Responses<->Chat
-// translation and key rotation for those providers.
+// buildRetrySequence 返回有序的托管 provider 步骤表：一把凭据一步，按 providers 配置顺序一家接一家排。
+// 命中 Responses 开关的步骤会调用 Store.NextProviderKey 取 key 并直连上游 /v1/responses；未命中的
+// provider 仍然每家一次走宿主 chat 兜底（由 chatProviderAttempted 去重），由宿主完成 Responses 与
+// Chat 的互转。
 //
-// skip ON: try one key per managed provider.
-// skip OFF: exhaust all keys per managed provider.
+// 步长取到 key 粒度是有意为之，与 skip_provider_on_429 无关。insufficient balance 这类 429 只
+// 禁用一把凭据，所以下一步必须是同一家另一把凭据；只有这一家已经没有可用凭据，才交给下一家。旧实
+// 现（开启该开关时）把步骤表压缩成每家一步，于是任何 key 级失败都像是 provider 级失败：请求会在第
+// 一家还剩约 140 把可用凭据的情况下跳到第二家，而第二家应答的是另一个上游模型。
+//
+// 现在该开关只决定池级 insufficient_quota 应答是否把某家放进 skip 集；两个执行器循环都会尊重 skip
+// 集，丢掉这一家剩下的步骤。
 func buildRetrySequence(resolved resolvedEntry, cfg *modelscope.Config) []retryStep {
 	var steps []retryStep
-	if cfg.SkipProviderOn429 {
-		for _, name := range cfg.Providers {
-			steps = append(steps, retryStep{provider: name})
+	for _, name := range cfg.Providers {
+		key := strings.ToLower(strings.TrimSpace(name))
+		count := len(resolved.providerOrder[key])
+		if count == 0 {
+			// 冷启动或解析失败：仍然给这一家一步，让它的宿主 chat 兜底有机会执行；确实没有凭据可调用时由
+			// resolveStep 报失败。
+			count = 1
 		}
-	} else {
-		for _, name := range cfg.Providers {
-			key := strings.ToLower(strings.TrimSpace(name))
-			for i := 0; i < len(resolved.providerOrder[key]); i++ {
-				steps = append(steps, retryStep{provider: name})
-			}
+		for i := 0; i < count; i++ {
+			steps = append(steps, retryStep{provider: name})
 		}
 	}
 	return steps
 }
 
-// resolveStep resolves the auth ID, API key, base URL, and upstream model
-// name for a managed-provider retry step using the per-provider cursor from
-// the Store, so key order persists across requests.
+// resolveStep 用 Store 里该 provider 自己的游标，为一次托管 provider 重试步骤解析出 auth ID、API
+// key、基础地址和上游模型名，因此 key 顺序跨请求保持不变。
+//
+// 游标只允许落在仍然能应答的凭据上。SchedulerPick 在轮换前做的是同一件事（先把禁用
+// key 从候选组里滤掉）；把这一家的完整 key 列表直接交给它会出问题：旧实现下开启该开关时每家每
+// 请求只有极少的几步，
+// 一把已禁用的 key 就能吃掉这一家的整步。而成功同样会推进游标，于是健康流量跑一段时间后，游标会走进当
+// 天被禁用的 key 区间，请求就在第一家还有可用 key 时悄悄落到第二家。
 func resolveStep(step retryStep, resolved resolvedEntry, alias string) (retryCandidate, bool) {
 	providerKey := strings.ToLower(strings.TrimSpace(step.provider))
 	ids := resolved.providerOrder[providerKey]
 	if len(ids) == 0 {
 		return retryCandidate{}, false
 	}
-	authID := store.NextProviderKey(step.provider, ids)
+	model := upstreamModelForRetryStep(step, resolved, alias)
+	if model == "" {
+		// 该 provider 完全不提供请求的这个模型。
+		return retryCandidate{}, false
+	}
+	now := store.Now()
+	usable := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if store.IsKeyDisabled(id, model, now) {
+			continue
+		}
+		if strings.TrimSpace(resolved.raw[id]) == "" || strings.TrimSpace(resolved.baseURL[id]) == "" {
+			continue
+		}
+		usable = append(usable, id)
+	}
+	if len(usable) == 0 {
+		return retryCandidate{}, false
+	}
+	authID := store.NextProviderKey(step.provider, usable)
 	if authID == "" {
 		return retryCandidate{}, false
 	}
-	apiKey := resolved.raw[authID]
-	baseURL := resolved.baseURL[authID]
-	model := upstreamModelForRetryStep(step, resolved, alias)
 	return retryCandidate{
 		authID:   authID,
 		provider: step.provider,
-		apiKey:   apiKey,
-		baseURL:  baseURL,
+		apiKey:   resolved.raw[authID],
+		baseURL:  resolved.baseURL[authID],
 		model:    model,
 	}, true
 }
@@ -2179,13 +2141,10 @@ func hostModelRequestForCandidate(req executorRequestWithCallback, model string)
 	return out
 }
 
-// hostModelRequestForProvider builds one provider's nested chat call and pins it
-// to that provider with the internal marker header, so a 429 inside the nested
-// execution cannot make the host answer with another provider's credential.
+// hostModelRequestForProvider 构造某个 provider 的嵌套 chat 调用，并用内部标记头把它钉定在该
+// provider 上，这样嵌套执行里出现 429 时，宿主不会改用别家凭据应答。
 //
-// The header set is copied: the caller's headers belong to the outer request,
-// which later reuses them for the direct upstream calls and the final
-// unconstrained host fallback.
+// 请求头是复制出来的：调用方的头属于外层请求，后面直连上游和最后不设限的宿主兜底还会继续用它们。
 func hostModelRequestForProvider(req executorRequestWithCallback, model, provider string) executorRequestWithCallback {
 	out := hostModelRequestForCandidate(req, model)
 	if strings.TrimSpace(provider) == "" {
@@ -2200,17 +2159,12 @@ func hostModelRequestForProvider(req executorRequestWithCallback, model, provide
 	return out
 }
 
-// providerHasUsableCredential reports whether the plugin's own scheduler would
-// still hand this provider's request to one of its credentials.
+// providerHasUsableCredential 判断插件自己的调度器是否还会把这一家的请求交给它的某把凭据。
 //
-// The chat-fallback step asks the host to execute the *shared* route model, and
-// the host re-runs scheduler.pick over every provider serving that alias. If the
-// preferred provider is in the skip set (429) or has only daily-disabled keys,
-// the host answers that nested call with a different provider's credential —
-// which silently downgrades a later, Responses-enabled provider to the chat
-// protocol because its own native step never gets a chance to run. Checking the
-// same conditions the scheduler applies keeps the fallback on the provider it is
-// meant to test.
+// chat 兜底这一步是让宿主去执行*共享*的路由模型，宿主会对所有提供该别名的 provider 重跑
+// scheduler.pick。如果首选 provider 已在 skip 集里（429）或者只剩被日禁用的 key，宿主就会用别家
+// 凭据应答这次嵌套调用，于是本该走原生 Responses 的后面那家被悄悄降级成 chat，它自己的原生步骤根本
+// 没机会执行。这里用与调度器相同的判定条件，保证兜底仍然落在本该试探的那一家上。
 func providerHasUsableCredential(provider string, resolved resolvedEntry) bool {
 	cfg := currentConfig()
 	if cfg == nil {
@@ -2221,7 +2175,7 @@ func providerHasUsableCredential(provider string, resolved resolvedEntry) bool {
 	}
 	ids := resolved.providerOrder[strings.ToLower(strings.TrimSpace(provider))]
 	if len(ids) == 0 {
-		// Key set unknown (cold resolution): let the host decide.
+		// 拿不到该家的 key 列表（冷启动解析）：交给宿主判断。
 		return true
 	}
 	now := store.Now()
@@ -2239,6 +2193,22 @@ func retryableResponsesStatus(statusCode int) bool {
 		statusCode >= http.StatusInternalServerError
 }
 
+// responsesKeyRateLimitBailAfter 是同一次请求内，同一个 provider 连续返回 key 级 Responses
+// 额度/速率拒绝（response.failed + rate_limit_exceeded，且 body 不带池级 insufficient_quota）
+// 后，在本请求内放弃这一家的阈值。
+//
+// 这类失败不会禁用任何 key（速率窗口自己会恢复），所以本家的可用凭据数不会因失败而减少；没有
+// 阈值时，一次池级速率风暴会把这一家上百把 key 全撞一遍。取 3 是权衡结果：失败真的按 key 分布
+// 时连续 3 把都失败已经很少见，而最坏情况只多花 3 个往返。计数只活在这次请求里，绝不写进跨请
+// 求的 skip 集 —— 下一个请求仍然先试这一家的下一把 key。
+const responsesKeyRateLimitBailAfter = 3
+
+// noteResponsesKeyRateLimit 给该 provider 在本次请求内的连击计数加一，返回是否已到放弃阈值。
+func noteResponsesKeyRateLimit(streak map[string]int, providerName string) bool {
+	streak[providerName]++
+	return streak[providerName] >= responsesKeyRateLimitBailAfter
+}
+
 func executeResponsesPassthrough(req executorRequestWithCallback) (pluginapi.ExecutorResponse, error) {
 	cfg := currentConfig()
 	resolved := ensureResolved()
@@ -2252,9 +2222,13 @@ func executeResponsesPassthrough(req executorRequestWithCallback) (pluginapi.Exe
 
 	unsupportedProviders := make(map[string]bool)
 	chatProviderAttempted := make(map[string]bool)
+	keyRateLimitStreak := make(map[string]int)
 	for _, step := range steps {
 		providerName := strings.ToLower(strings.TrimSpace(step.provider))
-		if unsupportedProviders[providerName] {
+		// 该 provider 一旦回过池级 insufficient_quota 的 429，整家就被摘掉（skip_provider_on_429
+		// 只授权做这件事）。key 级禁用不会走到这里，因此剩下的可用 key 仍会继续轮换。
+		if unsupportedProviders[providerName] || (cfg.SkipProviderOn429 && store.IsProviderSkipped(step.provider)) {
+			unsupportedProviders[providerName] = true
 			continue
 		}
 		candidateModel, routeModel := resolveProviderModel(resolved, step.provider, alias)
@@ -2265,26 +2239,22 @@ func executeResponsesPassthrough(req executorRequestWithCallback) (pluginapi.Exe
 			if chatProviderAttempted[providerName] {
 				continue
 			}
-			// Only run the chat fallback for a provider that can actually answer
-			// it; otherwise the host would satisfy this step with another
-			// provider's credential and lose that provider's native protocol.
+			// 只在确实能应答的 provider 上走 chat 兜底；否则宿主会用别家凭据满足这一步，那一家的原生协议就丢了。
 			if !providerHasUsableCredential(step.provider, resolved) {
 				logInfoRequest(req.HostCallbackID, "responses chat fallback skipped provider=%s (in 429 skip set or all credentials disabled)", step.provider)
 				continue
 			}
 			chatProviderAttempted[providerName] = true
 
-			// Without a host-routable ID for this provider there is no chat
-			// fallback to try: the direct upstream call below is the only route.
+			// 该 provider 没有宿主可路由的 ID，就没有 chat 兜底可走：下面的直连上游调用
+			// 是唯一路径。
 			if routeModel == "" {
 				logInfoRequest(req.HostCallbackID, "responses skip provider=%s model=%s (no host-routable model, Responses passthrough disabled for it)", step.provider, alias)
 				continue
 			}
-			// The host resolves providers from its model registry by exact ID, and
-			// an aliased compat model is registered under the alias only: send the
-			// route ID, never the upstream name. The host then rewrites the
-			// per-auth upstream name itself, and the plugin scheduler still runs
-			// for the nested call, so providers keep their configured order.
+			// 宿主是用精确 ID 在模型注册表里解析 provider 的，配了别名的兼容模型只以别名注册：因此这里必须发送路
+			// 由 ID，绝不发送上游模型名。宿主会自己改写它那把凭据对应的上游名，插件调度器对嵌套调用仍会运行，所以
+			// provider 仍然保持配置顺序。
 			logDebugRequest(req.HostCallbackID, "responses attempt provider=%s mode=chat-fallback pinned=true model=%s upstream=%s", step.provider, routeModel, candidateModel)
 			hostResp, errHost := hostModelExecute(hostModelRequestForProvider(req, routeModel, step.provider))
 			if errHost != nil {
@@ -2298,9 +2268,8 @@ func executeResponsesPassthrough(req executorRequestWithCallback) (pluginapi.Exe
 				}
 				return pluginapi.ExecutorResponse{}, fmt.Errorf("host chat fallback: HTTP %d: %s", hostResp.StatusCode, string(hostResp.Body))
 			}
-			// The host's own scheduler picks the credential for the nested call, so
-			// this only proves the preferred provider accepted it; the `schedule`
-			// line under the same request id names the auth actually used.
+			// 嵌套调用的凭据由宿主自己的调度器挑选，所以这里只能证明首选 provider 接受了该请求；同一个请求 id 下
+			// 的 `schedule` 行才写明实际用的是哪个 auth。
 			logDebugRequest(req.HostCallbackID, "responses served via=host-chat-fallback preferred_provider=%s model=%s (credential chosen by host scheduler)", step.provider, routeModel)
 			return pluginapi.ExecutorResponse{Payload: hostResp.Body, Headers: hostResp.Headers}, nil
 		}
@@ -2333,8 +2302,21 @@ func executeResponsesPassthrough(req executorRequestWithCallback) (pluginapi.Exe
 		}
 		respBody := string(resp.Body)
 		if modelscope.IsResponsesRateLimitExceeded(respBody) {
-			logInfoRequest(req.HostCallbackID, "responses rate limited provider=%s model=%s, rotating", cand.provider, cand.model)
-			store.ApplyResponsesRateLimit(cand.authID, "openai-compatible-"+cand.provider, req.Model, string(resp.Body), store.Now())
+			// 池级还是 key 级只看 body：ApplyResponsesRateLimit 据此决定是摘整家还是只冷却
+			// 这一把 key。这里再补一层本请求内的连击上限，专门兜住 key 级（不禁用 key）那一类。
+			poolLevel := modelscope.IsPoolLevelQuotaExhausted(respBody)
+			bail := false
+			if !poolLevel {
+				bail = noteResponsesKeyRateLimit(keyRateLimitStreak, providerName)
+			}
+			logInfoRequest(req.HostCallbackID, "responses rate limited provider=%s model=%s key=%s pool_level=%v streak=%d/%d body=%s, rotating",
+				cand.provider, cand.model, maskKey(cand.apiKey), poolLevel, keyRateLimitStreak[providerName], responsesKeyRateLimitBailAfter, logBodyExcerpt(respBody))
+			store.ApplyResponsesRateLimit(cand.authID, "openai-compatible-"+cand.provider, req.Model, respBody, store.Now())
+			if bail {
+				logInfoRequest(req.HostCallbackID, "responses provider=%s hit %d consecutive key-level rate limits, moving to the next provider for this request only",
+					cand.provider, keyRateLimitStreak[providerName])
+				unsupportedProviders[providerName] = true
+			}
 			continue
 		}
 		if modelscope.IsResponsesFailed(respBody) {
@@ -2342,9 +2324,9 @@ func executeResponsesPassthrough(req executorRequestWithCallback) (pluginapi.Exe
 			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, resp.StatusCode, respBody, cand.provider, cand.model))
 			continue
 		}
-		// Modelscope answers some rejections with HTTP 200 plus a bare error
-		// document. Treat it as this provider failing instead of handing the
-		// client a body that is not a Response resource.
+		// Modelscope 会把部分拒绝以 HTTP 200 加一段裸错误文档返回。要把它
+		// 当成这一家失败了，而不是把一个不是 Response 资源的响应体
+		// 交给客户端。
 		if modelscope.IsResponsesErrorPayload(respBody) {
 			logInfoRequest(req.HostCallbackID, "responses provider=%s model=%s returned an error payload with HTTP 200: %s", cand.provider, cand.model, logBodyExcerpt(respBody))
 			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, resp.StatusCode, respBody, cand.provider, cand.model))
@@ -2360,11 +2342,10 @@ func executeResponsesPassthrough(req executorRequestWithCallback) (pluginapi.Exe
 		return pluginapi.ExecutorResponse{Payload: resp.Body, Headers: headerMapToHTTP(resp.Headers)}, nil
 	}
 
-	// All managed providers exhausted via Responses passthrough. Defer to the
-	// host's built-in path so non-managed providers serve the request through
-	// the normal chat protocol (Responses<->Chat translation handled by host).
-	// The host skips this plugin's router/interceptors (non-recursive); the
-	// plugin's scheduler still runs and skips managed keys disabled above.
+	// 所有托管 provider 都已通过 Responses 透传耗尽。交回宿主的内置路径，让非托管
+	// provider 按常规 chat 协议服务本次请求（Responses 与 Chat 的转换由宿主完成）。
+	// 宿主会跳过本插件的路由器和拦截器（不递归）；插件调度器仍会运行，并跳过上面
+	// 被禁用的托管 key。
 	hostResp, err := hostModelExecute(req)
 	if err != nil {
 		return pluginapi.ExecutorResponse{}, fmt.Errorf("responses managed keys exhausted, host fallback failed: %w", err)
@@ -2383,8 +2364,8 @@ const (
 	responsesStreamPreflightOK responsesStreamPreflightStatus = iota
 	responsesStreamPreflightFailed
 	responsesStreamPreflightRateLimited
-	// responsesStreamPreflightErrorPayload marks a stream that opened with HTTP
-	// 200 but delivered an error document rather than SSE events.
+	// responsesStreamPreflightErrorPayload 标记那种以 HTTP 200 建连、但送回
+	// 来的是错误文档而不是 SSE 事件的流。
 	responsesStreamPreflightErrorPayload
 )
 
@@ -2408,9 +2389,13 @@ func executeResponsesPassthroughStream(req executorRequestWithCallback) (plugina
 
 	unsupportedProviders := make(map[string]bool)
 	chatProviderAttempted := make(map[string]bool)
+	keyRateLimitStreak := make(map[string]int)
 	for _, step := range steps {
 		providerName := strings.ToLower(strings.TrimSpace(step.provider))
-		if unsupportedProviders[providerName] {
+		// 该 provider 一旦回过池级 insufficient_quota 的 429，整家就被摘掉（skip_provider_on_429
+		// 只授权做这件事）。key 级禁用不会走到这里，因此剩下的可用 key 仍会继续轮换。
+		if unsupportedProviders[providerName] || (cfg.SkipProviderOn429 && store.IsProviderSkipped(step.provider)) {
+			unsupportedProviders[providerName] = true
 			continue
 		}
 		candidateModel, routeModel := resolveProviderModel(resolved, step.provider, alias)
@@ -2427,13 +2412,13 @@ func executeResponsesPassthroughStream(req executorRequestWithCallback) (plugina
 			}
 			chatProviderAttempted[providerName] = true
 
-			// Without a host-routable ID for this provider there is no chat
-			// fallback to try: the direct upstream stream is the only route.
+			// 该 provider 没有宿主可路由的 ID，就没有 chat 兜底可走：下面的直连上游流是
+			// 唯一路径。
 			if routeModel == "" {
 				logInfoRequest(req.HostCallbackID, "responses stream skip provider=%s model=%s (no host-routable model, Responses passthrough disabled for it)", step.provider, alias)
 				continue
 			}
-			// Route model, not upstream model: see executeResponsesPassthrough.
+			// 传路由名而不是上游模型名：原因见 executeResponsesPassthrough。
 			logDebugRequest(req.HostCallbackID, "responses stream attempt provider=%s mode=chat-fallback pinned=true model=%s upstream=%s", step.provider, routeModel, candidateModel)
 			hostStream, errHost := hostModelExecuteStream(hostModelRequestForProvider(req, routeModel, step.provider))
 			if errHost != nil {
@@ -2507,9 +2492,22 @@ func executeResponsesPassthroughStream(req executorRequestWithCallback) (plugina
 		}
 		switch preflight.status {
 		case responsesStreamPreflightRateLimited:
-			logInfoRequest(req.HostCallbackID, "responses stream rate limited provider=%s model=%s, rotating", cand.provider, cand.model)
+			// 与直连分支同理：池级由 ApplyResponsesRateLimit 摘整家，key 级只冷却这一把 key，
+			// 这里补的是 key 级那一类在本请求内的连击上限。
+			poolLevel := modelscope.IsPoolLevelQuotaExhausted(preflight.reason)
+			bail := false
+			if !poolLevel {
+				bail = noteResponsesKeyRateLimit(keyRateLimitStreak, providerName)
+			}
+			logInfoRequest(req.HostCallbackID, "responses stream rate limited provider=%s model=%s key=%s pool_level=%v streak=%d/%d body=%s, rotating",
+				cand.provider, cand.model, maskKey(cand.apiKey), poolLevel, keyRateLimitStreak[providerName], responsesKeyRateLimitBailAfter, logBodyExcerpt(preflight.reason))
 			hostHTTPStreamClose(stream.StreamID)
 			store.ApplyResponsesRateLimit(cand.authID, "openai-compatible-"+cand.provider, req.Model, preflight.reason, store.Now())
+			if bail {
+				logInfoRequest(req.HostCallbackID, "responses stream provider=%s hit %d consecutive key-level rate limits, moving to the next provider for this request only",
+					cand.provider, keyRateLimitStreak[providerName])
+				unsupportedProviders[providerName] = true
+			}
 			continue
 		case responsesStreamPreflightFailed:
 			logInfoRequest(req.HostCallbackID, "responses stream failed provider=%s model=%s: %s", cand.provider, cand.model, logBodyExcerpt(preflight.reason))
@@ -2517,9 +2515,9 @@ func executeResponsesPassthroughStream(req executorRequestWithCallback) (plugina
 			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, stream.StatusCode, preflight.reason, cand.provider, cand.model))
 			continue
 		case responsesStreamPreflightErrorPayload:
-			// Modelscope answers some rejections with HTTP 200 plus a bare error
-			// document instead of an SSE stream. Forwarding that as a completed
-			// stream would hand the client a body that is not a Response resource.
+			// Modelscope 会把部分拒绝以 HTTP 200 加一段裸错误文档返回，而不是 SSE
+			// 流。若把它当作已完成的流转发出，交给客户端的就是一个不是 Response 资
+			// 源的响应体。
 			logInfoRequest(req.HostCallbackID, "responses stream provider=%s model=%s returned an error payload with HTTP 200: %s", cand.provider, cand.model, logBodyExcerpt(preflight.reason))
 			hostHTTPStreamClose(stream.StreamID)
 			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, stream.StatusCode, preflight.reason, cand.provider, cand.model))
@@ -2530,8 +2528,8 @@ func executeResponsesPassthroughStream(req executorRequestWithCallback) (plugina
 		return pluginapi.ExecutorStreamResponse{Headers: headerMapToHTTP(stream.Headers)}, nil
 	}
 
-	// All managed providers exhausted. Defer to the host's built-in streaming
-	// path so non-managed providers serve the request via chat protocol.
+	// 所有托管 provider 已耗尽。交回宿主的内置流式路径，让非托管 provider 用
+	// chat 协议服务本次请求。
 	hostStream, err := hostModelExecuteStream(req)
 	if err != nil {
 		return pluginapi.ExecutorStreamResponse{}, fmt.Errorf("responses stream managed keys exhausted, host fallback failed: %w", err)
@@ -2621,8 +2619,8 @@ func preflightResponsesStream(streamID string, first pluginapi.ExecutorStreamChu
 			return result, nil
 		}
 		if done {
-			// The stream ended without ever producing an SSE data event: what we
-			// accumulated is a plain JSON body, so check it for an error document.
+			// 流到结束都没产出任何 SSE data 事件：累积到的是一段普通 JSON 响应体，
+			// 因此要把它当作错误文档检查一遍。
 			if modelscope.IsResponsesErrorPayload(string(payload)) {
 				return responsesStreamPreflightResult{
 					status: responsesStreamPreflightErrorPayload,
@@ -2692,9 +2690,9 @@ func forwardResponsesStream(req executorRequestWithCallback, cand retryCandidate
 		}
 	}
 	if done {
-		// first chunk is pre-filtered by executeResponsesPassthroughStream:
-		// response.failed (rate-limit or other) never reaches here, so a
-		// single-chunk stream is always a genuine success.
+		// 首个数据块已经由 executeResponsesPassthroughStream 预筛过：
+		// response.failed（限流或其他原因）绝不会走到这里，所以单块流一定是
+		// 一次真正的成功。
 		store.OnUsage(modelscope.UsageRecord{
 			Provider: "openai-compatible-" + cand.provider,
 			AuthID:   cand.authID,
@@ -2765,7 +2763,7 @@ func readHostStream(streamID string, stopAtFirst bool) ([]byte, bool, error) {
 	}
 }
 
-// hostModelExecute defers a non-streaming request to the host built-in provider path.
+// hostModelExecute 把非流式请求交回宿主内置的 provider 路径处理。
 var hostModelExecute = func(req executorRequestWithCallback) (pluginapi.HostModelExecutionResponse, error) {
 	originalBody := req.OriginalRequest
 	if len(originalBody) == 0 {
@@ -2797,7 +2795,7 @@ var hostModelExecute = func(req executorRequestWithCallback) (pluginapi.HostMode
 	return out, nil
 }
 
-// hostModelExecuteStream defers a streaming request to the host built-in provider path.
+// hostModelExecuteStream 把流式请求交回宿主内置的 provider 路径处理。
 var hostModelExecuteStream = func(req executorRequestWithCallback) (pluginapi.HostModelStreamResponse, error) {
 	originalBody := req.OriginalRequest
 	if len(originalBody) == 0 {
@@ -2860,7 +2858,7 @@ func readHostModelStreamChunk(streamID string) (chunk pluginapi.ExecutorStreamCh
 	return chunk, raw.Done, nil
 }
 
-// forwardHostModelStream bridges a host-managed model stream to the client stream bridge.
+// forwardHostModelStream 把宿主托管的模型流转发到面向客户端的流通道上。
 func forwardHostModelStream(req executorRequestWithCallback, upstreamStreamID string, first pluginapi.ExecutorStreamChunk, done bool) {
 	defer hostModelStreamClose(upstreamStreamID)
 	emitted := false

@@ -5,11 +5,11 @@ import (
 	"time"
 )
 
-// TestNoManagedModelsField verifies that ManagedModels and ManagesModel are
-// gone from Config, and that all models are handled by default.
+// TestNoManagedModelsField 验证 Config 里已经没有 ManagedModels 和 ManagesModel，并且默认就
+// 处理所有模型。
 func TestNoManagedModelsField(t *testing.T) {
 	cfg := DefaultConfig()
-	// ConfigFromMap should not crash without managed_models.
+	// 没有 managed_models 时 ConfigFromMap 也不应崩溃。
 	c, err := ConfigFromMap(map[string]any{
 		"providers": []any{"modelscope"},
 	})
@@ -20,8 +20,8 @@ func TestNoManagedModelsField(t *testing.T) {
 	_ = c
 }
 
-// TestSchedulerHandlesAllModels verifies that the scheduler handles requests
-// for any model name (no model filtering since ManagedModels was removed).
+// TestSchedulerHandlesAllModels 验证调度器会处理任意模型名的请求（ManagedModels 移除后不再做过
+// 模型过滤）。
 func TestSchedulerHandlesAllModels(t *testing.T) {
 	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
 	s, _ := newTestStore(now)
@@ -44,8 +44,8 @@ func TestSchedulerHandlesAllModels(t *testing.T) {
 	}
 }
 
-// TestApplyRateLimitAllModels verifies that 429 + "insufficient balance"
-// triggers a daily global disable regardless of model name.
+// TestApplyRateLimitAllModels 验证不论模型名是什么，429 + "insufficient balance" 都会触发日级
+// 全局禁用。
 func TestApplyRateLimitAllModels(t *testing.T) {
 	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
 	s, _ := newTestStore(now)
@@ -62,24 +62,24 @@ func TestApplyRateLimitAllModels(t *testing.T) {
 	}
 }
 
-// TestDisableModelGone verifies that the per-model disable path is fully
-// removed: keyState has no models field, and Status() doesn't return Models.
+// TestDisableModelGone 验证逐模型禁用这条路径已被彻底移除：keyState 里没有 models 字段，
+// Status() 也不再返回 Models。
 func TestDisableModelGone(t *testing.T) {
 	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
 	s, _ := newTestStore(now)
 	s.Reconfigure(cfgWith("modelscope"))
 
-	// Record a seen key.
+	// 记录一把被见过的 key。
 	s.recordSeen([]string{"auth-1"})
 
-	// Status should only have AuthID and Global, no Models field.
+	// Status 只应包含 AuthID 和 Global，没有 Models 字段。
 	st := s.Status()
-	// No disables → empty status.
+	// 没有任何禁用 -> 返回空状态。
 	if len(st) != 0 {
 		t.Fatalf("expected empty status (no disables), got %d entries", len(st))
 	}
 
-	// Disable globally.
+	// 执行全局禁用。
 	s.disableGlobal("auth-1", "Qwen-72B", now)
 	st = s.Status()
 	if len(st) != 1 {

@@ -66,11 +66,9 @@ func TestNormalizeAPIResponseUnparseable(t *testing.T) {
 	}
 }
 
-// TestNormalizeAPIResponseMixedCase covers the mixed envelope where
-// "Code" is CamelCase but "data" is lowercase — the format returned by
-// GET /api/v1/inference/rate-limit. This was the original bug where the
-// CamelCase parser matched "Code":200 and returned early with empty Data,
-// causing currentUsagePerDay to always decode as 0.
+// TestNormalizeAPIResponseMixedCase 覆盖混合信封：顶层 "Code" 是大驼峰而 "data" 是小写 ——
+// GET /api/v1/inference/rate-limit 返回的就是这种格式。这正是最初那个 bug：大驼峰解析器匹配到
+// "Code":200 后就带着空 Data 提前返回，导致 currentUsagePerDay 永远解码成 0。
 func TestNormalizeAPIResponseMixedCase(t *testing.T) {
 	raw := []byte(`{"Code":200,"Data":{"currentUsagePerDay":6},"Message":"success","RequestId":"abc","Success":true}`)
 	resp, err := NormalizeAPIResponse(raw)
@@ -92,10 +90,9 @@ func TestNormalizeAPIResponseMixedCase(t *testing.T) {
 	}
 }
 
-// TestNormalizeAPIResponseLowerData covers the mixed envelope where "Code"
-// is CamelCase but "data" is fully lowercase — also seen on some /api/v1/*
-// endpoints. Go's case-insensitive json.Unmarshal should capture it in the
-// single-pass struct tagged "Data".
+// TestNormalizeAPIResponseLowerData 覆盖另一种混合信封："Code" 是大驼峰而 "data" 全小写 —— 在
+// 某些 /api/v1/* 端点上也会看到。Go 的大小写不敏感 json.Unmarshal 应当能用带 "Data" tag 的那一
+// 次结构体解析把它取到。
 func TestNormalizeAPIResponseLowerData(t *testing.T) {
 	raw := []byte(`{"Code":200,"data":{"currentUsagePerDay":42},"Message":"success","Success":true}`)
 	resp, err := NormalizeAPIResponse(raw)
@@ -118,7 +115,7 @@ func TestNormalizeAPIResponseLowerData(t *testing.T) {
 }
 
 func TestTransactionRecordFields(t *testing.T) {
-	// Verify the JSON tags match the real API response
+	// 校验 json tag 与真实 API 响应一致
 	raw := []byte(`{"gmt_created":"2026-08-13","type":"EARN","rule_key":"daily_active","category_key":"daily","title":"注册并登录","description":"注册账号后每日登录即可获取","category":"每日发放","total_amount":200,"count":1,"expire_days":1,"expire_at":"2026-08-14 08:28:41","days_remaining":1}`)
 	var rec TransactionRecord
 	if err := json.Unmarshal(raw, &rec); err != nil {

@@ -132,7 +132,7 @@
         animation: spin 0.8s linear infinite;
         vertical-align: -2px;
       }
-      /* loading overlay */
+      /* 加载遮罩 */
       .overlay {
         position: fixed;
         inset: 0;
@@ -161,7 +161,7 @@
         transition: width 0.3s ease;
         width: 0;
       }
-      /* tabs */
+      /* 标签页 */
       .tabs {
         display: flex;
         gap: 0;
@@ -273,7 +273,7 @@
         color: #86868b;
         margin-top: 3px;
       }
-      /* table */
+      /* 表格 */
       table {
         width: 100%;
         border-collapse: collapse;
@@ -466,7 +466,7 @@
         font-size: 11px;
         color: #86868b;
       }
-      /* detail */
+      /* 明细 */
       .detail-row td {
         padding: 0 !important;
         background: #fafbfc !important;
@@ -552,7 +552,7 @@
         color: #86868b;
         margin-left: auto;
       }
-      /* checkin */
+      /* 签到 */
       .checkin-grid {
         display: flex;
         gap: 8px;
@@ -606,7 +606,7 @@
         color: #86868b;
         margin-top: 1px;
       }
-      /* transactions */
+      /* 流水 */
       .tx-toolbar {
         display: flex;
         align-items: center;
@@ -737,7 +737,7 @@
         color: #86868b;
         text-decoration: line-through;
       }
-      /* toast */
+      /* 轻提示 */
       .toast {
         position: fixed;
         bottom: 24px;
@@ -1008,7 +1008,7 @@
       "
     >
       Modelscope 限流管理后台插件 v<span id="plugin-version">加载中</span> ·
-      构建于 2026-08-30 23:16:28 CST · Responses 接口：<span
+      构建于 2026-09-01 21:26:16 CST · Responses 接口：<span
         id="responses-status"
         >加载中</span
       >
@@ -1112,7 +1112,7 @@
       }
       setInterval(updateCountdown, 1000);
 
-      // Stale-while-revalidate: keep old data visible during refetch
+      // 过期数据先用：刷新期间保持旧数据可见
       var staleAccounts = null;
 
       var overlayTimer = null;
@@ -1442,7 +1442,7 @@
         document.getElementById("rl-tbody").innerHTML =
           html ||
           '<tr><td colspan="7" style="text-align:center;color:#86868b;padding:20px">无匹配</td></tr>';
-        // Auto-expand all matching rows when searching
+        // 搜索时自动展开所有命中的行
         if (acctSearchTerm && count > 0) {
           ACCOUNTS.forEach(function (a, i) {
             var hay = (
@@ -1741,7 +1741,7 @@
         var btn = document.getElementById("tx-refresh-btn");
         btn.disabled = true;
         btn.textContent = "刷新中…";
-        // Single request: balance + transactions in one API call pair
+        // 单次请求：余额和流水用一对接口一起拿
         xhr(
           "GET",
           "?api=refresh-balance&key=" + ACCOUNTS[idx].maskedKey,
@@ -1759,7 +1759,7 @@
             renderCubeCards();
             renderTable();
             renderTxAccountDisplay(idx);
-            // Use transaction records from same response (no separate fetchTransactions call)
+            // 直接用同一份响应里的流水，不再单独调 fetchTransactions
             txRecords = d.records || [];
             txPage = 1;
             renderTransactions();
@@ -1781,7 +1781,7 @@
               return r.success;
             }).length;
             toast("一键签到完成：" + ok + " 个账号成功");
-            // Force backend to fetch fresh data (not cache)
+            // 让后端强制拉新数据（不走缓存）
             staleAccounts = null;
             detailJSCache = {};
             showOverlay("正在获取账号数据");
@@ -1862,7 +1862,7 @@
             return;
           }
           var accs = d.accounts || d;
-          // Only update UI if fetchedAt changed (backend refreshed data)
+          // 只有 fetchedAt 变了（后端确实刷新了）才更新界面
           if (d.fetchedAt && d.fetchedAt === lastFetchedAt && staleAccounts) {
             fetchInProgress = false;
             if (cb) cb();
@@ -1897,11 +1897,11 @@
 
       function applySort() {
         var tb = document.getElementById("rl-tbody");
-        // Preserve expanded rows: remove detail rows but keep expandedIdxs
+        // 保留展开状态：去掉明细行，但记住 expandedIdxs
         tb.querySelectorAll(".detail-row").forEach(function (r) {
           r.remove();
         });
-        // Re-expand previously expanded rows after sort
+        // 排序之后重新展开之前展开的那些行
         var kept = [];
         expandedIdxs.forEach(function (idx) {
           var row = tb.querySelector('tr[data-idx="' + idx + '"]');
@@ -1956,12 +1956,12 @@
           });
       }
 
-      // init
+      // 初始化
       setupSorting();
       updateToolbarBtn();
       fetchStats();
       fetchConfig();
-      // 5-second polling: fetch stats + accounts
+      // 每 5 秒轮询：拉取概况和账号
       setInterval(function () {
         fetchStats();
         fetchAccounts();

@@ -2,10 +2,9 @@ package ratelimit
 
 import "testing"
 
-// TestIsResponsesErrorPayloadClassifiesBodies covers the discriminator the
-// Responses executor needs when an upstream answers HTTP 200: a real Response
-// resource (which legitimately carries "error":null) must stay a success, while
-// a bare error document must not be handed to the client as one.
+// TestIsResponsesErrorPayloadClassifiesBodies 覆盖 Responses 执行器在上游返回 HTTP 200 时需要的
+// 判别逻辑：真正的 Response 资源（本来就带 "error":null）必须仍算成功，而裸的错误文档绝不能当作
+// 成功响应交给客户端。
 func TestIsResponsesErrorPayloadClassifiesBodies(t *testing.T) {
 	cases := []struct {
 		name string
@@ -36,9 +35,8 @@ func TestIsResponsesErrorPayloadClassifiesBodies(t *testing.T) {
 	}
 }
 
-// TestIsResponsesErrorPayloadFlagsFailedResponseObject keeps the ordering
-// honest: a response-shaped body whose error member actually carries a payload
-// is still an error, even though the object type looks like a Response.
+// TestIsResponsesErrorPayloadFlagsFailedResponseObject 保证判断顺序是对的：形状像 response 的
+// 响应体只要 error 成员真的带了内容，就仍然是错误，哪怕 object 类型看起来是个 Response。
 func TestIsResponsesErrorPayloadFlagsFailedResponseObject(t *testing.T) {
 	body := `{"object":"response","status":"failed","error":{"code":"server_error","message":"boom"}}`
 	if !IsResponsesErrorPayload(body) {

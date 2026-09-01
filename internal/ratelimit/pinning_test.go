@@ -8,16 +8,16 @@ import (
 	"time"
 )
 
-// recordLogger captures core log output so the pin diagnostics are assertable.
+// recordLogger 捕获核心层的日志输出，这样钉定相关的诊断信息可以被断言。
 type recordLogger struct{ lines []string }
 
 func (l *recordLogger) Printf(format string, args ...any) {
 	l.lines = append(l.lines, fmt.Sprintf(format, args...))
 }
 
-// pinnedReq builds a scheduler.pick payload like the one the host forwards for
-// the plugin's own nested chat call: the marker header plus the internal-source
-// metadata. Without the metadata the request looks client-originated.
+// pinnedReq 构造一个 scheduler.pick 载荷，和宿主为插件自己的嵌套 chat 调用转发过来的那份一
+// 致：既有标记请求头，也有内部来源的 metadata。缺了 metadata 时，这个请求看起来就像客户端直接
+// 发来的。
 func pinnedReq(pinned string, internal bool, cands ...Candidate) SchedulerPickRequest {
 	req := SchedulerPickRequest{
 		Provider:   "mixed",
@@ -44,7 +44,7 @@ func TestSchedulerPickHonoursPinnedProvider(t *testing.T) {
 		{ID: "auth-ds", Provider: "openai-compatible-modelscope-my", Priority: 4},
 	}
 
-	// Unpinned: configured order wins, so provider 1 is chosen.
+	// 未钉定时按配置顺序优先，因此选中 provider 1。
 	plain := SchedulerPickRequest{Provider: "mixed", Providers: []string{"mixed"}, Model: "glm-5.2", Candidates: cands}
 	first, err := s.SchedulerPick(plain)
 	if err != nil {
@@ -63,10 +63,9 @@ func TestSchedulerPickHonoursPinnedProvider(t *testing.T) {
 	}
 }
 
-// TestSchedulerPickPinnedUnavailableFails guards the leak the pin exists to
-// close: when the pinned provider cannot serve, the pick must fail instead of
-// deferring, because deferring hands the nested call to another provider's
-// credential and that provider loses its native Responses attempt.
+// TestSchedulerPickPinnedUnavailableFails 守住引入钉定就是为了堵住的那个漏洞：被钉定的 provider
+// 无法服务时，挑选必须失败而不能让位；一旦让位，嵌套调用就会被交给别的 provider 的凭据，那家就
+// 失去了属于它自己的原生 Responses 尝试。
 func TestSchedulerPickPinnedUnavailableFails(t *testing.T) {
 	now := time.Date(2026, 8, 30, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
 	s, _ := newTestStore(now)
@@ -100,8 +99,8 @@ func TestSchedulerPickPinnedSkipsProviderAfter429(t *testing.T) {
 	}
 }
 
-// TestSchedulerPickIgnoresClientSuppliedPin keeps a caller from dictating which
-// account serves it: the marker only counts for internally originated picks.
+// TestSchedulerPickIgnoresClientSuppliedPin 防止调用方指定由哪个账号服务它：这个标记只在内部来
+// 源的挑选里才生效。
 func TestSchedulerPickIgnoresClientSuppliedPin(t *testing.T) {
 	now := time.Date(2026, 8, 30, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
 	s, _ := newTestStore(now)
@@ -151,10 +150,9 @@ func TestPinnedProviderReadsHeaderTolerantly(t *testing.T) {
 	}
 }
 
-// TestSchedulerPickAnnouncesDroppedPin protects the live diagnosis: the pin only
-// works because the host flags nested executions as internally originated, so a
-// header that arrives without that marker must be reported rather than silently
-// ignored (a silent drop would quietly re-enable the protocol downgrade).
+// TestSchedulerPickAnnouncesDroppedPin 保护线上的可诊断性：钉定之所以生效，是因为宿主会把嵌套
+// 执行标记为内部来源；因此只带请求头却没有该标记时，必须打日志说出来而不能悄悄忽略（静默丢弃等
+// 于把协议降级悄悄放回来）。
 func TestSchedulerPickAnnouncesDroppedPin(t *testing.T) {
 	now := time.Date(2026, 8, 30, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
 	rec := &recordLogger{}

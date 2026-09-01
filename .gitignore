@@ -1,6 +1,6 @@
 
-# Build artifacts (regenerable via: go build -buildmode=c-shared ./cmd/plugin)
-# Go toolchain downloads
+# 构建产物（可用 go build -buildmode=c-shared ./cmd/plugin 重新生成）
+# Go 工具链下载
 *.tgz
 cmd/plugin/*.dll
 cmd/plugin/*.dylib

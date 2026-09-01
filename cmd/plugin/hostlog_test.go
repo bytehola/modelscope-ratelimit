@@ -12,8 +12,7 @@ import (
 	modelscope "modelscope-ratelimit/internal/ratelimit"
 )
 
-// withHostLog wires a fake host.log callback and a non-nil host handle, and
-// returns the lines the plugin would have handed to CLIProxyAPI.
+// withHostLog 挂上一个假的 host.log 回调和非空的宿主句柄，并返回插件本应交给 CLIProxyAPI 的日志行。
 func withHostLog(t *testing.T, fail bool) *[]rpcHostLogRequest {
 	t.Helper()
 	var sent []rpcHostLogRequest
@@ -97,9 +96,8 @@ func TestLogDebugUsesDebugLevelAndRequestCallbackID(t *testing.T) {
 func TestStoreLoggerReachesHostLog(t *testing.T) {
 	sent := withHostLog(t, false)
 
-	// The core state machine logs through the injected sink; a disable event is
-	// the case operators look for first, so it must land in the host log too.
-	// A unique auth id keeps this out of the other tests' shared store state.
+	// 核心状态机通过注入的 sink 打日志。禁用事件是运维最先找的东西，所以它也必须落到宿主日志里。
+	// 用唯一的 auth id，避免污染其他用例共用的 store 状态。
 	store.DisableGlobal("auth-logprobe", "glm-5.2", store.Now())
 
 	found := false
@@ -171,8 +169,7 @@ func TestLogBodyExcerptIsSingleLineAndBounded(t *testing.T) {
 	}
 }
 
-// countBanner returns how many of the captured host.log lines are the
-// configuration banner.
+// countBanner 统计捕获到的 host.log 里配置横幅有几行。
 func countBanner(sent *[]rpcHostLogRequest) int {
 	n := 0
 	for _, req := range *sent {
@@ -183,10 +180,9 @@ func countBanner(sent *[]rpcHostLogRequest) int {
 	return n
 }
 
-// TestConfigBannerIsDeferredOncePerChange pins both banner rules: the host loads
-// plugins before it attaches the log file, so the banner must be deferred until
-// a runtime call proves the sink exists, and repeated register/reconfigure calls
-// for the same config must produce exactly one line.
+// TestConfigBannerIsDeferredOncePerChange 同时钉住横幅的两条规则：宿主在挂接日志文件之前就会加载
+// 插件，因此横幅必须推迟到有运行期调用证明日志出口已存在之后再写；同一份配置反复
+// register/reconfigure 只能产生一行。
 func TestConfigBannerIsDeferredOncePerChange(t *testing.T) {
 	sent := withHostLog(t, false)
 	origLast, origPending := lastConfigBanner, pendingConfigBanner

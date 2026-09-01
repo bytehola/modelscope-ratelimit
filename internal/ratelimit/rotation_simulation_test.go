@@ -7,13 +7,13 @@ import (
 	"time"
 )
 
-// rotationSim is a lightweight test harness that drives SchedulerPick + OnUsage
-// in sequence and records the resulting provider+key picks as a table.
+// rotationSim 是一个轻量测试台：按顺序驱动 SchedulerPick + OnUsage，并把每次得到的
+// provider+key 选择记录成一张表。
 type rotationSim struct {
 	s         *Store
 	providers []string
-	keys      map[string][]string // provider -> key IDs
-	seen      map[string]bool     // keys tried (excluded from next candidate list)
+	keys      map[string][]string // provider -> key ID 列表
+	seen      map[string]bool     // 已试过的 key（下一次候选列表里会被排除）
 	t         *testing.T
 }
 
@@ -22,7 +22,7 @@ func newRotationSim(t *testing.T, providers ...string) *rotationSim {
 	now := time.Date(2026, 7, 8, 10, 0, 0, 0, loc)
 	s, _ := newTestStore(now)
 	cfg := cfgWith(providers...)
-	cfg.InsufficientQuotaCooldown = 0 // no blocking; focus on rotation
+	cfg.InsufficientQuotaCooldown = 0 // 不产生阻塞，只关注轮换
 	cfg.SkipProviderOn429 = false
 	s.Reconfigure(cfg)
 
@@ -73,7 +73,7 @@ func (r *rotationSim) usage429(id, provider string) {
 		Failed:   true,
 		Failure:  &UsageFailure{StatusCode: 429, Body: insufficientQuotaBody},
 	})
-	r.seen[id] = true // host removes tried key from next candidate list
+	r.seen[id] = true // 宿主会把已试过的 key 从下一次候选列表里移除
 }
 
 func (r *rotationSim) usage200(id, provider string) {
@@ -83,7 +83,7 @@ func (r *rotationSim) usage200(id, provider string) {
 		Model:    "Qwen-72B",
 		Alias:    "Qwen-72B",
 	})
-	r.seen = map[string]bool{} // new request: all keys available again
+	r.seen = map[string]bool{} // 新请求：所有 key 重新可用
 }
 
 func (r *rotationSim) usageBalanceExhausted(id, provider string) {
@@ -95,7 +95,7 @@ func (r *rotationSim) usageBalanceExhausted(id, provider string) {
 		Failed:   true,
 		Failure:  &UsageFailure{StatusCode: 429, Body: insufficientBalanceBody},
 	})
-	r.seen[id] = true // key is disabled and removed from candidate list
+	r.seen[id] = true // 该 key 被禁用，并从候选列表里移除
 }
 
 func (r *rotationSim) newRequest() {
@@ -117,8 +117,7 @@ func shortName(id string) string {
 	return id
 }
 
-// TestRotationSim_UserScenario reproduces the exact two-cycle sequence the
-// user specified and logs it as a readable table.
+// TestRotationSim_UserScenario 复现约定的那两轮完整序列，并打印成可读的表格。
 func TestRotationSim_UserScenario(t *testing.T) {
 	sim := newRotationSim(t, "modelscope", "modelscope-ai", "modelscope-my")
 
@@ -127,7 +126,7 @@ func TestRotationSim_UserScenario(t *testing.T) {
 	rows = append(rows, "-----|------|------")
 
 	// === 第一轮 ===
-	// skip OFF: exhaust ms keys first, then ai, then my
+	// skip OFF：先把 ms 家的 key 试完，再轮到 ai 家、my 家
 	id := sim.pick()
 	rows = append(rows, fmt.Sprintf("1 | %s | 429", shortName(id)))
 	sim.usage429(id, providerOf(id))
@@ -163,7 +162,7 @@ func TestRotationSim_UserScenario(t *testing.T) {
 		t.Log(row)
 	}
 
-	// Verify the exact sequence: exhaust each provider's keys before moving
+	// 校验精确序列：每家都要先把自己的 key 试完才换下一家
 	want := []string{"modelscope-k1", "modelscope-k2", "modelscope-k3", "modelscope-k4", "modelscope-k1", "modelscope-k2", "modelscope-k3", "modelscope-k4", "modelscope-ai-k1"}
 	sim2 := newRotationSim(t, "modelscope", "modelscope-ai", "modelscope-my")
 	var got []string
@@ -183,8 +182,8 @@ func TestRotationSim_UserScenario(t *testing.T) {
 	}
 }
 
-// TestRotationSim_AllExhausted simulates all 12 keys returning 429 until none
-// are available. Shows the full round-robin exhaustion sequence.
+// TestRotationSim_AllExhausted 模拟 12 把 key 全部返回 429 直到无可用凭据，展示完整的轮询耗尽
+// 序列。
 func TestRotationSim_AllExhausted(t *testing.T) {
 	sim := newRotationSim(t, "modelscope", "modelscope-ai", "modelscope-my")
 
@@ -209,9 +208,8 @@ func TestRotationSim_AllExhausted(t *testing.T) {
 	}
 }
 
-// TestRotationSim_MixedSuccess simulates a mix of 200 and 429 responses across
-// providers and keys, showing how a 200 keeps the provider while advancing its
-// key, and a 429 rotates to the next provider.
+// TestRotationSim_MixedSuccess 在各家各 key 上混合 200 与 429，展示：200 会留在当前这家并推进
+// 它的 key 游标，而某家全部 key 都不可用时才会换下一家。
 func TestRotationSim_MixedSuccess(t *testing.T) {
 	sim := newRotationSim(t, "modelscope", "modelscope-ai", "modelscope-my")
 
@@ -224,10 +222,10 @@ func TestRotationSim_MixedSuccess(t *testing.T) {
 	}{
 		{false}, // ms#1 200
 		{false}, // ms#2 200
-		{true},  // ms#3 429 -> stay on ms
-		{true},  // ms#4 429 -> stay on ms (exhausted) -> ai
-		{false}, // ai#1 200 -> reset to ms
-		{false}, // ms#1 200 (cursor continues)
+		{true},  // ms 第 3 把 429 -> 仍留在 ms 家
+		{true},  // ms 第 4 把 429 -> ms 家已耗尽 -> 换到 ai 家
+		{false}, // ai 第 1 把 200 -> 下一次请求回到 ms 家
+		{false}, // ms 第 1 把 200（key 游标继续往后）
 	}
 
 	for i, st := range steps {
@@ -248,7 +246,7 @@ func TestRotationSim_MixedSuccess(t *testing.T) {
 		t.Log(row)
 	}
 
-	// Verify: skip OFF exhausts provider: ms#1, ms#2, ms#3, ms#4, then ai#1
+	// 校验：skip OFF 会先耗尽一家：ms#1、ms#2、ms#3、ms#4，然后才是 ai#1
 	want := []string{"modelscope-k1", "modelscope-k2", "modelscope-k3", "modelscope-k4", "modelscope-k1", "modelscope-k2"}
 	sim2 := newRotationSim(t, "modelscope", "modelscope-ai", "modelscope-my")
 	for i, st := range steps {
@@ -264,9 +262,8 @@ func TestRotationSim_MixedSuccess(t *testing.T) {
 	}
 }
 
-// TestRotationSim_BalanceExhausted shows how an "insufficient balance" 429
-// permanently disables a key, so it's skipped in all subsequent picks while
-// other keys continue to rotate.
+// TestRotationSim_BalanceExhausted 展示 "insufficient balance" 的 429 会把该 key 当天永久禁
+// 用，因此后续挑选都会跳过它，其余 key 继续轮换。
 func TestRotationSim_BalanceExhausted(t *testing.T) {
 	sim := newRotationSim(t, "modelscope", "modelscope-ai")
 
@@ -274,22 +271,22 @@ func TestRotationSim_BalanceExhausted(t *testing.T) {
 	rows = append(rows, "步骤 | 选中 | 结果")
 	rows = append(rows, "-----|------|------")
 
-	// 1: ms#1 429 insufficient_balance -> daily disabled
+	// 1: ms#1 因 insufficient_balance 返回 429 -> 当天禁用
 	id := sim.pick()
 	rows = append(rows, fmt.Sprintf("1 | %s | 429 insufficient_balance (禁用)", shortName(id)))
 	sim.usageBalanceExhausted(id, providerOf(id))
 
-	// 2: ms#2 429 insufficient_quota -> stay on ms
+	// 2: ms#2 因 insufficient_quota 返回 429 -> 仍留在 ms 家
 	id = sim.pick()
 	rows = append(rows, fmt.Sprintf("2 | %s | 429 insufficient_quota", shortName(id)))
 	sim.usage429(id, providerOf(id))
 
-	// 3: ms#3 200 -> reset
+	// 3: ms#3 返回 200 -> 复位
 	id = sim.pick()
 	rows = append(rows, fmt.Sprintf("3 | %s | 200 (reset)", shortName(id)))
 	sim.usage200(id, providerOf(id))
 
-	// 4: new request, ms#1 still disabled -> ms#3 200 (reset to first provider)
+	// 4: 新请求，ms#1 仍在禁用中 -> 拿到 ms#3 并返回 200（回到第一家）
 	id = sim.pick()
 	rows = append(rows, fmt.Sprintf("4 | %s | 200 (ms#1 仍禁用)", shortName(id)))
 	sim.usage200(id, providerOf(id))
@@ -298,7 +295,7 @@ func TestRotationSim_BalanceExhausted(t *testing.T) {
 		t.Log(row)
 	}
 
-	// Verify key sequence
+	// 校验 key 序列
 	sim2 := newRotationSim(t, "modelscope", "modelscope-ai")
 	want := []string{"modelscope-k1", "modelscope-k2", "modelscope-k3", "modelscope-k4"}
 	for i, w := range want {

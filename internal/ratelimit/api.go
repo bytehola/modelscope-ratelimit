@@ -5,28 +5,24 @@ import (
 	"fmt"
 )
 
-// APIResponse is the normalized response from Modelscope APIs. Both response
-// formats are supported:
-//   - /api/v1/*     → {"Code":200,"Data":{...},"Success":true}  (CamelCase)
-//   - /openapi/v1/* → {"success":true,"data":{...}}             (snake_case)
+// APIResponse 是 Modelscope API 的归一化响应。两种响应格式都支持：
+//   - /api/v1/*     → {"Code":200,"Data":{...},"Success":true}  （大驼峰）
+//   - /openapi/v1/* → {"success":true,"data":{...}}             （小写下划线）
 //
-// The Data field holds the inner payload as raw JSON for the caller to
-// unmarshal into the appropriate struct.
+// Data 字段以内层原始 JSON 的形式保留，由调用方反序列化成对应结构体。
 type APIResponse struct {
 	Success bool
-	Code    int // 0 for openapi format
+	Code    int // openapi 格式下为 0
 	Data    json.RawMessage
 }
 
-// NormalizeAPIResponse parses a Modelscope API response body and returns the
-// inner Data payload regardless of whether the endpoint uses the CamelCase
-// (/api/v1/*) or snake_case (/openapi/v1/*) envelope. It is a pure function
-// with no HTTP dependency so it can be unit-tested in isolation.
+// NormalizeAPIResponse 解析 Modelscope API 的响应体，返回内层的 Data 载荷，无论该端点
+// 用的是大驼峰信封（/api/v1/*）还是小写下划线信封（/openapi/v1/*）。它是纯函数、不依赖
+// HTTP，因此可以脱离宿主单独做单测。
 func NormalizeAPIResponse(raw []byte) (*APIResponse, error) {
-	// Single unmarshal: json.Unmarshal is case-insensitive for struct field
-	// matching, so a single anonymous struct captures both CamelCase (/api/v1/*)
-	// and snake_case (/openapi/v1/*) envelopes, including mixed formats where
-	// "Code" is CamelCase but "data" is lowercase.
+	// 一次反序列化搞定：json.Unmarshal 对结构体字段匹配是大小写不敏感的，所以一个匿名
+	// 结构体就能同时吃下大驼峰（/api/v1/*）和小写下划线（/openapi/v1/*）两种信封，包括
+	// "Code" 是大驼峰而 "data" 是小写这种混合写法。
 	var env struct {
 		Code    int             `json:"Code"`
 		Success bool            `json:"Success"`
@@ -35,14 +31,13 @@ func NormalizeAPIResponse(raw []byte) (*APIResponse, error) {
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return nil, fmt.Errorf("unparseable API response (first 200 bytes: %s)", truncate(raw, 200))
 	}
-	// If "Data" (CamelCase) was matched, use it directly.
+	// 如果匹配到了大驼峰 "Data"，直接使用。
 	if len(env.Data) > 0 {
 		return &APIResponse{Success: env.Success || env.Code == 200, Code: env.Code, Data: env.Data}, nil
 	}
-	// CamelCase "Data" was empty — try lowercase "data" (mixed envelope).
-	// json.Unmarshal matched it case-insensitively above, so env.Data
-	// already contains it. If env.Data is still empty, the response has
-	// no Data field at all (e.g. error responses).
+	// 大驼峰 "Data" 为空 —— 试试小写 "data"（混合信封）。上面 json.Unmarshal 已经按大
+	// 小写不敏感匹配过，env.Data 里就是它。如果 env.Data 仍为空，说明响应根本没有 Data
+	// 字段（例如错误响应）。
 	if env.Code != 0 || env.Success {
 		return &APIResponse{Success: env.Success || env.Code == 200, Code: env.Code, Data: env.Data}, nil
 	}
@@ -56,10 +51,10 @@ func truncate(b []byte, n int) string {
 	return string(b[:n])
 }
 
-// ---- Response structs (field names and json tags mirror the real API) ----
+// ---- 响应结构体（字段名与 json tag 与真实 API 一致）----
 
-// LoginInfo mirrors GET /api/v1/users/login/info -> Data.
-// Calling this endpoint also activates the daily magic cube sign-in.
+// LoginInfo 对应 GET /api/v1/users/login/info 的 Data。
+// 调用该端点同时会触发当日魔粒签到。
 type LoginInfo struct {
 	Name       string `json:"Name"`
 	NickName   string `json:"NickName"`
@@ -69,35 +64,34 @@ type LoginInfo struct {
 	IsRealName bool   `json:"is_real_name"`
 }
 
-// MagicCubeBalance mirrors GET /openapi/v1/magicubes/balance -> data.
-// Only three fields are returned by the real API.
+// MagicCubeBalance 对应 GET /openapi/v1/magicubes/balance 的 data。
+// 真实 API 只返回这三个字段。
 type MagicCubeBalance struct {
 	TotalBalance     int `json:"total_balance"`
 	AvailableBalance int `json:"available_balance"`
 	FrozenAmount     int `json:"frozen_amount"`
 }
 
-// TransactionRecord mirrors a single record from
-// GET /openapi/v1/magicubes/transactions -> data.records[].
-// Fields expire_days/expire_at/days_remaining are present only on EARN records.
-// model_tier is present only on SPEND_CONFIRM records.
+// TransactionRecord 对应 GET /openapi/v1/magicubes/transactions 的
+// data.records[] 中的单条记录。expire_days/expire_at/days_remaining 只在 EARN 记录里出
+// 现；model_tier 只在 SPEND_CONFIRM 记录里出现。
 type TransactionRecord struct {
 	GmtCreated    string `json:"gmt_created"`
-	Type          string `json:"type"` // EARN / SPEND_CONFIRM / EXPIRE
+	Type          string `json:"type"` // 取值 EARN / SPEND_CONFIRM / EXPIRE
 	RuleKey       string `json:"rule_key"`
 	CategoryKey   string `json:"category_key"`
 	Title         string `json:"title"`
 	Description   string `json:"description"`
 	Category      string `json:"category"`
-	ModelTier     string `json:"model_tier"` // SPEND_CONFIRM only
+	ModelTier     string `json:"model_tier"` // 仅 SPEND_CONFIRM 有
 	TotalAmount   int    `json:"total_amount"`
 	Count         int    `json:"count"`
-	ExpireDays    int    `json:"expire_days"`    // EARN only
-	ExpireAt      string `json:"expire_at"`      // EARN only
-	DaysRemaining int    `json:"days_remaining"` // EARN only
+	ExpireDays    int    `json:"expire_days"`    // 仅 EARN 有
+	ExpireAt      string `json:"expire_at"`      // 仅 EARN 有
+	DaysRemaining int    `json:"days_remaining"` // 仅 EARN 有
 }
 
-// TransactionsResp mirrors GET /openapi/v1/magicubes/transactions -> data.
+// TransactionsResp 对应 GET /openapi/v1/magicubes/transactions 的 data。
 type TransactionsResp struct {
 	Page     int                 `json:"page"`
 	PageSize int                 `json:"page_size"`
@@ -105,24 +99,24 @@ type TransactionsResp struct {
 	Records  []TransactionRecord `json:"records"`
 }
 
-// SDKToken mirrors GET /api/v1/users/tokens/list -> Data.SdkTokens[].
+// SDKToken 对应 GET /api/v1/users/tokens/list 的 Data.SdkTokens[]。
 type SDKToken struct {
 	Id           int    `json:"Id"`
 	SdkToken     string `json:"SdkToken"`
 	SdkTokenName string `json:"SdkTokenName"`
-	Valid        string `json:"Valid"` // "1" = valid, "0" = invalid
+	Valid        string `json:"Valid"` // "1" 有效，"0" 无效
 	ExpiresAt    string `json:"ExpiresAt"`
 	GmtCreated   string `json:"GmtCreated"`
 	Username     string `json:"Username"`
 }
 
-// SDKTokenList mirrors GET /api/v1/users/tokens/list -> Data.
+// SDKTokenList 对应 GET /api/v1/users/tokens/list 的 Data。
 type SDKTokenList struct {
 	SdkTokens  []SDKToken `json:"SdkTokens"`
 	TotalCount int        `json:"TotalCount"`
 }
 
-// UserInfo mirrors GET /api/v1/users/info -> Data (mixed case fields).
+// UserInfo 对应 GET /api/v1/users/info 的 Data（字段大小写混用）。
 type UserInfo struct {
 	UserName     string `json:"user_name"`
 	UserNickname string `json:"user_nickname"`
@@ -135,7 +129,7 @@ type UserInfo struct {
 	UserId       string `json:"user_id"`
 }
 
-// BindingCheck mirrors GET /api/v1/users/binding/check -> Data.
+// BindingCheck 对应 GET /api/v1/users/binding/check 的 Data。
 type BindingCheck struct {
 	IsBindingYun bool `json:"IsBindingYun"`
 	YunInfo      struct {
@@ -146,15 +140,15 @@ type BindingCheck struct {
 	} `json:"YunInfo"`
 }
 
-// InferenceRateLimit mirrors GET /api/v1/inference/rate-limit -> Data.
+// InferenceRateLimit 对应 GET /api/v1/inference/rate-limit 的 Data。
 type InferenceRateLimit struct {
 	CurrentUsagePerDay int `json:"currentUsagePerDay"`
 }
 
-// ---- Fetcher closure types ----
-// The core layer holds function pointers; the glue layer provides
-// implementations that make real HTTP calls (net/http direct, cookie auth).
-// Session = API key itself (m_session_id cookie value), never expires.
+// ---- 取数闭包类型 ----
+// 核心层只持有函数指针，具体实现由胶水层提供，负责真正发起 HTTP 调用（直接用
+// net/http，走 cookie 鉴权）。session 就是 api key 本身（m_session_id cookie 的值），
+// 永不过期。
 
 type LoginInfoFetcher func(sessionID string) (*LoginInfo, error)
 type BalanceFetcher func(sessionID string) (*MagicCubeBalance, error)
@@ -162,17 +156,15 @@ type TransactionsFetcher func(sessionID string, page, pageSize int) (*Transactio
 type TokenListFetcher func(sessionID string) (*SDKTokenList, error)
 type RateLimitFetcher func(sessionID string) (*InferenceRateLimit, error)
 
-// MidnightSignInFunc is called by the core layer at the daily boundary
-// (PruneAll -> dayChanged). The glue layer implementation iterates all known
-// auth IDs, calls LoginInfoFetcher for each, then refreshes balance and
-// rate-limit, updating core state via recordCheckIn/recordMagicCube/recordUsagePerDay.
+// MidnightSignInFunc 由核心层在跨过日期边界时（PruneAll -> dayChanged）调用。胶水层的
+// 实现会遍历所有已知 auth ID，逐个调用 LoginInfoFetcher，再刷新余额和限流，并通过
+// recordCheckIn/recordMagicCube/recordUsagePerDay 写回核心状态。
 type MidnightSignInFunc func()
 
-// ---- Store setter methods for injected closures ----
+// ---- Store 上用于注入闭包的 setter ----
 
-// SetLoginInfoFetcher injects a function that reads the user profile
-// (name, email, Havana ID, etc.) for a session ID. Used by the midnight
-// sign-in to populate account summary state.
+// SetLoginInfoFetcher 注入一个按 session id 读取用户资料（昵称、邮箱、Havana ID 等）的
+// 函数，供午夜签到流程填充账号概况状态。
 func (s *Store) SetLoginInfoFetcher(f LoginInfoFetcher) {
 	if f == nil {
 		s.loginInfoFetcher.Store(nil)
@@ -181,9 +173,8 @@ func (s *Store) SetLoginInfoFetcher(f LoginInfoFetcher) {
 	s.loginInfoFetcher.Store(&f)
 }
 
-// SetBalanceFetcher injects a function that reads the current magic-cube balance
-// for a session ID (m_session_id). Used by the midnight sign-in to update
-// core state with available/total/frozen balance.
+// SetBalanceFetcher 注入一个按 session id（m_session_id）读取当前魔粒余额的函数，供午
+// 夜签到流程更新核心状态里的可用/总额/冻结余额。
 func (s *Store) SetBalanceFetcher(f BalanceFetcher) {
 	if f == nil {
 		s.balanceFetcher.Store(nil)
@@ -192,8 +183,8 @@ func (s *Store) SetBalanceFetcher(f BalanceFetcher) {
 	s.balanceFetcher.Store(&f)
 }
 
-// SetRateLimitFetcher injects a function that reads the daily usage counter
-// for a session ID. Used by the midnight sign-in to update usage-per-day state.
+// SetRateLimitFetcher 注入一个按 session id 读取当日用量计数的函数，供午夜签到流程更新
+// usage-per-day 状态。
 func (s *Store) SetRateLimitFetcher(f RateLimitFetcher) {
 	if f == nil {
 		s.rateLimitFetcher.Store(nil)
@@ -202,9 +193,8 @@ func (s *Store) SetRateLimitFetcher(f RateLimitFetcher) {
 	s.rateLimitFetcher.Store(&f)
 }
 
-// SetMidnightSignInFunc injects the daily boundary callback invoked by
-// PruneAll when the calendar day changes. The glue implementation signs in
-// every account and refreshes balance + usage.
+// SetMidnightSignInFunc 注入跨日回调，由 PruneAll 在日期变化时调用。胶水层的实现会给
+// 每个账号签到并刷新余额 + 用量。
 func (s *Store) SetMidnightSignInFunc(f MidnightSignInFunc) {
 	if f == nil {
 		s.midnightSignInFunc.Store(nil)

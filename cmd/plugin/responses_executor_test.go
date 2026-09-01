@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
@@ -36,9 +37,8 @@ func setTestResolved() {
 	resolvedMu.Unlock()
 }
 
-// withRouteIndex derives the upstream-name -> route-ID index that resolveKeys
-// builds alongside routeToName, so test fixtures stay faithful to what the glue
-// computes from the management API (route ID = alias when set, else name).
+// withRouteIndex 构造 resolveKeys 会和 routeToName 一起建的那份“上游名到路由 ID”反查索引，
+// 这样测试夹具与胶水层从管理接口算出来的结果保持一致（路由 ID 有 alias 用 alias，否则用 name）。
 func withRouteIndex(routes map[string]map[string]string) map[string]map[string]string {
 	out := make(map[string]map[string]string, len(routes))
 	for provider, models := range routes {
@@ -246,25 +246,25 @@ func TestBuildRetrySequenceOnlyManaged(t *testing.T) {
 
 	cfg := currentConfig()
 
-	// skip ON: one step per managed provider, no non-managed steps.
-	cfg.SkipProviderOn429 = true
-	steps := buildRetrySequence(getResolved(), cfg)
-	if len(steps) != 2 {
-		t.Fatalf("skip ON: want 2 managed steps, got %+v", steps)
-	}
-	if steps[0].provider != "modelscope" || steps[1].provider != "modelscope-ai" {
-		t.Fatalf("skip ON: provider order wrong: %+v", steps)
+	// 两种模式都按 provider 顺序一把凭据一步：key 级失败必须先在本家内轮换，才允许换到下一家。
+	want := []string{"modelscope", "modelscope", "modelscope-ai"}
+	for _, skip := range []bool{true, false} {
+		cfg.SkipProviderOn429 = skip
+		steps := buildRetrySequence(getResolved(), cfg)
+		got := make([]string, 0, len(steps))
+		for _, st := range steps {
+			got = append(got, st.provider)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("skip=%v: want %d steps %v, got %v", skip, len(want), want, got)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("skip=%v: step order = %v, want %v", skip, got, want)
+			}
+		}
 	}
 
-	// skip OFF: one step per managed key (3 total), no non-managed steps.
-	cfg.SkipProviderOn429 = false
-	steps = buildRetrySequence(getResolved(), cfg)
-	if len(steps) != 3 {
-		t.Fatalf("skip OFF: want 3 managed steps, got %d (%+v)", len(steps), steps)
-	}
-	for _, s := range steps {
-		t.Logf("step provider=%s", s.provider)
-	}
 }
 
 func TestProviderNameForAuth(t *testing.T) {
@@ -298,7 +298,7 @@ func pluginapiExecutorRequest(model string) pluginapi.ExecutorRequest {
 
 var pluginapiModelRouteTargetSelf = pluginapi.ModelRouteTargetSelf
 
-// ---- resolveStep tests ----
+// ---- resolveStep 用例 ----
 
 func TestResolveStepReturnsFirstKey(t *testing.T) {
 	setTestPluginConfig("modelscope")
@@ -350,7 +350,7 @@ func TestResolveStepUnknownProvider(t *testing.T) {
 	}
 }
 
-// ---- routeResponsesRequest edge cases ----
+// ---- routeResponsesRequest 边界情况 ----
 
 func TestRouteResponsesRequestEmptyProviders(t *testing.T) {
 	setTestPluginConfig()
@@ -362,7 +362,7 @@ func TestRouteResponsesRequestEmptyProviders(t *testing.T) {
 	pluginCfg.UseResponses = nil
 }
 
-// ---- executor defer logic (stubbed I/O) ----
+// ---- 执行器让位逻辑（打桩 I/O）----
 
 func setTestResolvedExec() {
 	routes := map[string]map[string]string{"modelscope": {"glm-5.2": "ZhipuAI/GLM-5.2"}}
@@ -382,10 +382,9 @@ func setTestResolvedExec() {
 }
 
 func setTestResolvedMixedResponses() {
-	// Mirrors the real deployment: provider A registers zai-org/GLM-5.2 under the
-	// alias glm-5.2 (so "zai-org/GLM-5.2" is NOT a host-routable model ID) and
-	// also serves the DeepSeek model by name; provider B registers
-	// deepseek-ai/DeepSeek-V4-Pro-0813 under the same alias glm-5.2.
+	// 对应真实部署：A 家把 zai-org/GLM-5.2 注册在别名 glm-5.2 下（所以 zai-org/GLM-5.2 不是宿主可路由
+	// 的模型 ID），同时按原名提供 DeepSeek 那个模型；B 家把 deepseek-ai/DeepSeek-V4-Pro-0813 注册
+	// 在同一个别名 glm-5.2 下。
 	routes := map[string]map[string]string{
 		"modelscope-ai-deepseek2": {
 			"glm-5.2":                          "zai-org/GLM-5.2",
@@ -523,9 +522,8 @@ func TestExecuteResponsesPassthroughMixedProvidersPrefersProviderOrderChatFallba
 	if string(resp.Payload) != `{"provider":"zai-chat"}` {
 		t.Fatalf("unexpected payload: %s", string(resp.Payload))
 	}
-	// The host registry only knows the alias for an aliased compat model, so the
-	// chat fallback must carry the route ID ("glm-5.2") and not the upstream
-	// name ("zai-org/GLM-5.2"), which host.model.execute cannot resolve.
+	// 宿主注册表对于配了别名的兼容模型只认别名，所以 chat 兜底必须带路由 ID（glm-5.2）而不是上游模型名
+	// （zai-org/GLM-5.2），后者 host.model.execute 根本解析不出来。
 	if len(hostFallbackModels) != 1 || hostFallbackModels[0] != "glm-5.2" {
 		t.Fatalf("first provider host fallback must use the host-routable model ID, got %v", hostFallbackModels)
 	}
@@ -822,8 +820,7 @@ func TestExecuteResponsesPassthroughStreamMixedProvidersOnlyUsesEnabledUpstream(
 	if len(gotURLs) != 1 {
 		t.Fatalf("upstream stream calls = %d, want 1", len(gotURLs))
 	}
-	// First call: provider A's chat fallback with the host-routable ID. Second
-	// call: the all-managed-exhausted fallback, which keeps the client model.
+	// 第一次调用：A 家的 chat 兜底，带宿主可路由的 ID。第二次调用：托管全部耗尽后的兜底，保留客户端原名。
 	if len(hostFallbackModels) != 2 || hostFallbackModels[0] != "glm-5.2" || hostFallbackModels[1] != "glm-5.2" {
 		t.Fatalf("first provider stream fallback must use the host-routable model ID, got %v", hostFallbackModels)
 	}
@@ -1124,12 +1121,9 @@ func TestExecuteResponsesPassthroughStreamHostFallbackError(t *testing.T) {
 	}
 }
 
-// TestExecuteResponsesPassthroughSkippedProviderKeepsNativeResponsesPath covers
-// a protocol downgrade: provider 1 sits in the skip set after a 429, yet its
-// chat-fallback step still asks the host to execute the alias. The host's
-// scheduler then answers with provider 2's credential, so provider 2's model is
-// served over /v1/chat/completions even though it is Responses-enabled and its
-// own native step was never reached.
+// 覆盖一种协议降级：provider 1 在 429 之后进了 skip 集，但它的 chat 兜底那一步仍然让宿主去执行这
+// 个别名。宿主的调度器于是改用 provider 2 的凭据应答，结果 provider 2 明明开了 Responses，它的模型
+// 却走了 /v1/chat/completions，而且属于它自己的原生那步根本没机会执行。
 func TestExecuteResponsesPassthroughSkippedProviderKeepsNativeResponsesPath(t *testing.T) {
 	setTestPluginConfig("modelscope-ai-deepseek2", "modelscope-my")
 	pluginCfg.SkipProviderOn429 = true
@@ -1169,8 +1163,7 @@ func TestExecuteResponsesPassthroughSkippedProviderKeepsNativeResponsesPath(t *t
 	}
 }
 
-// TestExecuteResponsesPassthroughDisabledProviderKeepsNativeResponsesPath is the
-// same downgrade reached through daily disables instead of the skip set.
+// 同一个降级换由日禁用来触发（而不是 skip 集）时的版本。
 func TestExecuteResponsesPassthroughDisabledProviderKeepsNativeResponsesPath(t *testing.T) {
 	origStore := store
 	store = modelscope.NewStore(stderrLogger{})
@@ -1208,10 +1201,8 @@ func TestExecuteResponsesPassthroughDisabledProviderKeepsNativeResponsesPath(t *
 	}
 }
 
-// TestResolveProviderModelSeparatesRouteAndUpstreamModels pins the two model
-// identifiers a managed-provider step needs: the upstream name for direct
-// /v1/responses calls, and the host-routable ID (alias when one is configured)
-// for host.model.execute chat fallbacks.
+// 钉住托管 provider 那一步需要的两个模型标识：直连 /v1/responses 用上游模型名，宿主 chat 兜底用可路
+// 由 ID（配了别名时就是别名）。
 func TestResolveProviderModelSeparatesRouteAndUpstreamModels(t *testing.T) {
 	setTestPluginConfig("modelscope-ai-deepseek2", "modelscope-my")
 	setTestResolvedMixedResponses()
@@ -1241,8 +1232,17 @@ func TestResolveProviderModelSeparatesRouteAndUpstreamModels(t *testing.T) {
 			wantUpstream: "deepseek-ai/DeepSeek-V4-Pro-0813", wantRoute: "glm-5.2",
 		},
 		{
+			// zai-org/GLM-5.2 是另一家的模型：这一家有索引，但索引里没有这个名字，因此没有可发往上游的内容。
+			// 旧的返回值（原样给出请求名且没有路由）会让执行器把客户端的模型名发给一家服务不了它的 provider，
+			// 随之而来的 400 会终止整个请求。
 			name: "provider does not serve model", provider: "modelscope-my", requested: "zai-org/GLM-5.2",
-			wantUpstream: "zai-org/GLM-5.2", wantRoute: "",
+			wantUpstream: "", wantRoute: "",
+		},
+		{
+			// 这就是线上抓包的那种情形：modelscope-my 把客户端请求的那个模型注册成了另一个别名，因此跨
+			// provider 解析必须同时找回上游模型名和这一家自己可路由的 ID。
+			name: "same model under another alias", provider: "modelscope-ai-deepseek2", requested: "glm-5.2",
+			wantUpstream: "zai-org/GLM-5.2", wantRoute: "glm-5.2",
 		},
 		{
 			name: "unknown provider keeps passthrough behaviour", provider: "modelscope-other", requested: "glm-5.2",
@@ -1263,11 +1263,8 @@ func TestResolveProviderModelSeparatesRouteAndUpstreamModels(t *testing.T) {
 	}
 }
 
-// TestExecuteResponsesPassthroughAliasedFirstProviderServes is the
-// providers-order regression: CLIProxyAPI registers an aliased
-// openai-compatibility model under the alias only, so a chat fallback that
-// carries the upstream name comes back as model_not_found and the first
-// configured provider used to vanish from the sequence without a trace.
+// providers 顺序的回归用例：宿主只以别名注册配了别名的兼容模型，因此带上游模型名的 chat
+// 兜底会拿到 model_not_found；修复前第一家会无声地从序列里消失。
 func TestExecuteResponsesPassthroughAliasedFirstProviderServes(t *testing.T) {
 	setTestPluginConfig("modelscope-ai-deepseek2", "modelscope-my")
 	pluginCfg.SkipProviderOn429 = true
@@ -1279,8 +1276,7 @@ func TestExecuteResponsesPassthroughAliasedFirstProviderServes(t *testing.T) {
 	origModel := hostModelExecute
 	t.Cleanup(func() { hostHTTPDo = origHTTP; hostModelExecute = origModel })
 
-	// Behaves like the host: resolve providers from the model registry by exact
-	// model ID, and reject anything not registered.
+	// 行为与宿主一致：按精确的模型 ID 在注册表里解析 provider，未注册的一律拒绝。
 	hostModelExecute = func(req executorRequestWithCallback) (pluginapi.HostModelExecutionResponse, error) {
 		if _, ok := routable[req.Model]; !ok {
 			return pluginapi.HostModelExecutionResponse{}, errors.New("unknown provider for model " + req.Model)
@@ -1310,9 +1306,7 @@ func TestExecuteResponsesPassthroughAliasedFirstProviderServes(t *testing.T) {
 	}
 }
 
-// TestExecuteResponsesPassthroughChatFallbackFailureIsLogged guards the silent
-// skip: a chat fallback that fails must still fall through to the next managed
-// provider, but it must say so.
+// 守住静默跳过：chat 兜底失败时既要继续往后一家走，也要把这件事说出来。
 func TestExecuteResponsesPassthroughChatFallbackFailureIsLogged(t *testing.T) {
 	setTestPluginConfig("modelscope-ai-deepseek2", "modelscope-my")
 	pluginCfg.SkipProviderOn429 = true
@@ -1353,8 +1347,7 @@ func TestExecuteResponsesPassthroughChatFallbackFailureIsLogged(t *testing.T) {
 	}
 }
 
-// TestExecuteResponsesPassthroughStreamAliasedFirstProviderServes mirrors the
-// non-streaming regression for the SSE path.
+// 把上面那个非流式的回归搬到 SSE 流式路径上。
 func TestExecuteResponsesPassthroughStreamAliasedFirstProviderServes(t *testing.T) {
 	setTestPluginConfig("modelscope-ai-deepseek2", "modelscope-my")
 	pluginCfg.SkipProviderOn429 = true
@@ -1407,11 +1400,9 @@ func TestExecuteResponsesPassthroughStreamAliasedFirstProviderServes(t *testing.
 	}
 }
 
-// TestExecuteResponsesPassthroughErrorPayloadIsNotSuccess covers the upstream
-// that answers HTTP 200 with a bare {"code":...,"message":...} document (real
-// Modelscope behaviour for a rejected parameter). That body is not a Response
-// resource, so it must not be returned as a success: the executor has to keep
-// rotating and ultimately let the host path answer.
+// 覆盖上游用 HTTP 200 返回一份只有 code 和 message 字段的裸错误文档的情况，这是 Modelscope 拒绝某个
+// 参数时的真实行为。这种 body 不是 Response 资源，绝不能当成功返回：执行器要继续轮换，最终让宿主路径
+// 应答。
 func TestExecuteResponsesPassthroughErrorPayloadIsNotSuccess(t *testing.T) {
 	setTestPluginConfig("modelscope")
 	setTestResolvedExec()
@@ -1451,9 +1442,8 @@ func TestExecuteResponsesPassthroughErrorPayloadIsNotSuccess(t *testing.T) {
 	}
 }
 
-// TestExecuteResponsesPassthroughStreamErrorPayloadTriggersFallback is the SSE
-// twin: a stream that opens 200 and then delivers a JSON error document without
-// any data: event must be treated as a failed candidate, not forwarded.
+// 上面场景的 SSE 版本：流以 200 建连，随后送来一个不带任何 data 事件的 JSON 错误文档，必须当作这个候
+// 选失败处理，不能转发出去。
 func TestExecuteResponsesPassthroughStreamErrorPayloadTriggersFallback(t *testing.T) {
 	setTestPluginConfig("modelscope")
 	setTestResolvedExec()
@@ -1506,10 +1496,8 @@ func TestExecuteResponsesPassthroughStreamErrorPayloadTriggersFallback(t *testin
 	}
 }
 
-// TestExecuteResponsesPassthroughChatFallbackPinsProvider checks that a
-// provider's chat-fallback step tells the host which provider must answer, that
-// the marker does not leak into the caller's own header set, and that the final
-// unconstrained host fallback stays unpinned.
+// 校验三点：某家的 chat 兜底会告诉宿主必须由哪家应答；这个标记不会漏进调用方自己的请求头；最后那次不
+// 设限的宿主兜底保持不钉定。
 func TestExecuteResponsesPassthroughChatFallbackPinsProvider(t *testing.T) {
 	setTestPluginConfig("modelscope-ai-deepseek2", "modelscope-my")
 	pluginCfg.SkipProviderOn429 = true
@@ -1565,5 +1553,304 @@ func TestExecuteResponsesPassthroughChatFallbackPinsProvider(t *testing.T) {
 	}
 	if got := req.Headers.Get(modelscope.PinnedProviderHeader); got != "" {
 		t.Fatalf("the executor must not mutate the caller's headers, found %q", got)
+	}
+}
+
+// 用面板保存的那种取值驱动路由门：该字段是字符串型配置项，到达时永远是一个 YAML 标量。
+// 方括号写法和 true 这个关键字都应当照样命中对应模型。
+func TestRouteResponsesRequestPanelScalarForms(t *testing.T) {
+	setTestResolvedExec()
+	cases := []struct {
+		name  string
+		raw   string
+		model string
+		want  bool
+	}{
+		{"bracket_list_hit", `["ZhipuAI/GLM-5.2", "Qwen/Qwen2.5-72B-Instruct"]`, "glm-5.2", true},
+		{"bracket_list_miss", `["ZhipuAI/GLM-5.2", "Qwen/Qwen2.5-72B-Instruct"]`, "qwen-72b", false},
+		{"comma_list", "ZhipuAI/GLM-5.2, Qwen/Qwen2.5-72B-Instruct", "glm-5.2", true},
+		{"keyword_true", "true", "glm-5.2", true},
+		{"keyword_false", "false", "glm-5.2", false},
+		{"wildcard", "*", "glm-5.2", true},
+		{"unknown_word", "responses", "glm-5.2", false},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := modelscope.ConfigFromMap(map[string]any{
+				"providers":     []any{"modelscope"},
+				"use_responses": tt.raw,
+			})
+			if err != nil {
+				t.Fatalf("ConfigFromMap: %v", err)
+			}
+			pluginCfg = cfg
+			store.Reconfigure(cfg)
+			resp := routeResponsesRequest(pluginapiModelRouteRequest("openai-response", tt.model))
+			if resp.Handled != tt.want {
+				t.Fatalf("use_responses=%q model=%q handled=%v, want %v", tt.raw, tt.model, resp.Handled, tt.want)
+			}
+		})
+	}
+}
+
+// 与线上部署一致：三家 provider 都提供 deepseek-ai/DeepSeek-V4-Pro-0813。
+// modelscope-my 则把它挂在别名 glm-5.2 下，因此它的索引查不到 deepseek-v4-pro。
+// 只有 modelscope 和 modelscope-my 提供 Qwen/Qwen3.8-Flash-Next。
+func setTestResolvedAliasCollision() {
+	routes := map[string]map[string]string{
+		"modelscope": {
+			"glm-5.2":            "ZhipuAI/GLM-5.2",
+			"deepseek-v4-pro":    "deepseek-ai/DeepSeek-V4-Pro-0813",
+			"Qwen3.8-Flash-Next": "Qwen/Qwen3.8-Flash-Next",
+		},
+		"modelscope-my": {
+			"glm-5.2":            "deepseek-ai/DeepSeek-V4-Pro-0813",
+			"ZhipuAI/GLM-5.2":    "ZhipuAI/GLM-5.2",
+			"Qwen3.8-Flash-Next": "Qwen/Qwen3.8-Flash-Next",
+		},
+		"modelscope-ai": {
+			"glm-5.2":         "zai-org/GLM-5.2",
+			"deepseek-v4-pro": "deepseek-ai/DeepSeek-V4-Pro-0813",
+		},
+	}
+	resolvedMu.Lock()
+	resolvedCache = resolvedEntry{
+		raw: map[string]string{"auth-cms": "key-ms", "auth-cmy": "key-my", "auth-cai": "key-ai"},
+		baseURL: map[string]string{
+			"auth-cms": "https://ms.example/v1",
+			"auth-cmy": "https://my.example/v1",
+			"auth-cai": "https://ai.example/v1",
+		},
+		routeToName: routes,
+		nameToRoute: withRouteIndex(routes),
+		providerOrder: map[string][]string{
+			"modelscope":    {"auth-cms"},
+			"modelscope-my": {"auth-cmy"},
+			"modelscope-ai": {"auth-cai"},
+		},
+		at: time.Now(),
+	}
+	resolvedMu.Unlock()
+}
+
+func responsesTestRequest(model string) executorRequestWithCallback {
+	return executorRequestWithCallback{
+		ExecutorRequest: pluginapi.ExecutorRequest{
+			Model:           model,
+			SourceFormat:    "openai-response",
+			Stream:          false,
+			OriginalRequest: []byte(`{"model":"` + model + `","input":"hi"}`),
+			Headers:         http.Header{},
+		},
+		HostCallbackID: "test-cb",
+	}
+}
+
+func TestResolveProviderModelCrossProviderAlias(t *testing.T) {
+	setTestPluginConfig("modelscope", "modelscope-my", "modelscope-ai")
+	setTestResolvedAliasCollision()
+
+	cases := []struct {
+		provider     string
+		requested    string
+		wantUpstream string
+		wantRoute    string
+	}{
+		{"modelscope", "deepseek-v4-pro", "deepseek-ai/DeepSeek-V4-Pro-0813", "deepseek-v4-pro"},
+		// 回归点：modelscope-my 也提供同一个模型，只是名字叫 glm-5.2，因此它自己的索引看不到请求的别名。
+		{"modelscope-my", "deepseek-v4-pro", "deepseek-ai/DeepSeek-V4-Pro-0813", "glm-5.2"},
+		{"modelscope-my", "glm-5.2", "deepseek-ai/DeepSeek-V4-Pro-0813", "glm-5.2"},
+		{"modelscope-ai", "glm-5.2", "zai-org/GLM-5.2", "glm-5.2"},
+		// 完全不提供该模型的 provider 解析结果为空：把客户端别名转发过去只会换来一个 Invalid model id。
+		{"modelscope-ai", "Qwen3.8-Flash-Next", "", ""},
+		{"modelscope", "Qwen3.8-Flash-Next", "Qwen/Qwen3.8-Flash-Next", "Qwen3.8-Flash-Next"},
+		// 三家都不认识的模型：同样没有可发往上游的名字。
+		{"modelscope", "no-such-model", "", ""},
+	}
+	for _, tt := range cases {
+		upstream, route := resolveProviderModel(getResolved(), tt.provider, tt.requested)
+		if upstream != tt.wantUpstream || route != tt.wantRoute {
+			t.Fatalf("resolveProviderModel(%q, %q) = (%q, %q), want (%q, %q)",
+				tt.provider, tt.requested, upstream, route, tt.wantUpstream, tt.wantRoute)
+		}
+	}
+}
+
+// 复现抓包到的失败：第一家答 429，重试第二家时过去会发出客户端别名，因为那一家把同一个上游模型注册成
+// 了另一个别名。
+func TestExecuteResponsesPassthroughRetryUsesCanonicalModel(t *testing.T) {
+	setTestPluginConfig("modelscope", "modelscope-my")
+	pluginCfg.SkipProviderOn429 = false
+	pluginCfg.UseResponses = []string{"deepseek-ai/DeepSeek-V4-Pro-0813"}
+	setTestResolvedAliasCollision()
+
+	origHTTP := hostHTTPDo
+	origModel := hostModelExecute
+	t.Cleanup(func() { hostHTTPDo = origHTTP; hostModelExecute = origModel })
+
+	var sentModels []string
+	var sentURLs []string
+	hostHTTPDo = func(req pluginapi.HTTPRequest, _ string) (hostHTTPResponse, error) {
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.Unmarshal(req.Body, &body)
+		sentModels = append(sentModels, body.Model)
+		sentURLs = append(sentURLs, req.URL)
+		if len(sentModels) == 1 {
+			// 用一个普通 429：写 insufficient balance 会把这把凭据当天禁用，并把该状态泄漏给后续用例。
+			return hostHTTPResponse{StatusCode: 429, Body: []byte(`{"error":{"message":"Too many requests"}}`)}, nil
+		}
+		return hostHTTPResponse{StatusCode: 200, Body: []byte(`{"id":"resp-second","object":"response"}`)}, nil
+	}
+	hostModelExecute = func(req executorRequestWithCallback) (pluginapi.HostModelExecutionResponse, error) {
+		t.Fatalf("host chat fallback must not run once the second provider answers, model=%s", req.Model)
+		return pluginapi.HostModelExecutionResponse{}, nil
+	}
+
+	resp, err := executeResponsesPassthrough(responsesTestRequest("deepseek-v4-pro"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(resp.Payload) != `{"id":"resp-second","object":"response"}` {
+		t.Fatalf("unexpected payload: %s", string(resp.Payload))
+	}
+	want := "deepseek-ai/DeepSeek-V4-Pro-0813"
+	if len(sentModels) != 2 {
+		t.Fatalf("expected two upstream attempts, got %v (%v)", sentModels, sentURLs)
+	}
+	if sentModels[0] != want || sentModels[1] != want {
+		t.Fatalf("both attempts must carry the upstream model name, got %v", sentModels)
+	}
+}
+
+// 校验另一半：不提供该模型的托管 provider 会被跳过，请求仍然能到达提供它的那一家，而不是死在 Invalid
+// model id 上。
+func TestExecuteResponsesPassthroughSkipsProviderWithoutModel(t *testing.T) {
+	// 先试 modelscope-ai，它根本不提供这个 Qwen 模型。
+	setTestPluginConfig("modelscope-ai", "modelscope")
+	pluginCfg.SkipProviderOn429 = false
+	pluginCfg.UseResponses = []string{"*"}
+	setTestResolvedAliasCollision()
+
+	origHTTP := hostHTTPDo
+	origModel := hostModelExecute
+	t.Cleanup(func() { hostHTTPDo = origHTTP; hostModelExecute = origModel })
+
+	var sentModels []string
+	var sentURLs []string
+	hostHTTPDo = func(req pluginapi.HTTPRequest, _ string) (hostHTTPResponse, error) {
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.Unmarshal(req.Body, &body)
+		sentModels = append(sentModels, body.Model)
+		sentURLs = append(sentURLs, req.URL)
+		return hostHTTPResponse{StatusCode: 200, Body: []byte(`{"id":"resp-ok","object":"response"}`)}, nil
+	}
+	hostModelExecute = func(req executorRequestWithCallback) (pluginapi.HostModelExecutionResponse, error) {
+		t.Fatalf("a provider that cannot serve the model must be skipped, not answered via host, model=%s", req.Model)
+		return pluginapi.HostModelExecutionResponse{}, nil
+	}
+
+	resp, err := executeResponsesPassthrough(responsesTestRequest("Qwen3.8-Flash-Next"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if string(resp.Payload) != `{"id":"resp-ok","object":"response"}` {
+		t.Fatalf("unexpected payload: %s", string(resp.Payload))
+	}
+	// 修复前第一步就把客户端别名原样发出去，上游回 400 Invalid model id，而这个不可重试的状态码会让整个请
+	// 求终止。
+	if len(sentModels) != 1 || sentModels[0] != "Qwen/Qwen3.8-Flash-Next" {
+		t.Fatalf("only the serving provider may be called, with the upstream name: %v (%v)", sentModels, sentURLs)
+	}
+}
+
+// 两家 provider 都提供同一个上游模型，各自用自己的路由 ID；alpha 家有两把凭据。
+func setTestResolvedTwoKeyProviders() {
+	routes := map[string]map[string]string{
+		"alpha": {"shared-a": "vendor/Shared-Model"},
+		"beta":  {"shared-b": "vendor/Shared-Model"},
+	}
+	resolvedMu.Lock()
+	resolvedCache = resolvedEntry{
+		raw:         map[string]string{"a1": "key-a1", "a2": "key-a2", "b1": "key-b1"},
+		baseURL:     map[string]string{"a1": "https://alpha.example/v1", "a2": "https://alpha.example/v1", "b1": "https://beta.example/v1"},
+		routeToName: routes,
+		nameToRoute: withRouteIndex(routes),
+		providerOrder: map[string][]string{
+			"alpha": {"a1", "a2"},
+			"beta":  {"b1"},
+		},
+		at: time.Now(),
+	}
+	resolvedMu.Unlock()
+}
+
+// 已禁用的凭据不能被当作这一家的应答，必须先轮换到同一家还活着的 key。
+func TestResolveStepAvoidsDisabledKeys(t *testing.T) {
+	origStore := store
+	store = modelscope.NewStore(stderrLogger{})
+	t.Cleanup(func() { store = origStore })
+
+	setTestPluginConfig("alpha", "beta")
+	setTestResolvedTwoKeyProviders()
+
+	store.DisableGlobal("a1", "vendor/Shared-Model", store.Now())
+	cand, ok := resolveStep(retryStep{provider: "alpha"}, getResolved(), "shared-a")
+	if !ok {
+		t.Fatal("resolveStep must succeed with the provider's remaining key")
+	}
+	if cand.authID != "a2" {
+		t.Fatalf("resolveStep picked %q, want the undisabled key a2", cand.authID)
+	}
+
+	// 全部 key 都被禁用：这一家确实没有可用凭据了。
+	store.DisableGlobal("a2", "vendor/Shared-Model", store.Now())
+	if _, ok := resolveStep(retryStep{provider: "alpha"}, getResolved(), "shared-a"); ok {
+		t.Fatal("resolveStep must report no candidate once all keys are disabled")
+	}
+}
+
+// 这就是被报出来的那个 bug：skip_provider_on_429 下每家只有一步，key 游标在成功时也会前进，于是落在
+// 一把当天被禁用的 key 上就会让整家作废，请求因此跳到第二家，而第一家其实还有可用凭据。
+func TestExecuteResponsesPassthroughDisabledKeyKeepsFirstProvider(t *testing.T) {
+	origStore := store
+	store = modelscope.NewStore(stderrLogger{})
+	t.Cleanup(func() { store = origStore })
+
+	setTestPluginConfig("alpha", "beta")
+	pluginCfg.SkipProviderOn429 = true
+	pluginCfg.UseResponses = []string{"vendor/Shared-Model"}
+	setTestResolvedTwoKeyProviders()
+	store.DisableGlobal("a1", "vendor/Shared-Model", store.Now())
+
+	origHTTP := hostHTTPDo
+	origModel := hostModelExecute
+	t.Cleanup(func() { hostHTTPDo = origHTTP; hostModelExecute = origModel })
+
+	type attempt struct {
+		url  string
+		auth string
+	}
+	var attempts []attempt
+	hostHTTPDo = func(req pluginapi.HTTPRequest, _ string) (hostHTTPResponse, error) {
+		attempts = append(attempts, attempt{url: req.URL, auth: req.Headers.Get("Authorization")})
+		return hostHTTPResponse{StatusCode: 200, Body: []byte(`{"id":"resp-alpha"}`)}, nil
+	}
+	hostModelExecute = func(r executorRequestWithCallback) (pluginapi.HostModelExecutionResponse, error) {
+		t.Fatalf("no host fallback expected, model=%s", r.Model)
+		return pluginapi.HostModelExecutionResponse{}, nil
+	}
+
+	if _, err := executeResponsesPassthrough(responsesTestRequest("shared-a")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(attempts) != 1 {
+		t.Fatalf("expected a single upstream attempt, got %+v", attempts)
+	}
+	if attempts[0].url != "https://alpha.example/v1/responses" || attempts[0].auth != "Bearer key-a2" {
+		t.Fatalf("first provider must be served by its remaining live key, got %+v", attempts[0])
 	}
 }

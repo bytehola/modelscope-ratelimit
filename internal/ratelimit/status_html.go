@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// nextMidnight returns the next 00:00 in loc strictly after now.
+// nextMidnight 返回时区 loc 下严格晚于 now 的下一个 00:00。
 func nextMidnight(now time.Time, loc *time.Location) time.Time {
 	n := now.In(loc)
 	y, m, d := n.Date()
@@ -17,22 +17,20 @@ func nextMidnight(now time.Time, loc *time.Location) time.Time {
 type GuidanceReason int
 
 const (
-	// GuidanceMissing is shown when providers or management_key is empty.
+	// GuidanceMissing：providers 或 management_key 为空时展示。
 	GuidanceMissing GuidanceReason = iota
-	// GuidanceResolutionFailed is shown when server-side resolution failed
-	// (wrong management_key, unreachable host_base_url, etc.).
+	// GuidanceResolutionFailed：服务端解析凭据失败时展示（management_key 错误、
+	// host_base_url 不可达等）。
 	GuidanceResolutionFailed
-	// GuidanceProviderNotFound is shown when none of the configured providers
-	// matches an openai-compatibility entry upstream.
+	// GuidanceProviderNotFound：配置里的 provider 一个都匹配不到上游
+	// openai-compatibility 条目时展示。
 	GuidanceProviderNotFound
 )
 
-// RenderGuidanceHTML renders the configuration guide. It always directs the
-// operator to the management center's "插件管理 → 编辑配置" instead of
-// hand-editing config.yaml. detail carries an extra hint (the resolution
-// error, or the comma-joined unmatched provider list). The page auto-refreshes
-// every 15s so it transitions to the status page once the config is fixed and
-// the plugin is reloaded (reconfigure clears the resolution cache).
+// RenderGuidanceHTML 渲染配置引导页。它始终把运维指引到管理中心的“插件管理 → 编辑配置”，而不
+// 是让人手改 config.yaml。detail 用于附带一条额外提示（解析错误，或用逗号连接的未匹配 provider
+// 列表）。页面每 15 秒自动刷新，所以配置改好、插件重载之后（reconfigure 会清理解析缓存）就会自
+// 动切到状态页。
 func RenderGuidanceHTML(cfg *Config, reason GuidanceReason, detail string) string {
 	hostBase := "http://127.0.0.1:8317"
 	if cfg != nil && cfg.HostBaseURL != "" {
@@ -72,7 +70,7 @@ func RenderGuidanceHTML(cfg *Config, reason GuidanceReason, detail string) strin
 	b.WriteString(`<div class="title">Modelscope 限流</div>`)
 	b.WriteString(`<div class="sub">配置引导 · 在管理中心保存配置后自动重载</div>`)
 
-	// Notice card: the specific reason this guide is shown.
+	// 提示卡片：说明本次为什么展示这个引导页。
 	switch reason {
 	case GuidanceResolutionFailed:
 		b.WriteString(`<div class="notice"><div class="nh err">服务端解析失败</div>`)
@@ -85,7 +83,7 @@ func RenderGuidanceHTML(cfg *Config, reason GuidanceReason, detail string) strin
 		b.WriteString(`<div class="notice"><div class="nh err">providers 设置错误</div>`)
 		fmt.Fprintf(&b, `<div class="nd">未找到与 <code>%s</code> 匹配的 openai 提供商。</div>`, html.EscapeString(detail))
 		b.WriteString(`</div>`)
-	default: // GuidanceMissing
+	default: // GuidanceMissing（缺少必填配置）
 		b.WriteString(`<div class="notice"><div class="nh warn">尚未配置</div>`)
 		b.WriteString(`<div class="nd">尚未配置 <code>providers</code> 或 <code>management_key</code>，状态页暂不可用。</div>`)
 		b.WriteString(`</div>`)

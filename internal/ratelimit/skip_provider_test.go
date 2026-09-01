@@ -6,12 +6,10 @@ import (
 	"time"
 )
 
-// skip_provider_on_429 mode: a managed insufficient_quota 429 adds the
-// provider to a per-provider skip set; subsequent SchedulerPick calls filter
-// out candidates from that provider. The set is latching: it persists across
-// non-managed failures so all non-managed keys are tried consecutively before
-// falling back to managed. Cleared by any 200. The managed key that 429'd
-// is NOT daily-disabled (stays available for future probes).
+// skip_provider_on_429 模式：托管凭据返回 insufficient_quota 的 429 时，把该 provider 加入按
+// provider 维护的跳过集合；后续 SchedulerPick 会过滤掉这一家的候选。集合是 latch 的：非托管失
+// 败不会让它失效，于是非托管 key 会被连续试完才回到托管。任意 200 清空。返回 429 的那把托管
+// key 不会被日禁用（以便日后重新探测）。
 func TestSkipProviderOn429JumpsToNonManaged(t *testing.T) {
 	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
 	s, _ := newTestStore(now)
@@ -28,7 +26,7 @@ func TestSkipProviderOn429JumpsToNonManaged(t *testing.T) {
 		}
 	}
 
-	// 1st pick: no 429 yet -> managed.
+	// 第 1 次挑选：还没有 429 -> 选托管。
 	r1, err := s.SchedulerPick(mkReq(
 		Candidate{ID: "m-1", Provider: "modelscope", Priority: 1},
 		Candidate{ID: "a-1", Provider: "aliyun", Priority: 1},
@@ -37,8 +35,8 @@ func TestSkipProviderOn429JumpsToNonManaged(t *testing.T) {
 		t.Fatalf("1st pick: expected managed m-1, got %+v err=%v", r1, err)
 	}
 
-	// Managed 429 (insufficient_quota) -> add "modelscope" to skip set.
-	// With SkipProviderOn429, the key must NOT be daily-disabled.
+	// 托管 429（insufficient_quota）-> 把 "modelscope" 加入跳过集合。
+	// 开启 SkipProviderOn429 时，这把 key 不应被日禁用。
 	s.OnUsage(UsageRecord{
 		AuthID:          "m-1",
 		Provider:        "modelscope",
@@ -55,8 +53,8 @@ func TestSkipProviderOn429JumpsToNonManaged(t *testing.T) {
 		t.Fatal("managed 429 key must NOT be daily-disabled in skip_provider_on_429 mode")
 	}
 
-	// 2nd pick (retry): modelscope skipped -> pick non-managed a-1.
-	// Latching: skip set NOT consumed.
+	// 第 2 次挑选（重试）：跳过 modelscope -> 选非托管的 a-1。
+	// latch 语义：跳过集合不会被这次挑选消耗掉。
 	r2, err := s.SchedulerPick(mkReq(
 		Candidate{ID: "m-2", Provider: "modelscope", Priority: 1},
 		Candidate{ID: "a-1", Provider: "aliyun", Priority: 1},
@@ -68,8 +66,8 @@ func TestSkipProviderOn429JumpsToNonManaged(t *testing.T) {
 		t.Fatal("skip set must persist after the skip pick (latching, not consumed)")
 	}
 
-	// 3rd pick: modelscope still in skip set -> skip managed again, pick
-	// non-managed. This is the key difference from one-shot: no interleaving.
+	// 第 3 次挑选：modelscope 仍在跳过集合里 -> 再次跳过托管，选非托管。这正是与“一次性标
+	// 记”的关键差别：不会穿插回托管。
 	r3, err := s.SchedulerPick(mkReq(
 		Candidate{ID: "m-2", Provider: "modelscope", Priority: 1},
 		Candidate{ID: "a-1", Provider: "aliyun", Priority: 1},
@@ -79,9 +77,8 @@ func TestSkipProviderOn429JumpsToNonManaged(t *testing.T) {
 	}
 }
 
-// skip_provider_on_429 arms ONLY on insufficient_quota 429s. Other 429 body
-// types (limit_burst_rate, exceeded-today) do NOT add to the skip set --
-// they fall through to normal daily-disable + cooldown handling.
+// skip_provider_on_429 只在 insufficient_quota 的 429 上武装自己。其他 429 类型
+// （limit_burst_rate、exceeded-today）不会加入跳过集合，而是走常规的日禁用 + 冷却处理。
 func TestSkipProviderOn429Any429Body(t *testing.T) {
 	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
 	s, _ := newTestStore(now)
@@ -89,7 +86,7 @@ func TestSkipProviderOn429Any429Body(t *testing.T) {
 	cfg.SkipProviderOn429 = true
 	s.Reconfigure(cfg)
 
-	// insufficient_quota 429 -> add to skip set.
+	// insufficient_quota 的 429 -> 加入跳过集合。
 	s.OnUsage(UsageRecord{
 		AuthID:   "m-1",
 		Provider: "modelscope",
@@ -102,8 +99,8 @@ func TestSkipProviderOn429Any429Body(t *testing.T) {
 		t.Fatal("insufficient_quota 429 must add provider to skip set")
 	}
 
-	// Non-insufficient_quota 429 (limit_burst_rate) -> must NOT add to skip set.
-	s.ClearAllSkippedProviders() // reset for next check
+	// 非 insufficient_quota 的 429（limit_burst_rate）-> 绝不能加入跳过集合。
+	s.ClearAllSkippedProviders() // 为下一次检查复位
 	s.OnUsage(UsageRecord{
 		AuthID:          "m-2",
 		Provider:        "modelscope",
@@ -116,15 +113,14 @@ func TestSkipProviderOn429Any429Body(t *testing.T) {
 	if s.HasSkippedProviders() {
 		t.Fatal("limit_burst_rate 429 must NOT add to skip set (only insufficient_quota does)")
 	}
-	// limit_burst_rate 429 must NOT daily-disable (only 429 + "insufficient balance"
-	// triggers the magic-cube-exhausted daily disable).
+	// limit_burst_rate 的 429 不应触发日禁用（只有 429 + "insufficient balance" 才会因为魔粒
+	// 耗尽而日禁用）。
 	if s.isDisabled("m-2", "Qwen-72B", now) {
 		t.Fatal("limit_burst_rate 429 must not daily-disable")
 	}
 }
 
-// Latching: non-managed failure does NOT clear the skip set. All non-managed
-// keys are tried consecutively before falling back to managed.
+// latch 语义：非托管失败不会清空跳过集合，因此非托管 key 会被连续试完才回到托管。
 func TestSkipProviderLatchingNonManagedFailures(t *testing.T) {
 	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
 	s, _ := newTestStore(now)
@@ -141,7 +137,7 @@ func TestSkipProviderLatchingNonManagedFailures(t *testing.T) {
 		}
 	}
 
-	// 1st pick: managed.
+	// 第 1 次挑选：托管。
 	r1, _ := s.SchedulerPick(mkReq(
 		Candidate{ID: "m-1", Provider: "modelscope", Priority: 1},
 		Candidate{ID: "b-1", Provider: "aliyun", Priority: 1},
@@ -151,7 +147,7 @@ func TestSkipProviderLatchingNonManagedFailures(t *testing.T) {
 		t.Fatalf("1st pick: expected m-1, got %s", r1.AuthID)
 	}
 
-	// Managed 429 -> add to skip set.
+	// 托管 429 -> 加入跳过集合。
 	s.OnUsage(UsageRecord{
 		AuthID:   "m-1",
 		Provider: "modelscope",
@@ -161,8 +157,8 @@ func TestSkipProviderLatchingNonManagedFailures(t *testing.T) {
 		Failure:  &UsageFailure{StatusCode: 429, Body: `{"error":{"code":"insufficient_quota"}}`},
 	})
 
-	// b-1 tried (simulated host retry): candidates shrink to m-2, b-2.
-	// Skip set latching -> still skip modelscope -> pick b-2.
+	// b-1 已试过（模拟宿主重试）：候选收缩为 m-2、b-2。
+	// 跳过集合仍在 -> 继续跳过 modelscope -> 选 b-2。
 	r2, _ := s.SchedulerPick(mkReq(
 		Candidate{ID: "m-2", Provider: "modelscope", Priority: 1},
 		Candidate{ID: "b-2", Provider: "aliyun", Priority: 1},
@@ -174,7 +170,7 @@ func TestSkipProviderLatchingNonManagedFailures(t *testing.T) {
 		t.Fatal("skip set must persist after non-managed pick (latching)")
 	}
 
-	// All non-managed exhausted: only managed left -> defer to host.
+	// 非托管已全部耗尽：只剩托管 -> 让位给宿主。
 	r3, err := s.SchedulerPick(mkReq(
 		Candidate{ID: "m-2", Provider: "modelscope", Priority: 1},
 	))
@@ -183,8 +179,7 @@ func TestSkipProviderLatchingNonManagedFailures(t *testing.T) {
 	}
 }
 
-// Any 200 (managed or non-managed) clears the skip set so the next request
-// probes the free managed quota again.
+// 任意 200（托管或非托管）都会清空跳过集合，让下一次请求重新探测免费的托管额度。
 func TestSkipProviderAny200ClearsFlag(t *testing.T) {
 	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
 	s, _ := newTestStore(now)
@@ -192,7 +187,7 @@ func TestSkipProviderAny200ClearsFlag(t *testing.T) {
 	cfg.SkipProviderOn429 = true
 	s.Reconfigure(cfg)
 
-	// Arm the skip set via managed 429.
+	// 用一次托管 429 武装跳过集合。
 	s.OnUsage(UsageRecord{
 		AuthID:   "m-1",
 		Provider: "modelscope",
@@ -205,8 +200,7 @@ func TestSkipProviderAny200ClearsFlag(t *testing.T) {
 		t.Fatal("skip set must be armed after managed 429")
 	}
 
-	// Non-managed 200 -> clears skip set (prioritise free quota: next request
-	// tries managed first).
+	// 非托管 200 -> 清空跳过集合（优先用免费额度：下一次请求先试托管）。
 	s.OnUsage(UsageRecord{
 		AuthID:   "a-1",
 		Provider: "aliyun",
@@ -218,7 +212,7 @@ func TestSkipProviderAny200ClearsFlag(t *testing.T) {
 		t.Fatal("any 200 must clear the skip set (non-managed 200 included)")
 	}
 
-	// Re-arm, then managed 200 also clears.
+	// 重新武装，随后托管 200 同样会清空。
 	s.SetSkipProvider("modelscope")
 	s.OnUsage(UsageRecord{
 		AuthID:   "m-1",
@@ -232,7 +226,7 @@ func TestSkipProviderAny200ClearsFlag(t *testing.T) {
 	}
 }
 
-// Non-managed failure does NOT touch the skip set (stays armed if set).
+// 非托管失败不碰跳过集合（已武装时保持原样）。
 func TestSkipProviderNonManagedFailureDoesNotClear(t *testing.T) {
 	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
 	s, _ := newTestStore(now)
@@ -240,10 +234,10 @@ func TestSkipProviderNonManagedFailureDoesNotClear(t *testing.T) {
 	cfg.SkipProviderOn429 = true
 	s.Reconfigure(cfg)
 
-	// Arm the skip set.
+	// 武装跳过集合。
 	s.SetSkipProvider("modelscope")
 
-	// Non-managed failure (429) -> skip set must stay armed.
+	// 非托管失败（429）-> 跳过集合必须保持武装。
 	s.OnUsage(UsageRecord{
 		AuthID:   "a-1",
 		Provider: "aliyun",
@@ -257,10 +251,8 @@ func TestSkipProviderNonManagedFailureDoesNotClear(t *testing.T) {
 	}
 }
 
-// When all managed candidates are tried (managed==0 in SchedulerPick), the
-// skip set is cleared so the next request starts fresh and probes the free
-// managed quota again. This prevents the set from getting stuck when every
-// candidate (managed + non-managed) fails.
+// 当所有托管候选都已试过（SchedulerPick 里 managed==0）时清空跳过集合，让下一次请求重新开始、
+// 重新探测免费的托管额度。这样可以避免在托管和非托管全部失败时，集合被永久卡住。
 func TestSkipProviderFlagClearedWhenAllManagedTried(t *testing.T) {
 	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
 	s, _ := newTestStore(now)
@@ -277,7 +269,7 @@ func TestSkipProviderFlagClearedWhenAllManagedTried(t *testing.T) {
 		}
 	}
 
-	// 1st pick: managed m-1.
+	// 第 1 次挑选：托管 m-1。
 	r1, _ := s.SchedulerPick(mkReq(
 		Candidate{ID: "m-1", Provider: "modelscope", Priority: 1},
 		Candidate{ID: "b-1", Provider: "aliyun", Priority: 1},
@@ -286,7 +278,7 @@ func TestSkipProviderFlagClearedWhenAllManagedTried(t *testing.T) {
 		t.Fatalf("1st pick: expected m-1, got %s", r1.AuthID)
 	}
 
-	// Managed 429 -> arm skip set.
+	// 托管 429 -> 武装跳过集合。
 	s.OnUsage(UsageRecord{
 		AuthID:   "m-1",
 		Provider: "modelscope",
@@ -299,8 +291,7 @@ func TestSkipProviderFlagClearedWhenAllManagedTried(t *testing.T) {
 		t.Fatal("skip set must be armed after managed 429")
 	}
 
-	// 2nd pick: m-1 tried -> only non-managed left -> managed==0 -> skip set
-	// cleared, defer to host.
+	// 第 2 次挑选：m-1 已试过 -> 只剩非托管 -> managed==0 -> 清空跳过集合并让位给宿主。
 	r2, err := s.SchedulerPick(mkReq(
 		Candidate{ID: "b-1", Provider: "aliyun", Priority: 1},
 	))
@@ -312,10 +303,9 @@ func TestSkipProviderFlagClearedWhenAllManagedTried(t *testing.T) {
 	}
 }
 
-// When skip set is armed and the route has NO non-managed provider, the
-// plugin fails fast (returns ErrAllCredentialsDisabled) instead of falling
-// through to try remaining managed keys (which would all 429 on the same
-// pool). The skip set is cleared so the next request probes managed again.
+// 当跳过集合已武装、而该 route 又没有任何非托管 provider 时，插件快速失败（返回
+// ErrAllCredentialsDisabled），而不是继续去试剩下的托管 key（它们会在同一个资源池上全部 429）。
+// 同时清空跳过集合，让下一次请求重新探测托管。
 func TestSkipProviderNoNonManagedFailsFast(t *testing.T) {
 	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
 	s, _ := newTestStore(now)
@@ -326,14 +316,14 @@ func TestSkipProviderNoNonManagedFailsFast(t *testing.T) {
 	mkReq := func(cands ...Candidate) SchedulerPickRequest {
 		return SchedulerPickRequest{
 			Provider: "modelscope",
-			// No non-managed provider in the route.
+			// 该 route 上没有非托管 provider。
 			Providers:  []string{"modelscope"},
 			Model:      "Qwen-72B",
 			Candidates: cands,
 		}
 	}
 
-	// 1st pick: skip set empty -> normal managed pick.
+	// 第 1 次挑选：跳过集合为空 -> 正常挑托管。
 	r1, err := s.SchedulerPick(mkReq(
 		Candidate{ID: "m-1", Provider: "modelscope", Priority: 1},
 		Candidate{ID: "m-2", Provider: "modelscope", Priority: 1},
@@ -343,7 +333,7 @@ func TestSkipProviderNoNonManagedFailsFast(t *testing.T) {
 		t.Fatalf("1st pick: expected m-1, got %+v err=%v", r1, err)
 	}
 
-	// Managed 429 -> arm skip set.
+	// 托管 429 -> 武装跳过集合。
 	s.OnUsage(UsageRecord{
 		AuthID:   "m-1",
 		Provider: "modelscope",
@@ -356,7 +346,7 @@ func TestSkipProviderNoNonManagedFailsFast(t *testing.T) {
 		t.Fatal("skip set must be armed after managed 429")
 	}
 
-	// 2nd pick: skip set armed, no non-managed -> fail fast + clear.
+	// 第 2 次挑选：跳过集合已武装且无非托管 -> 快速失败并清空。
 	_, err = s.SchedulerPick(mkReq(
 		Candidate{ID: "m-2", Provider: "modelscope", Priority: 1},
 		Candidate{ID: "m-3", Provider: "modelscope", Priority: 1},
@@ -371,8 +361,8 @@ func TestSkipProviderNoNonManagedFailsFast(t *testing.T) {
 		t.Fatal("skip set must be cleared after fail-fast error so next request probes managed")
 	}
 
-	// 3rd pick: skip set cleared -> normal managed pick again (probe recovery).
-	// Round-robin cursor advanced past m-1, so the next managed pick is m-2.
+	// 第 3 次挑选：跳过集合已清空 -> 重新正常挑托管（探测是否恢复）。
+	// 轮询游标已经越过 m-1，所以这次拿到的是 m-2。
 	r3, err := s.SchedulerPick(mkReq(
 		Candidate{ID: "m-1", Provider: "modelscope", Priority: 1},
 		Candidate{ID: "m-2", Provider: "modelscope", Priority: 1},
@@ -382,8 +372,8 @@ func TestSkipProviderNoNonManagedFailsFast(t *testing.T) {
 	}
 }
 
-// Per-provider granularity: when modelscope 429s, modelscope-my (also managed)
-// is NOT skipped and its candidates are still available.
+// 粒度是 provider：modelscope 返回 429 时，同样托管的 modelscope-my 不会被跳过，它的候选仍然可
+// 用。
 func TestSkipProviderPerProviderGranularity(t *testing.T) {
 	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
 	s, _ := newTestStore(now)
@@ -400,7 +390,7 @@ func TestSkipProviderPerProviderGranularity(t *testing.T) {
 		}
 	}
 
-	// 1st pick: no skip -> pick modelscope (first in config order).
+	// 第 1 次挑选：没有跳过记录 -> 选 modelscope（配置里的第一家）。
 	r1, _ := s.SchedulerPick(mkReq(
 		Candidate{ID: "m-1", Provider: "modelscope", Priority: 1},
 		Candidate{ID: "my-1", Provider: "modelscope-my", Priority: 1},
@@ -410,7 +400,7 @@ func TestSkipProviderPerProviderGranularity(t *testing.T) {
 		t.Fatalf("1st pick: expected m-1, got %s", r1.AuthID)
 	}
 
-	// modelscope 429 -> add "modelscope" to skip set (NOT "modelscope-my").
+	// modelscope 429 -> 只把 "modelscope" 加入跳过集合（不含 "modelscope-my"）。
 	s.OnUsage(UsageRecord{
 		AuthID:   "m-1",
 		Provider: "modelscope",
@@ -426,7 +416,7 @@ func TestSkipProviderPerProviderGranularity(t *testing.T) {
 		t.Fatal("modelscope-my must NOT be in skip set (per-provider granularity)")
 	}
 
-	// 2nd pick: modelscope skipped, modelscope-my NOT skipped -> pick my-1.
+	// 第 2 次挑选：跳过 modelscope，而 modelscope-my 未被跳过 -> 选 my-1。
 	r2, _ := s.SchedulerPick(mkReq(
 		Candidate{ID: "m-2", Provider: "modelscope", Priority: 1},
 		Candidate{ID: "my-1", Provider: "modelscope-my", Priority: 1},
@@ -436,7 +426,7 @@ func TestSkipProviderPerProviderGranularity(t *testing.T) {
 		t.Fatalf("2nd pick: expected modelscope-my my-1 (modelscope skipped, my not), got %s", r2.AuthID)
 	}
 
-	// modelscope-my 200 -> clears ALL skip entries -> modelscope available again.
+	// modelscope-my 返回 200 -> 清空所有跳过条目 -> modelscope 重新可用。
 	s.OnUsage(UsageRecord{
 		AuthID:   "my-1",
 		Provider: "modelscope-my",
@@ -449,8 +439,7 @@ func TestSkipProviderPerProviderGranularity(t *testing.T) {
 	}
 }
 
-// When both managed providers are skipped and non-managed is available,
-// the plugin falls through to non-managed.
+// 两家托管 provider 都被跳过、同时存在非托管候选时，插件落到非托管上。
 func TestSkipProviderAllManagedSkippedFallsToNonManaged(t *testing.T) {
 	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
 	s, _ := newTestStore(now)
@@ -458,7 +447,7 @@ func TestSkipProviderAllManagedSkippedFallsToNonManaged(t *testing.T) {
 	cfg.SkipProviderOn429 = true
 	s.Reconfigure(cfg)
 
-	// Both providers in skip set.
+	// 两家 provider 都在跳过集合里。
 	s.SetSkipProvider("modelscope")
 	s.SetSkipProvider("modelscope-my")
 
@@ -471,7 +460,7 @@ func TestSkipProviderAllManagedSkippedFallsToNonManaged(t *testing.T) {
 		}
 	}
 
-	// All managed skipped -> availableCount=0 -> pick non-managed.
+	// 托管全被跳过 -> availableCount=0 -> 选非托管。
 	r, _ := s.SchedulerPick(mkReq(
 		Candidate{ID: "m-1", Provider: "modelscope", Priority: 1},
 		Candidate{ID: "my-1", Provider: "modelscope-my", Priority: 1},

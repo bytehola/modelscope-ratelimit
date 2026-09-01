@@ -1,20 +1,20 @@
 package ratelimit
 
-// The structs in this file mirror the JSON wire format documented in
-// docs/cn/plugin. Field names and shapes are taken verbatim from:
-//   - scheduler.md            (SchedulerPickRequest/Response, Candidate)
-//   - response-interceptor.md (ResponseInterceptRequest/Response)
-//   - response-stream-interceptor.md (StreamChunkInterceptRequest/Response)
-//   - usage-plugin.md         (UsageRecord, UsageFailure)
-// They carry json tags so the SDK glue can (un)marshal them directly.
+// 本文件的结构体逐字段镜像仓库 docs/cn/plugin/ 里约定的 JSON 线上格式，字段名与
+// 形状均按原样取自：
+//   - scheduler.md            （SchedulerPickRequest/Response、Candidate）
+//   - response-interceptor.md （ResponseInterceptRequest/Response）
+//   - response-stream-interceptor.md（StreamChunkInterceptRequest/Response）
+//   - usage-plugin.md         （UsageRecord、UsageFailure）
+// 结构体带 json tag，SDK 胶水层可以直接序列化/反序列化。
 
-// SchedulerOptions is the Options sub-object of a scheduler request.
+// SchedulerOptions 是 scheduler 请求里的 Options 子对象。
 type SchedulerOptions struct {
 	Headers  map[string][]string `json:"Headers,omitempty"`
 	Metadata map[string]any      `json:"Metadata,omitempty"`
 }
 
-// Candidate is a single credential record offered to the scheduler.
+// Candidate 是宿主交给调度器的单条凭据记录。
 type Candidate struct {
 	ID         string         `json:"ID"`
 	Provider   string         `json:"Provider"`
@@ -24,7 +24,7 @@ type Candidate struct {
 	Metadata   map[string]any `json:"Metadata,omitempty"`
 }
 
-// SchedulerPickRequest is the scheduler.pick request payload.
+// SchedulerPickRequest 是 scheduler.pick 的请求载荷。
 type SchedulerPickRequest struct {
 	Provider   string           `json:"Provider"`
 	Providers  []string         `json:"Providers,omitempty"`
@@ -34,19 +34,19 @@ type SchedulerPickRequest struct {
 	Candidates []Candidate      `json:"Candidates"`
 }
 
-// SchedulerPickResponse is the scheduler.pick result.
+// SchedulerPickResponse 是 scheduler.pick 的返回结果。
 //
-//   - Handled=true + AuthID:  pick this credential.
-//   - Handled=true + DelegateBuiltin: defer to the named built-in scheduler
-//     ("round-robin" or "fill-first").
-//   - Handled=false: do not handle this scheduling decision.
+//   - Handled=true + AuthID：使用该凭据。
+//   - Handled=true + DelegateBuiltin：交给指定的内置调度器
+//     （"round-robin" 或 "fill-first"）。
+//   - Handled=false：本次调度不由插件决定。
 type SchedulerPickResponse struct {
 	AuthID          string `json:"AuthID,omitempty"`
 	DelegateBuiltin string `json:"DelegateBuiltin,omitempty"`
 	Handled         bool   `json:"Handled"`
 }
 
-// ResponseInterceptRequest is the response.intercept_after request payload.
+// ResponseInterceptRequest 是 response.intercept_after 的请求载荷。
 type ResponseInterceptRequest struct {
 	SourceFormat    string              `json:"SourceFormat"`
 	Model           string              `json:"Model"`
@@ -61,16 +61,16 @@ type ResponseInterceptRequest struct {
 	Metadata        map[string]any      `json:"Metadata,omitempty"`
 }
 
-// ResponseInterceptResponse is the response.intercept_after result. Returning
-// it zero-valued means "no changes".
+// ResponseInterceptResponse 是 response.intercept_after 的返回结果。
+// 返回零值表示“不改动任何东西”。
 type ResponseInterceptResponse struct {
 	Headers      map[string][]string `json:"Headers,omitempty"`
 	Body         string              `json:"Body,omitempty"`
 	ClearHeaders []string            `json:"ClearHeaders,omitempty"`
 }
 
-// StreamChunkInterceptRequest is the response.intercept_stream_chunk payload.
-// ChunkIndex == -1 is the header-only initialisation call.
+// StreamChunkInterceptRequest 是 response.intercept_stream_chunk 的请求载荷。
+// ChunkIndex == -1 表示仅带响应头的初始化调用。
 type StreamChunkInterceptRequest struct {
 	SourceFormat    string              `json:"SourceFormat"`
 	Model           string              `json:"Model"`
@@ -85,7 +85,7 @@ type StreamChunkInterceptRequest struct {
 	Metadata        map[string]any      `json:"Metadata,omitempty"`
 }
 
-// StreamChunkInterceptResponse is the stream chunk interception result.
+// StreamChunkInterceptResponse 是分块流拦截的返回结果。
 type StreamChunkInterceptResponse struct {
 	Headers      map[string][]string `json:"Headers,omitempty"`
 	Body         string              `json:"Body,omitempty"`
@@ -93,7 +93,7 @@ type StreamChunkInterceptResponse struct {
 	DropChunk    bool                `json:"DropChunk"`
 }
 
-// UsageRecord is the usage.handle payload.
+// UsageRecord 是 usage.handle 的载荷。
 type UsageRecord struct {
 	Provider        string              `json:"Provider"`
 	ExecutorType    string              `json:"ExecutorType"`
@@ -113,7 +113,7 @@ type UsageRecord struct {
 	Failure         *UsageFailure       `json:"Failure,omitempty"`
 }
 
-// UsageFailure describes a failed request.
+// UsageFailure 描述一次失败请求。
 type UsageFailure struct {
 	StatusCode int    `json:"StatusCode"`
 	Body       string `json:"Body,omitempty"`
