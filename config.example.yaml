@@ -1,8 +1,6 @@
 # CLIProxyAPI 配置示例 — modelscope-ratelimit 插件
 # 将以下段落放入 config.yaml。
 
-# Modelscope 配置为 openai-compatibility 多 key provider；
-# 每个 api-key 为一个账户，name 即插件 providers 引用的名称。
 openai-compatibility:
   - name: "modelscope"
     disabled: false
@@ -30,14 +28,12 @@ plugins:
 
       # ---- 必填 ----
       providers: ["modelscope"] # 监控的 provider 名称；顺序决定轮换顺序。示例: ["modelscope", "modelscope-ai"]
-      skip_provider_on_429: false # 只影响池级 insufficient_quota（Chat 429 JSON 与 Responses 200+SSE 都算）和 405（该端点不被这一家接受）：开启=整家立即摘掉（推荐打开）；关闭=按 insufficient_quota_cooldown 逐 key 退避。Responses 的 rate_limit_exceeded 只是单把 key 被限，不摘 provider；两种模式都先在本家内换 key，本家用尽才切下一个 provider；任意 200 回到第一个 provider
+      skip_provider_on_429: false # 上游 429 时是否跳过该 provider，打开直接轮换到下一个。
       use_responses: "*" # 填上游模型 name（不是 alias）：
       #   "*" 或 "true"        全部模型走 Responses
       #   "false" / 留空 / 删除   关闭（任意匹配不到模型的字符串等同关闭）
       #   "Qwen/Qwen2.5-72B-Instruct"          仅该模型
-      #   '["Qwen/A", "Qwen/B"]' 或 "Qwen/A, Qwen/B"  多模型；管理面板把该字段当纯文本，所以字符串写法同样被拆成多个模型
-      #   ["Qwen/A", "Qwen/B"]   手改 config.yaml 时的 YAML 数组写法
-      # 未列入的托管 provider 由宿主按 providers 顺序以 Chat 协议兜底（配了 alias 的模型宿主只认 alias，插件内部已处理）
+      #   '["Qwen/A", "Qwen/B"]' 或 "Qwen/A, Qwen/B"  多模型
       host_base_url: "http://127.0.0.1:8317" # CPA 管理 API 地址，默认 127.0.0.1:8317
       management_key: "your-management-secret" # CPA 管理密钥，仅服务端使用
 
@@ -45,6 +41,7 @@ plugins:
       credential_strategy: "round-robin" # round-robin（轮询）| fill-first（填充优先）
       insufficient_quota_cooldown: 0.1 # 退避基准秒数，×2 递增封顶 60s，无抖动；0 = 跳过冷却立即轮换
       timezone: "Asia/Shanghai" # 每日 00:00 重置时区
+
 
       # ---- 可选 ----
       # ms_proxy_url: "http://127.0.0.1:8888" # 调试用 Modelscope API 代理，留空=直连

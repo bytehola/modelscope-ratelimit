@@ -1854,3 +1854,68 @@ func TestExecuteResponsesPassthroughDisabledKeyKeepsFirstProvider(t *testing.T) 
 		t.Fatalf("first provider must be served by its remaining live key, got %+v", attempts[0])
 	}
 }
+
+// TestSliceCompleteSSELinesKeepsCompletedEventIntactAcrossReadBoundary 守住 SSE 行对齐缓冲：
+// 上游把 response.completed 那条 data: 行横跨两次原始读取返回时，转交给宿主的每一块仍
+// 必须是完整行（宿主逐块按 \n 解析 usage、无跨块续行），否则整次请求的 token 用量丢失。
+func TestSliceCompleteSSELinesKeepsCompletedEventIntactAcrossReadBoundary(t *testing.T) {
+	completed := []byte("data: " + `{"type":"response.completed","response":{"usage":{"input_tokens":111,"output_tokens":45,"total_tokens":156}}}` + "\n\n")
+	boundary := 32 * 1024
+	// filler 是一条 SSE 注释行，长度精确把 completed 的 data: 行推到 32KB 边界前 30
+	// 字节，使边界落在 completed 的 JSON 内部。
+	filler := append([]byte(":"), bytes.Repeat([]byte("x"), boundary-30-3)...)
+	filler = append(filler, '\n', '\n')
+	chunkA := append(append([]byte{}, filler...), completed[:30]...)
+	chunkB := completed[30:]
+	rawChunks := [][]byte{chunkA, chunkB}
+
+	// 对照：原始两块各自按 \n 切行解析都拿不到 usage（这正是未对齐时丢 token 的条件）。
+	if parseStreamUsagePerChunk(t, rawChunks) {
+		t.Fatal("control: raw reads must NOT yield usage when the completed line is split across reads")
+	}
+
+	// 经过 sliceCompleteSSELines 行对齐后收集 emit 段（最后一块按 final=true 收尾）。
+	var pending []byte
+	var emitted [][]byte
+	for i, raw := range rawChunks {
+		seg, rest := sliceCompleteSSELines(pending, raw, i == len(rawChunks)-1)
+		pending = rest
+		if len(seg) > 0 {
+			emitted = append(emitted, seg)
+		}
+	}
+	if !parseStreamUsagePerChunk(t, emitted) {
+		t.Fatalf("aligned emit segments lost usage; got %d segments", len(emitted))
+	}
+}
+
+// parseStreamUsagePerChunk 复刻宿主 observePluginExecutorStreamUsage 的判定：每块按 \n 切，
+// 每行剥 data: 前缀后解析 JSON，命中 response.usage 带 token 字段即为找到。
+func parseStreamUsagePerChunk(t *testing.T, chunks [][]byte) bool {
+	t.Helper()
+	for _, c := range chunks {
+		for _, line := range bytes.Split(c, []byte("\n")) {
+			j := bytes.TrimSpace(line)
+			if bytes.HasPrefix(j, []byte("data:")) {
+				j = bytes.TrimSpace(bytes.TrimPrefix(j, []byte("data:")))
+			}
+			if len(j) == 0 || j[0] != '{' {
+				continue
+			}
+			var obj struct {
+				Response struct {
+					Usage map[string]any `json:"usage"`
+				} `json:"response"`
+			}
+			if err := json.Unmarshal(j, &obj); err != nil {
+				continue
+			}
+			if u := obj.Response.Usage; len(u) > 0 {
+				if _, ok := u["total_tokens"]; ok {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}

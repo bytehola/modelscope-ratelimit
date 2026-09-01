@@ -76,6 +76,7 @@ extern void cliproxyPluginShutdown(void);
 import "C"
 
 import (
+	"bytes"
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
@@ -103,7 +104,7 @@ import (
 // 出现在宿主自己的日志文件里。
 var store = modelscope.NewStore(stderrLogger{})
 
-const pluginVersion = "2.4.6"
+const pluginVersion = "2.4.7"
 
 var pluginHost *C.cliproxy_host_api
 
@@ -1062,9 +1063,9 @@ func pluginRegistration() any {
 			Author:           "k452b",
 			GitHubRepository: "https://github.com/bytehola/modelscope-ratelimit",
 			ConfigFields: []pluginapi.ConfigField{
-				{Name: "providers", Type: pluginapi.ConfigFieldTypeArray, Description: "监控的提供商名称（必填）。填入顺序决定轮换顺序：请求先在本 provider 内逐个 key 轮换（insufficient balance 这类 key 级 429 只禁用当前 key），本家没有可用凭据了才切下一个 provider；任意 200 后下一次请求回到第一个 provider。"},
-				{Name: "skip_provider_on_429", Type: pluginapi.ConfigFieldTypeBoolean, Description: "只管池级 insufficient_quota（Chat 的 429 JSON，或 Responses 以 200 + SSE response.failed 回送的同一种 code）与 405（这一家不接受当前端点/协议，逐 key 只会白撞）：开启时该 provider 整家进 skip 集，立即切下一个 provider / 非托管模型兜底（推荐打开）；关闭时 insufficient_quota 按 insufficient_quota_cooldown 逐 key 退避、405 继续逐 key 轮换。两种模式都先在本 provider 内换 key，key 级失败（含 Responses 的 rate_limit_exceeded）绝不摘家。任意 200 清空 skip 集并回到第一个 provider。"},
-				{Name: "use_responses", Type: pluginapi.ConfigFieldTypeString, Description: "打开 Responses API 接口（填上游模型 name，不是 alias）：填 “*” 或 “true” 表示全部模型；填 “false” 或任意匹配不到模型的字符串表示关闭；填单个上游模型名表示仅该模型；多个模型写在一行即可，例如 [\"ZhipuAI/GLM-5.2\", \"Qwen/Qwen2.5-72B-Instruct\"] 或 ZhipuAI/GLM-5.2, Qwen/Qwen2.5-72B-Instruct；YAML 数组写法同样有效。未列入的托管 provider 按 providers 顺序交由宿主以 Chat 协议兜底。默认关闭。"},
+				{Name: "providers", Type: pluginapi.ConfigFieldTypeArray, Description: "监控的提供商名称（必填）。填入顺序决定轮换顺序。示例: [\"modelscope\", \"modelscope-ai\"]"},
+				{Name: "skip_provider_on_429", Type: pluginapi.ConfigFieldTypeBoolean, Description: " 上游 429 时是否跳过该 provider，打开直接轮换到下一个。"},
+				{Name: "use_responses", Type: pluginapi.ConfigFieldTypeString, Description: "打开 Responses API 接口（填上游模型 name，不是）：填 “*” 或 “true” 表示全部模型；填 “false” 表示关闭；填单个上游模型名表示仅该模型；多个模型写在一行即可，例如 [\"ZhipuAI/GLM-5.2\", \"Qwen/Qwen2.5-72B-Instruct\"] 。"},
 				{Name: "host_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "CPA 链接地址，默认 http://127.0.0.1:8317。"},
 				{Name: "management_key", Type: pluginapi.ConfigFieldTypeString, Description: "CPA 管理密钥。（必填）"},
 				{Name: "credential_strategy", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"round-robin", "fill-first"}, Description: "凭据选择策略（仅对监控的 provider 生效）：round-robin=轮询（默认），fill-first=填充优先"},
@@ -2190,6 +2191,11 @@ func providerHasUsableCredential(provider string, resolved resolvedEntry) bool {
 	return false
 }
 
+// retryableResponsesStatus 判断上游状态码是否"可在本请求内继续尝试下一家"。
+// 其中 405 是偶发性的致命错误：请求体里含有被上游拦截的字符，上游直接回 Method
+// Not Allowed。换 key 无用（同一个 body 仍会触发），所以视为不可在本家重试，立即跳
+// 到下一家（skip_provider_on_429 开启时把本家摘进 skip 集）。429 与 5xx 仍按常规可
+// 重试处理。
 func retryableResponsesStatus(statusCode int) bool {
 	return statusCode == http.StatusTooManyRequests ||
 		statusCode == http.StatusMethodNotAllowed ||
@@ -2666,6 +2672,24 @@ func preflightResponsesStream(streamID string, first pluginapi.ExecutorStreamChu
 	}
 }
 
+// sliceCompleteSSELines 把 raw 接到 pending 之后，返回可立即交给宿主的"完整行前缀"
+// （以 \n 结尾，可能含多条完整 SSE 行）和需要留到下一段的不完整尾。宿主对插件发出
+// 的每一块按 \n 切行解析 usage、无跨块续行，所以跨块的不完整行必须由调用方暂存，等下
+// 一段补全后再发出。final=true 表示流已结束：把全部字节（含末尾无 \n 的最后一行）一
+// 次性吐出，宿主按 \n 切时仍能把最后一段当作完整行解析。emit 段被克隆，避免与后续
+// append 复用同一底层数组。
+func sliceCompleteSSELines(pending, raw []byte, final bool) (emit, rest []byte) {
+	b := append(pending, raw...)
+	if final {
+		return append([]byte(nil), b...), nil
+	}
+	idx := bytes.LastIndexByte(b, '\n')
+	if idx < 0 {
+		return nil, b
+	}
+	return append([]byte(nil), b[:idx+1]...), b[idx+1:]
+}
+
 func forwardResponsesStream(req executorRequestWithCallback, cand retryCandidate, upstreamStreamID string, first pluginapi.ExecutorStreamChunk, done bool) {
 	defer hostHTTPStreamClose(upstreamStreamID)
 	emitted := false
@@ -2682,6 +2706,34 @@ func forwardResponsesStream(req executorRequestWithCallback, cand retryCandidate
 		return true
 	}
 
+	// SSE 行对齐缓冲：上游按 32KB 原始字节读回，一个 data: 事件可能被切到两块的
+	// 边界上；宿主对插件发出的每一块独立按 \n 切行解析 usage、无跨块续行，半行 JSON
+	// 解析失败会让 response.completed 里的 usage 整个丢掉。sliceCompleteSSELines 只把
+	// 完整 \n 结尾的前缀交给宿主，跨块的不完整行留到下一段；收尾（done / 读错 /
+	// chunk.Err）按 final 决定是否吐剩余字节。
+	var pending []byte
+	flush := func(raw []byte, final bool) bool {
+		segment, rest := sliceCompleteSSELines(pending, raw, final)
+		pending = rest
+		if len(segment) == 0 {
+			return true
+		}
+		// 事件是单行 data: JSON，行对齐后的整段必含完整事件，比旧实现按原始 32KB
+		// 块逐段判定更准，也不会漏判跨块的事件。
+		if modelscope.IsResponsesRateLimitExceeded(string(segment)) {
+			store.ApplyResponsesRateLimit(cand.authID, "openai-compatible-"+cand.provider, req.Model, string(segment), store.Now())
+			responsesFailed = true
+			failedBody = string(segment)
+		} else if modelscope.IsResponsesFailed(string(segment)) {
+			responsesFailed = true
+			failedBody = string(segment)
+		}
+		if !emit(segment, "") {
+			return false
+		}
+		return true
+	}
+
 	if first.Payload != nil || first.Err != nil {
 		if first.Err != nil {
 			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, first.Err.Error(), cand.provider, cand.model))
@@ -2689,47 +2741,44 @@ func forwardResponsesStream(req executorRequestWithCallback, cand retryCandidate
 			hostStreamClose(req.StreamID, first.Err.Error())
 			return
 		}
-		if !emit(first.Payload, "") {
+		if !flush(first.Payload, done) {
 			hostStreamClose(req.StreamID, "host stream emit failed")
 			return
 		}
 	}
 	if done {
-		// 首个数据块已经由 executeResponsesPassthroughStream 预筛过：
-		// response.failed（限流或其他原因）绝不会走到这里，所以单块流一定是
-		// 一次真正的成功。
-		store.OnUsage(modelscope.UsageRecord{
-			Provider: "openai-compatible-" + cand.provider,
-			AuthID:   cand.authID,
-			Model:    cand.model,
-			Alias:    req.Model,
-		})
+		// 首个数据块已由 executeResponsesPassthroughStream 预筛过：response.failed 不会走到
+		// 这里。flush(final=true) 已把末尾无 \n 的行也吐出。
+		if responsesFailed {
+			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 200, failedBody, cand.provider, cand.model))
+		} else {
+			store.OnUsage(modelscope.UsageRecord{
+				Provider: "openai-compatible-" + cand.provider,
+				AuthID:   cand.authID,
+				Model:    cand.model,
+				Alias:    req.Model,
+			})
+		}
 		hostStreamClose(req.StreamID, "")
 		return
 	}
 	for {
 		chunk, isDone, errRead := readHostStreamChunk(upstreamStreamID)
 		if errRead != nil {
+			_ = flush(nil, false)
 			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, errRead.Error(), cand.provider, cand.model))
 			_ = hostStreamEmit(req.StreamID, nil, errRead.Error())
 			hostStreamClose(req.StreamID, errRead.Error())
 			return
 		}
 		if chunk.Err != nil {
+			_ = flush(nil, false)
 			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, chunk.Err.Error(), cand.provider, cand.model))
 			_ = hostStreamEmit(req.StreamID, nil, chunk.Err.Error())
 			hostStreamClose(req.StreamID, chunk.Err.Error())
 			return
 		}
-		if modelscope.IsResponsesRateLimitExceeded(string(chunk.Payload)) {
-			store.ApplyResponsesRateLimit(cand.authID, "openai-compatible-"+cand.provider, req.Model, string(chunk.Payload), store.Now())
-			responsesFailed = true
-			failedBody = string(chunk.Payload)
-		} else if modelscope.IsResponsesFailed(string(chunk.Payload)) {
-			responsesFailed = true
-			failedBody = string(chunk.Payload)
-		}
-		if !emit(chunk.Payload, "") {
+		if !flush(chunk.Payload, isDone) {
 			hostStreamClose(req.StreamID, "host stream emit failed")
 			return
 		}
