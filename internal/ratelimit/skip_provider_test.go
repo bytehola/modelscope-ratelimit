@@ -470,3 +470,66 @@ func TestSkipProviderAllManagedSkippedFallsToNonManaged(t *testing.T) {
 		t.Fatalf("expected non-managed a-1 (all managed skipped), got %s", r.AuthID)
 	}
 }
+
+// TestSkipProviderOn405JumpsProvider 覆盖 405 与池级 insufficient_quota 共用同一分支的语义：
+// skip_provider_on_429 开启时，托管 provider 回 405（该端点/协议根本不被这一家接受，本家所有
+// key 都会同样被拒）就把整家放进 skip 集，不逐 key 白撞；405 不看 body，也不该把 key 日禁用、
+// 不计入当日 429 统计。skip 集仍是原来的 latch 生命周期：任意 200 清空，下一个请求重新探测。
+func TestSkipProviderOn405JumpsProvider(t *testing.T) {
+	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
+	s, _ := newTestStore(now)
+	cfg := cfgWith("modelscope")
+	cfg.SkipProviderOn429 = true
+	s.Reconfigure(cfg)
+
+	s.OnUsage(UsageRecord{
+		AuthID:   "m-1",
+		Provider: "openai-compatible-modelscope",
+		Model:    "ZhipuAI/GLM-5.2",
+		Alias:    "glm-5.2",
+		Failed:   true,
+		Failure:  &UsageFailure{StatusCode: 405, Body: `{"error":{"message":"Method Not Allowed"}}`},
+	})
+	if !s.IsProviderSkipped("modelscope") {
+		t.Fatal("managed 405 must add provider to skip set (same handling as pool-level insufficient_quota)")
+	}
+	if s.isDisabled("m-1", "glm-5.2", now) {
+		t.Fatal("405 must not daily-disable the key")
+	}
+	if n := s.RateLimitCount(); n != 0 {
+		t.Fatalf("405 must not count as a rate limit, got %d", n)
+	}
+
+	// 下一家成功（任意 200）清空 skip 集：本家重新回到候选，保持“优先用免费额度”的探测节奏。
+	s.OnUsage(UsageRecord{
+		AuthID:   "my-1",
+		Provider: "openai-compatible-modelscope-my",
+		Model:    "deepseek-ai/DeepSeek-V4-Pro-0813",
+		Alias:    "glm-5.2",
+	})
+	if s.IsProviderSkipped("modelscope") {
+		t.Fatal("any 200 must clear the skip set")
+	}
+}
+
+// TestNoSkipProviderOn405WhenFlagDisabled 是开关的另一半：跳过模式关闭时 405 什么都不做，本家
+// 剩下的 key 继续按原顺序轮换（与关闭时的 429 处理一致）。
+func TestNoSkipProviderOn405WhenFlagDisabled(t *testing.T) {
+	now := time.Date(2026, 7, 8, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
+	s, _ := newTestStore(now)
+	cfg := cfgWith("modelscope")
+	cfg.SkipProviderOn429 = false
+	s.Reconfigure(cfg)
+
+	s.OnUsage(UsageRecord{
+		AuthID:   "m-1",
+		Provider: "openai-compatible-modelscope",
+		Model:    "ZhipuAI/GLM-5.2",
+		Alias:    "glm-5.2",
+		Failed:   true,
+		Failure:  &UsageFailure{StatusCode: 405, Body: `{"error":{"message":"Method Not Allowed"}}`},
+	})
+	if s.IsProviderSkipped("modelscope") {
+		t.Fatal("405 must not skip the provider while skip_provider_on_429 is off")
+	}
+}

@@ -103,7 +103,7 @@ import (
 // 出现在宿主自己的日志文件里。
 var store = modelscope.NewStore(stderrLogger{})
 
-const pluginVersion = "2.4.5"
+const pluginVersion = "2.4.6"
 
 var pluginHost *C.cliproxy_host_api
 
@@ -1063,7 +1063,7 @@ func pluginRegistration() any {
 			GitHubRepository: "https://github.com/bytehola/modelscope-ratelimit",
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "providers", Type: pluginapi.ConfigFieldTypeArray, Description: "监控的提供商名称（必填）。填入顺序决定轮换顺序：请求先在本 provider 内逐个 key 轮换（insufficient balance 这类 key 级 429 只禁用当前 key），本家没有可用凭据了才切下一个 provider；任意 200 后下一次请求回到第一个 provider。"},
-				{Name: "skip_provider_on_429", Type: pluginapi.ConfigFieldTypeBoolean, Description: "只管池级 429（insufficient_quota）：开启时该 provider 整家进 skip 集，立即切下一个 provider / 非托管模型兜底（推荐打开）；关闭时按 insufficient_quota_cooldown 逐 key 退避。两种模式都先在本 provider 内换 key，本家 key 用尽才换家。任意 200 清空 skip 集并回到第一个 provider。"},
+				{Name: "skip_provider_on_429", Type: pluginapi.ConfigFieldTypeBoolean, Description: "只管池级 insufficient_quota（Chat 的 429 JSON，或 Responses 以 200 + SSE response.failed 回送的同一种 code）与 405（这一家不接受当前端点/协议，逐 key 只会白撞）：开启时该 provider 整家进 skip 集，立即切下一个 provider / 非托管模型兜底（推荐打开）；关闭时 insufficient_quota 按 insufficient_quota_cooldown 逐 key 退避、405 继续逐 key 轮换。两种模式都先在本 provider 内换 key，key 级失败（含 Responses 的 rate_limit_exceeded）绝不摘家。任意 200 清空 skip 集并回到第一个 provider。"},
 				{Name: "use_responses", Type: pluginapi.ConfigFieldTypeString, Description: "打开 Responses API 接口（填上游模型 name，不是 alias）：填 “*” 或 “true” 表示全部模型；填 “false” 或任意匹配不到模型的字符串表示关闭；填单个上游模型名表示仅该模型；多个模型写在一行即可，例如 [\"ZhipuAI/GLM-5.2\", \"Qwen/Qwen2.5-72B-Instruct\"] 或 ZhipuAI/GLM-5.2, Qwen/Qwen2.5-72B-Instruct；YAML 数组写法同样有效。未列入的托管 provider 按 providers 顺序交由宿主以 Chat 协议兜底。默认关闭。"},
 				{Name: "host_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "CPA 链接地址，默认 http://127.0.0.1:8317。"},
 				{Name: "management_key", Type: pluginapi.ConfigFieldTypeString, Description: "CPA 管理密钥。（必填）"},
@@ -2070,8 +2070,9 @@ type retryCandidate struct {
 // 现（开启该开关时）把步骤表压缩成每家一步，于是任何 key 级失败都像是 provider 级失败：请求会在第
 // 一家还剩约 140 把可用凭据的情况下跳到第二家，而第二家应答的是另一个上游模型。
 //
-// 现在该开关只决定池级 insufficient_quota 应答是否把某家放进 skip 集；两个执行器循环都会尊重 skip
-// 集，丢掉这一家剩下的步骤。
+// 现在该开关只决定池级 insufficient_quota（Chat 的 429 JSON，或 Responses 以 200 + SSE
+// response.failed 回送的同一种 code）是否把某家放进 skip 集；两个执行器循环都会尊重 skip 集，丢掉
+// 这一家剩下的步骤。Responses 侧 key 级速率拒绝的兜底另见 responsesKeyRateLimitBailAfter。
 func buildRetrySequence(resolved resolvedEntry, cfg *modelscope.Config) []retryStep {
 	var steps []retryStep
 	for _, name := range cfg.Providers {
@@ -2092,11 +2093,11 @@ func buildRetrySequence(resolved resolvedEntry, cfg *modelscope.Config) []retryS
 // resolveStep 用 Store 里该 provider 自己的游标，为一次托管 provider 重试步骤解析出 auth ID、API
 // key、基础地址和上游模型名，因此 key 顺序跨请求保持不变。
 //
-// 游标只允许落在仍然能应答的凭据上。SchedulerPick 在轮换前做的是同一件事（先把禁用
-// key 从候选组里滤掉）；把这一家的完整 key 列表直接交给它会出问题：旧实现下开启该开关时每家每
-// 请求只有极少的几步，
-// 一把已禁用的 key 就能吃掉这一家的整步。而成功同样会推进游标，于是健康流量跑一段时间后，游标会走进当
-// 天被禁用的 key 区间，请求就在第一家还有可用 key 时悄悄落到第二家。
+// 游标只允许落在仍然能应答的凭据上：先按核心层的禁用状态把这一家的 key 过滤一遍，再交给
+// Store.NextProviderKey，这与 SchedulerPick 在轮换前做的是同一件事。把这一家的完整 key 列表直接
+// 交给它会出问题 —— 成功同样会推进游标，所以健康流量跑一段时间后，游标会走进当天已被禁用的 key
+// 区间，于是一把死 key 就能吃掉这一家的一步（旧实现每家只有极少的几步时，甚至能吃掉整步），请求
+// 在第一家还有可用 key 时就悄悄落到第二家。
 func resolveStep(step retryStep, resolved resolvedEntry, alias string) (retryCandidate, bool) {
 	providerKey := strings.ToLower(strings.TrimSpace(step.provider))
 	ids := resolved.providerOrder[providerKey]
@@ -2145,6 +2146,8 @@ func hostModelRequestForCandidate(req executorRequestWithCallback, model string)
 // provider 上，这样嵌套执行里出现 429 时，宿主不会改用别家凭据应答。
 //
 // 请求头是复制出来的：调用方的头属于外层请求，后面直连上游和最后不设限的宿主兜底还会继续用它们。
+//
+// 宿主在执行嵌套调用时仍会跑本插件的 SchedulerPick，所以 provider 顺序和 key 轮换规则与外层一致。
 func hostModelRequestForProvider(req executorRequestWithCallback, model, provider string) executorRequestWithCallback {
 	out := hostModelRequestForCandidate(req, model)
 	if strings.TrimSpace(provider) == "" {
@@ -2162,7 +2165,7 @@ func hostModelRequestForProvider(req executorRequestWithCallback, model, provide
 // providerHasUsableCredential 判断插件自己的调度器是否还会把这一家的请求交给它的某把凭据。
 //
 // chat 兜底这一步是让宿主去执行*共享*的路由模型，宿主会对所有提供该别名的 provider 重跑
-// scheduler.pick。如果首选 provider 已在 skip 集里（429）或者只剩被日禁用的 key，宿主就会用别家
+// scheduler.pick。如果首选 provider 已在 skip 集里（池级 insufficient_quota）或者只剩被日禁用的 key，宿主就会用别家
 // 凭据应答这次嵌套调用，于是本该走原生 Responses 的后面那家被悄悄降级成 chat，它自己的原生步骤根本
 // 没机会执行。这里用与调度器相同的判定条件，保证兜底仍然落在本该试探的那一家上。
 func providerHasUsableCredential(provider string, resolved resolvedEntry) bool {
@@ -2225,8 +2228,9 @@ func executeResponsesPassthrough(req executorRequestWithCallback) (pluginapi.Exe
 	keyRateLimitStreak := make(map[string]int)
 	for _, step := range steps {
 		providerName := strings.ToLower(strings.TrimSpace(step.provider))
-		// 该 provider 一旦回过池级 insufficient_quota 的 429，整家就被摘掉（skip_provider_on_429
-		// 只授权做这件事）。key 级禁用不会走到这里，因此剩下的可用 key 仍会继续轮换。
+		// 该 provider 一旦回过池级 insufficient_quota（429 JSON 或 Responses 的 200 + SSE 事
+		// 件），整家就被摘掉（skip_provider_on_429 只授权做这件事）。key 级失败不会走到这里，
+		// 因此剩下的可用 key 仍会继续轮换。
 		if unsupportedProviders[providerName] || (cfg.SkipProviderOn429 && store.IsProviderSkipped(step.provider)) {
 			unsupportedProviders[providerName] = true
 			continue
@@ -2392,8 +2396,9 @@ func executeResponsesPassthroughStream(req executorRequestWithCallback) (plugina
 	keyRateLimitStreak := make(map[string]int)
 	for _, step := range steps {
 		providerName := strings.ToLower(strings.TrimSpace(step.provider))
-		// 该 provider 一旦回过池级 insufficient_quota 的 429，整家就被摘掉（skip_provider_on_429
-		// 只授权做这件事）。key 级禁用不会走到这里，因此剩下的可用 key 仍会继续轮换。
+		// 该 provider 一旦回过池级 insufficient_quota（429 JSON 或 Responses 的 200 + SSE 事
+		// 件），整家就被摘掉（skip_provider_on_429 只授权做这件事）。key 级失败不会走到这里，
+		// 因此剩下的可用 key 仍会继续轮换。
 		if unsupportedProviders[providerName] || (cfg.SkipProviderOn429 && store.IsProviderSkipped(step.provider)) {
 			unsupportedProviders[providerName] = true
 			continue

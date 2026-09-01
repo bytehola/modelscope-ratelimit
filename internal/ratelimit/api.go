@@ -149,6 +149,12 @@ type InferenceRateLimit struct {
 // 核心层只持有函数指针，具体实现由胶水层提供，负责真正发起 HTTP 调用（直接用
 // net/http，走 cookie 鉴权）。session 就是 api key 本身（m_session_id cookie 的值），
 // 永不过期。
+//
+// 下面五个类型里，目前真正被胶水层注入并读取的只有 MidnightSignInFunc（见 Store 上的
+// SetMidnightSignInFunc）；LoginInfoFetcher / BalanceFetcher / RateLimitFetcher 的 setter
+// 没有任何调用方，TransactionsFetcher / TokenListFetcher 连 setter 都没有 —— 状态页与签到
+// 走的是 cmd/plugin/msclient.go 里的那套客户端方法。保留它们只是为了让核心层能脱机单测这
+// 些载荷形状，删除前请先确认没有新的注入点。
 
 type LoginInfoFetcher func(sessionID string) (*LoginInfo, error)
 type BalanceFetcher func(sessionID string) (*MagicCubeBalance, error)
@@ -157,14 +163,15 @@ type TokenListFetcher func(sessionID string) (*SDKTokenList, error)
 type RateLimitFetcher func(sessionID string) (*InferenceRateLimit, error)
 
 // MidnightSignInFunc 由核心层在跨过日期边界时（PruneAll -> dayChanged）调用。胶水层的
-// 实现会遍历所有已知 auth ID，逐个调用 LoginInfoFetcher，再刷新余额和限流，并通过
-// recordCheckIn/recordMagicCube/recordUsagePerDay 写回核心状态。
+// 实现会遍历所有已解析的 auth ID，逐个用 msClient 调 /api/v1/users/login/info（激活当日魔粒）
+// 并拉取余额与限流，再通过 RecordCheckIn / RecordMagicCube / RecordUsagePerDay 写回核心
+// 状态 —— 它不经过上面那几个 Fetcher。
 type MidnightSignInFunc func()
 
 // ---- Store 上用于注入闭包的 setter ----
 
 // SetLoginInfoFetcher 注入一个按 session id 读取用户资料（昵称、邮箱、Havana ID 等）的
-// 函数，供午夜签到流程填充账号概况状态。
+// 函数。当前没有调用方，也没有读取方（见文件头的说明）。
 func (s *Store) SetLoginInfoFetcher(f LoginInfoFetcher) {
 	if f == nil {
 		s.loginInfoFetcher.Store(nil)
@@ -173,8 +180,8 @@ func (s *Store) SetLoginInfoFetcher(f LoginInfoFetcher) {
 	s.loginInfoFetcher.Store(&f)
 }
 
-// SetBalanceFetcher 注入一个按 session id（m_session_id）读取当前魔粒余额的函数，供午
-// 夜签到流程更新核心状态里的可用/总额/冻结余额。
+// SetBalanceFetcher 注入一个按 session id（m_session_id）读取当前魔粒余额的函数。当前
+// 没有调用方，也没有读取方（见文件头的说明）。
 func (s *Store) SetBalanceFetcher(f BalanceFetcher) {
 	if f == nil {
 		s.balanceFetcher.Store(nil)
@@ -183,8 +190,8 @@ func (s *Store) SetBalanceFetcher(f BalanceFetcher) {
 	s.balanceFetcher.Store(&f)
 }
 
-// SetRateLimitFetcher 注入一个按 session id 读取当日用量计数的函数，供午夜签到流程更新
-// usage-per-day 状态。
+// SetRateLimitFetcher 注入一个按 session id 读取当日用量计数的函数。当前没有调用方，也
+// 没有读取方（见文件头的说明）。
 func (s *Store) SetRateLimitFetcher(f RateLimitFetcher) {
 	if f == nil {
 		s.rateLimitFetcher.Store(nil)

@@ -179,7 +179,7 @@ func isInsufficientQuota(statusCode int, body string) bool {
 }
 
 // IsInsufficientBalance 判断响应是否是 body 里带 "insufficient balance" 字样的 429
-// （账号余额耗尽）。与 insufficient_quota（池级速率窗口）不同，余额耗尽意味着在充值之
+// （账号余额耗尽）。与 insufficient_quota（整家共享的额度耗尽）不同，余额耗尽意味着在充值之
 // 前这把 key 真的不可用，因此不论 skip_provider_on_429 如何都会触发日禁用。判定用对
 // "insufficient balance"（中间是空格而非下划线）的大小写不敏感子串匹配，以覆盖各种
 // JSON 写法。
@@ -190,9 +190,14 @@ func IsInsufficientBalance(statusCode int, body string) bool {
 	return strings.Contains(strings.ToLower(body), "insufficient balance")
 }
 
-// ApplyInsufficientQuotaCooldown 检查 429 + insufficient_quota 响应，命中后给该 key 设
-// 一个短期冷却，让调度器在配置的时间窗内选别的 key。与日禁用不同，冷却在 X 秒后自动
-// 到期，key 不必等到午夜就重新可用。
+// ApplyInsufficientQuotaCooldown 检查一次额度/速率失败（判据 isInsufficientQuota：Chat 的
+// 429 + insufficient_quota，或 Responses 以 HTTP 200 回送的 rate_limit_exceeded），命中后给
+// 该 key 设一个短期冷却。
+//
+// 冷却的实际效果不是“换一把 key”，而是让 SchedulerPick 在窗口内阻塞全部托管挑选：Modelscope
+// 的额度在所有托管 key 与托管 provider 之间共享，逐个换 key 只会把上游 429 撞一遍。与日禁用
+// 不同，冷却到期后 key 自动重新可用，不必等到午夜。cfg.InsufficientQuotaCooldown <= 0 时整个
+// 函数是空操作（不做冷却，失败立刻轮换下一把 key / 下一家）。
 func (s *Store) ApplyInsufficientQuotaCooldown(authID, model string, statusCode int, body string, now time.Time) {
 	if authID == "" {
 		return
@@ -360,20 +365,23 @@ func (s *Store) OnUsage(rec UsageRecord) {
 				s.disableUnauthorized(rec.AuthID, now)
 				return
 			}
-			// skip_provider_on_429 模式：托管 provider 返回 insufficient_quota 的 429 时，
-			// 把它放进按 provider 的 skip 集，后续 SchedulerPick 就会过滤掉它的候选。只跳过
-			// 真正 429 的那一家，其他托管 provider 仍然可用。 latch 语义：条目会跨非托管失败
-			// 保留，由任意 200（OnUsage）或“托管候选已全部试过”来清空。其他类型的 429
-			// （exceeded-today、limit_burst_rate）走常规的日禁用 + 冷却处理。
+			// skip_provider_on_429 模式：托管 provider 返回池级 insufficient_quota 时（Chat
+			// 的 429 JSON，或 Responses 以 200 + SSE response.failed 回送的同一种 code），或者
+			// 回 405（这一家不接受当前端点/协议）时，把它放进按 provider 的 skip 集，后续
+			// SchedulerPick 就会过滤掉它的候选。只跳过真正池级耗尽或明确 405 的那一家，其他
+			// 托管 provider 仍然可用。 latch 语义：条目会跨非托管失败保留，由任意 200
+			// （OnUsage）或“托管候选已全部试过”来清空。其他类型的 429（exceeded-today、
+			// limit_burst_rate）走常规的日禁用 + 冷却处理。
 			//
 			// 判据是池级的 IsPoolLevelQuotaExhausted，不是宽口径的 isInsufficientQuota：后
 			// 者会把 Responses 的 key 级 rate_limit_exceeded（以 HTTP 200 回送，因此也会走到
-			// 这条用量记录）算进来，那只会把整家误摘掉。
-			if cfg.SkipProviderOn429 && IsPoolLevelQuotaExhausted(rec.Failure.Body) {
+			// 这条用量记录）算进来，那只会把整家误摘掉。405 与 body 无关：它是协议层面的事
+			// 实，本家所有 key 都会以同样的方式被拒，逐 key 轮换只是白撞。
+			if cfg.SkipProviderOn429 && (statusCode == 405 || IsPoolLevelQuotaExhausted(body)) {
 				s.recordSeen([]string{rec.AuthID})
 				providerName := extractProviderName(rec.Provider)
 				s.SetSkipProvider(providerName)
-				s.log.Printf("modelscope-ratelimit: managed 429, skip provider %s model=%s", providerName, s.displayName(model))
+				s.log.Printf("modelscope-ratelimit: managed %d, skip provider %s model=%s", statusCode, providerName, s.displayName(model))
 			}
 			// 冷却兜底：仅在跳过模式关闭时执行（该模式下 429 由 skip 集处理，不用冷却）。
 			// SchedulerPick 里的冷却阻塞段在跳过模式开启时同样会被绕过。

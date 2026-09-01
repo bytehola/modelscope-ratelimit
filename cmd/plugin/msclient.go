@@ -341,8 +341,10 @@ func (c *msClient) fetchTransactions(siteBase, sessionID string, page, pageSize 
 }
 
 // 账号缓存
-// accounts 端点只读缓存，由午夜签到或手动刷新填充。只有首次加载，或者缓存被清空之后，才会为所有账号
-// 触发新的取数。
+// accounts 端点的只读缓存。填充入口：启动 10 秒后的首次拉取、状态页轮询、手动刷新
+// （?api=accounts&refresh=1、checkin-all）以及午夜签到后的那次强刷。缓存有效期是
+// accountsCacheTTL（30 分钟）：为空或已过期时，状态页请求会触发一次全量取数（有旧数据时先回
+// 旧数据、同时后台刷新）。reconfigure 通过 clearAllCaches 整体清空。
 
 const accountsCacheTTL = 30 * time.Minute
 

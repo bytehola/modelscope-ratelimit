@@ -96,8 +96,9 @@ type Store struct {
 	midnightSignInFunc atomic.Pointer[MidnightSignInFunc]
 
 	// backoffMu 保护全局的 insufficient_quota 指数退避档位。Modelscope 的额度在所有 key 之间
-	// 共享，所以退避是全局的（不是逐 key）：每一轮连续的 429+insufficient_quota 让冷却时长翻
-	// 倍，封顶 maxInsufficientQuotaCooldown。
+	// 共享，所以退避是全局的（不是逐 key）：每一轮连续的额度失败（判据 isInsufficientQuota：
+	// Chat 的 429+insufficient_quota，或 Responses 以 200 回送的速率拒绝）让冷却时长翻倍，
+	// 封顶 maxInsufficientQuotaCooldown。
 	backoffMu       sync.Mutex
 	cooldownLevel   float64   // 当前退避间隔（秒）；0 表示空闲
 	cooldownLevelAt time.Time // 档位最近一次推进的时间
@@ -119,9 +120,11 @@ type Store struct {
 	blockActive       int       // 当前正处于冷却睡眠中的 goroutine 数量
 	blockStart        time.Time // 本轮阻塞的起点（blockActive 由 0 变 1 时）
 
-	// skipProviders 是 skip_provider_on_429 模式下按 provider 的 latch 跳过集合。OnUsage 在
-	// 托管凭据返回 429+insufficient_quota 时把该 provider 名加入集合；SchedulerPick 会过滤掉
-	// 集合内 provider 的候选。粒度是 provider：只有 429 的那一家被跳过，其他托管 provider 仍
+	// skipProviders 是 skip_provider_on_429 模式下按 provider 的 latch 跳过集合。OnUsage 在托管
+	// 凭据返回**池级** insufficient_quota 时把该 provider 名加入集合（Chat 的 429 JSON 与
+	// Responses 的 200 + SSE response.failed 都算，判据见 IsPoolLevelQuotaExhausted；Responses 的
+	// key 级 rate_limit_exceeded 不在此列）。SchedulerPick 会过滤掉集合内 provider 的
+	// 候选。粒度是 provider：只有真正池级耗尽的那一家被跳过，其他托管 provider 仍
 	// 可用。清空时机：任意 200（让下一次请求重新探测免费的托管额度），或托管候选已全部试过
 	// （managed==0）。
 	skipMu        sync.RWMutex

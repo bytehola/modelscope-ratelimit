@@ -1008,7 +1008,7 @@
       "
     >
       Modelscope 限流管理后台插件 v<span id="plugin-version">加载中</span> ·
-      构建于 2026-09-01 21:26:16 CST · Responses 接口：<span
+      构建于 2026-09-01 22:56:44 CST · Responses 接口：<span
         id="responses-status"
         >加载中</span
       >
@@ -1773,7 +1773,7 @@
         btn.disabled = true;
         btn.textContent = "处理中…";
         if (!signedInToday) {
-          // 一键签到: sign-in all accounts, then force fresh data
+          // 一键签到：先给所有账号签到，再强制拉取最新数据
           xhr("GET", "?api=checkin-all", function (sc, d) {
             signedInToday = true;
             updateToolbarBtn();
@@ -1791,7 +1791,7 @@
             });
           });
         } else {
-          // 一键刷新: force backend to fetch fresh data immediately
+          // 一键刷新：让服务端立刻重新拉取一份新数据
           staleAccounts = null;
           detailJSCache = {};
           xhr("GET", "?api=accounts&refresh=1", function (sc, d) {

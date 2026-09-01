@@ -25,7 +25,7 @@ var ErrPinnedProviderUnavailable = errors.New("pinned provider has no available 
 //
 // provider 轮换：始终按 Providers 的配置顺序，从第一个还有可用候选的 provider 开始；
 // 一家之内的 key 由该家自己的游标轮转（跨请求保持）。skip_provider_on_429 开启时，
-// 返回过 429+insufficient_quota 的 provider 会被放进 skip 集，它的候选一直被过滤到
+// 返回过池级 insufficient_quota 的 provider 会被放进 skip 集，它的候选一直被过滤到
 // 下一次 200；关闭时不写 skip 集，改为对该 key 施加退避冷却，冷却结束后仍优先用这一
 // 家的下一把 key，本家没有可用 key 才轮到下一家。
 //
@@ -127,8 +127,8 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 		if s.isDisabled(c.ID, req.Model, now) {
 			continue
 		}
-		// skip_provider_on_429：过滤掉最近返回过 429+insufficient_quota 的 provider 的
-		// 候选。粒度是 provider：只有 429 的那一家被跳过，其他托管 provider 照常可用。
+		// skip_provider_on_429：过滤掉最近返回过池级 insufficient_quota 的 provider 的
+		// 候选。粒度是 provider：只有真正池级耗尽的那一家被跳过，其他托管 provider 照常可用。
 		if cfg.SkipProviderOn429 && s.IsProviderSkipped(extractProviderName(c.Provider)) {
 			continue
 		}
@@ -146,7 +146,7 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 
 	// 没有任何托管候选 => 不在管辖范围内，交回内置调度器。
 	if managed == 0 {
-		// 该模型的托管候选已全部 tried/不可用。如果 skip 集里还有 provider（没有 200 来
+		// 该模型的托管候选都已进入宿主的 “tried” 集合或不可用。如果 skip 集里还有 provider（没有 200 来
 		// 清空它），就把整个集合清掉，让下一次请求重新开始 —— 托管额度可能已经恢复。这
 		// 样能避免集合被卡死：当托管和非托管候选全部失败时，宿主会直接返回错误而不再调
 		// 用插件，这里是最后一次清理机会。
@@ -192,7 +192,7 @@ func (s *Store) SchedulerPick(req SchedulerPickRequest) (SchedulerPickResponse, 
 
 	var picked Candidate
 	// provider 轮换：从配置里的第一个 provider 开始，依次找到第一个还有可用候选的
-	// provider；skip_provider_on_429 开启时，skip 集已经过滤掉最近 429 的那一家。选中
+	// provider；skip_provider_on_429 开启时，skip 集已经过滤掉最近池级额度耗尽的那一家。选中
 	// 一家之后，由该家自己的 key 游标（NextProviderKey）决定用哪把 key，该游标跨请求
 	// 继续轮转。
 	start := s.managedProviderStart(len(cfg.Providers))
