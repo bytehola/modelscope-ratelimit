@@ -104,7 +104,7 @@ import (
 // 出现在宿主自己的日志文件里。
 var store = modelscope.NewStore(stderrLogger{})
 
-const pluginVersion = "2.4.7"
+const pluginVersion = "2.4.8"
 
 var pluginHost *C.cliproxy_host_api
 
@@ -340,7 +340,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	}
 	raw, err := handleMethod(C.GoString(method), requestBytes)
 	if err != nil {
-		writeResponse(response, errorEnvelope("plugin_error", err.Error()))
+		writeResponse(response, pluginErrorEnvelope(err))
 		return 1
 	}
 	writeResponse(response, raw)
@@ -1571,6 +1571,84 @@ func errorEnvelope(code, message string) []byte {
 	return raw
 }
 
+// errorEnvelopeWithStatus 构造带 HTTP 状态码的错误信封。宿主解码后还原成
+// rpcPluginError.StatusCode()，于是透传给客户端的就是同一个状态码；宿主也据此按
+// clienterror.IsRequestFault 认定"错误出在请求本身"，不再冷却或轮换其他凭据。
+func errorEnvelopeWithStatus(code, message string, status int) []byte {
+	raw, _ := json.Marshal(pluginabi.Envelope{OK: false, Error: &pluginabi.Error{Code: code, Message: message, HTTPStatus: status}})
+	return raw
+}
+
+// requestFaultError 是"错误出在这次请求本身、换任何一把 key 都救不回来"的执行器错误，
+// 携带要回给客户端的 HTTP 状态码与错误码。其余执行器错误仍是无状态码的 plugin_error
+// （客户端看到 500），行为不变。
+type requestFaultError struct {
+	status  int
+	code    string
+	message string
+}
+
+func (e *requestFaultError) Error() string { return e.message }
+
+// StatusCode 让本包测试与任何在 Go 侧消费它的调用方读到同一份状态码。
+func (e *requestFaultError) StatusCode() int { return e.status }
+
+// pluginErrorEnvelope 把 handleMethod 返回的 Go error 写成错误信封：请求级错误保留
+// 错误码与状态码，其他错误保持原样。
+func pluginErrorEnvelope(err error) []byte {
+	var fault *requestFaultError
+	if errors.As(err, &fault) && fault != nil {
+		return errorEnvelopeWithStatus(fault.code, fault.message, fault.status)
+	}
+	return errorEnvelope("plugin_error", err.Error())
+}
+
+// contentInspectionErrorCode 是回给客户端的错误码。上游把这类拒绝的 error.code 降级成了
+// server_error，但真实语义是"请求内容未通过审查"，属于客户端错误，所以这里给一个稳定的
+// 自建码，供客户端按码判断而不是去 match 文案。
+const contentInspectionErrorCode = "data_inspection_failed"
+
+// clientErrorDetail 是 OpenAI 风格错误文档的 error 成员。
+type clientErrorDetail struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    string `json:"code"`
+}
+
+// clientErrorDocument 是一段可以直接当成响应体交给客户端的错误文档。
+type clientErrorDocument struct {
+	Error clientErrorDetail `json:"error"`
+}
+
+// inputContentRejectedError 把上游"输入内容被审查拦下"的拒绝改写成回给客户端的 400。
+//
+// message 是一段合法的 OpenAI 风格错误文档：宿主对合法 JSON 的错误文本原样透传（非流式），
+// 流式路径也按 error.type/code/message 重组事件，所以客户端拿到的是结构化错误而不是一段 SSE
+// 原文。错误文案用上游原文；取不到时退回响应体摘要，绝不退化成空消息。provider、key 等
+// 路由细节只进日志，不进客户端消息。
+func inputContentRejectedError(body string) error {
+	detail := modelscope.ResponsesFailureMessage(body)
+	if detail == "" {
+		detail = logBodyExcerpt(body)
+	}
+	if detail == "" {
+		detail = "input text data may contain inappropriate content"
+	}
+	payload := mustJSONMarshal(clientErrorDocument{
+		Error: clientErrorDetail{
+			Message: detail,
+			Type:    "invalid_request_error",
+			Code:    contentInspectionErrorCode,
+		},
+	})
+	// 这段 struct 不可能序列化失败，但仍然不允许给客户端留一条空消息。
+	message := string(payload)
+	if message == "" {
+		message = detail
+	}
+	return &requestFaultError{status: http.StatusBadRequest, code: contentInspectionErrorCode, message: message}
+}
+
 // writeResponse 把信封字节拷贝进宿主提供的 cliproxy_buffer。
 func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 	if response == nil || len(raw) == 0 {
@@ -2218,6 +2296,21 @@ func noteResponsesKeyRateLimit(streak map[string]int, providerName string) bool 
 	return streak[providerName] >= responsesKeyRateLimitBailAfter
 }
 
+// noteInputContentRejected 只能用在"这次响应已经判定为失败"的分支上：检查它是不是"客户端送
+// 来的内容被上游审查拦下"。命中时打日志并返回要抛给宿主的请求级错误，调用方据此立刻结束整个
+// 请求；未命中返回 nil，调用方继续按常规换下一把 key / 下一家。
+//
+// 判据只看错误码与文案（见核心层 IsInputContentInspectionFailed），因为上游把这类拒绝塞进
+// HTTP 200 + response.failed，并把 error.code 降级成 server_error —— 从状态码上看不出来。
+func noteInputContentRejected(callbackID string, cand retryCandidate, body string) error {
+	if !modelscope.IsInputContentInspectionFailed(body) {
+		return nil
+	}
+	logInfoRequest(callbackID, "responses input rejected by content inspection provider=%s model=%s key=%s body=%s",
+		cand.provider, cand.model, maskKey(cand.apiKey), logBodyExcerpt(body))
+	return inputContentRejectedError(body)
+}
+
 func executeResponsesPassthrough(req executorRequestWithCallback) (pluginapi.ExecutorResponse, error) {
 	cfg := currentConfig()
 	resolved := ensureResolved()
@@ -2330,6 +2423,9 @@ func executeResponsesPassthrough(req executorRequestWithCallback) (pluginapi.Exe
 			continue
 		}
 		if modelscope.IsResponsesFailed(respBody) {
+			if errRejected := noteInputContentRejected(req.HostCallbackID, cand, respBody); errRejected != nil {
+				return pluginapi.ExecutorResponse{}, errRejected
+			}
 			logInfoRequest(req.HostCallbackID, "responses failed provider=%s model=%s body=%s", cand.provider, cand.model, logBodyExcerpt(respBody))
 			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, resp.StatusCode, respBody, cand.provider, cand.model))
 			continue
@@ -2338,6 +2434,9 @@ func executeResponsesPassthrough(req executorRequestWithCallback) (pluginapi.Exe
 		// 当成这一家失败了，而不是把一个不是 Response 资源的响应体
 		// 交给客户端。
 		if modelscope.IsResponsesErrorPayload(respBody) {
+			if errRejected := noteInputContentRejected(req.HostCallbackID, cand, respBody); errRejected != nil {
+				return pluginapi.ExecutorResponse{}, errRejected
+			}
 			logInfoRequest(req.HostCallbackID, "responses provider=%s model=%s returned an error payload with HTTP 200: %s", cand.provider, cand.model, logBodyExcerpt(respBody))
 			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, resp.StatusCode, respBody, cand.provider, cand.model))
 			continue
@@ -2521,6 +2620,10 @@ func executeResponsesPassthroughStream(req executorRequestWithCallback) (plugina
 			}
 			continue
 		case responsesStreamPreflightFailed:
+			if errRejected := noteInputContentRejected(req.HostCallbackID, cand, preflight.reason); errRejected != nil {
+				hostHTTPStreamClose(stream.StreamID)
+				return pluginapi.ExecutorStreamResponse{}, errRejected
+			}
 			logInfoRequest(req.HostCallbackID, "responses stream failed provider=%s model=%s: %s", cand.provider, cand.model, logBodyExcerpt(preflight.reason))
 			hostHTTPStreamClose(stream.StreamID)
 			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, stream.StatusCode, preflight.reason, cand.provider, cand.model))
@@ -2529,6 +2632,10 @@ func executeResponsesPassthroughStream(req executorRequestWithCallback) (plugina
 			// Modelscope 会把部分拒绝以 HTTP 200 加一段裸错误文档返回，而不是 SSE
 			// 流。若把它当作已完成的流转发出，交给客户端的就是一个不是 Response 资
 			// 源的响应体。
+			if errRejected := noteInputContentRejected(req.HostCallbackID, cand, preflight.reason); errRejected != nil {
+				hostHTTPStreamClose(stream.StreamID)
+				return pluginapi.ExecutorStreamResponse{}, errRejected
+			}
 			logInfoRequest(req.HostCallbackID, "responses stream provider=%s model=%s returned an error payload with HTTP 200: %s", cand.provider, cand.model, logBodyExcerpt(preflight.reason))
 			hostHTTPStreamClose(stream.StreamID)
 			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, stream.StatusCode, preflight.reason, cand.provider, cand.model))

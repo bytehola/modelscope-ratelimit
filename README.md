@@ -6,7 +6,7 @@
 ![CLIProxyAPI](https://img.shields.io/badge/CLIProxyAPI-v7.2.51+-blue)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
 ![Build](https://img.shields.io/badge/build-c--shared-black)
-![Version](https://img.shields.io/badge/version-2.4.7-green)
+![Version](https://img.shields.io/badge/version-2.4.8-green)
 
 ## 核心特性
 - 🎲 **自动签到 + 魔粒监控**：每日 00:00 签到领取魔粒，定时拉取余额与消费流水。

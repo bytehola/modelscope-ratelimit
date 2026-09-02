@@ -55,6 +55,100 @@ func IsResponsesFailed(body string) bool {
 	return strings.Contains(body, `"response.failed"`)
 }
 
+// inputInspectionMarkers 是上游"输入内容审查未通过"的错误特征（大小写不敏感子串）。
+// Modelscope 背后的算法侧拦下请求内容时回 DataInspectionFailed，文案形如
+// "<400> InternalError.Algo.DataInspectionFailed: Input text data may contain
+// inappropriate content."。Responses 协议把它塞进 HTTP 200 + response.failed，而且
+// error.code 被降级成 server_error，所以只能靠 code 与 message 里的特征串识别。
+var inputInspectionMarkers = []string{
+	"datainspectionfailed",
+	"data_inspection_failed",
+	"inappropriate content",
+}
+
+// outputInspectionMarker 标记"被拦下的是模型输出"而不是输入。这类失败不完全是请求侧的
+// 问题：换一把 key 重新生成有可能过审，所以仍按常规轮换处理，不直接报错给客户端。
+const outputInspectionMarker = "output text data"
+
+// IsInputContentInspectionFailed 判断一次失败响应是不是"客户端请求的内容被上游审查拦下"。
+//
+// 命中即代表换 key、换 provider 都救不回来：同一个请求体在任何一把凭据上都会撞上同一条
+// 审查规则，逐 key 轮换只是把同一个非法请求往上游重复投递，所以调用方必须把错误直接回给
+// 客户端（与 Chat 侧上游直接回 400 时的表现一致）。
+//
+// 只允许在"这次请求已经失败"的分支上调用（response.failed，或 200 + 裸错误文档）：判据是
+// 子串匹配，正常完成的响应里若模型自己生成了这些字样会被误判。
+func IsInputContentInspectionFailed(body string) bool {
+	if body == "" {
+		return false
+	}
+	lower := strings.ToLower(body)
+	matched := false
+	for _, marker := range inputInspectionMarkers {
+		if strings.Contains(lower, marker) {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return false
+	}
+	return !strings.Contains(lower, outputInspectionMarker)
+}
+
+// responsesFailureMessageProbe 从失败响应里取上游的错误文案。字段布局同时覆盖 Responses
+// 事件（{"response":{"error":{"message":...}}}）、Modelscope 以 200 回送的裸错误文档
+// （{"code":...,"message":...}），以及 OpenAI 风格的 {"error":{"message":...}}。
+type responsesFailureMessageProbe struct {
+	Message *string `json:"message"`
+	Error   *struct {
+		Message *string `json:"message"`
+	} `json:"error"`
+	Response *struct {
+		Error *struct {
+			Message *string `json:"message"`
+		} `json:"error"`
+	} `json:"response"`
+}
+
+// ResponsesFailureMessage 从一段已经判定为失败的响应里取出上游给客户端看的错误文案。
+// SSE 的 "data:" 分帧、裸 JSON 错误文档、以及 {"response":{...}} 包装都覆盖；取不到
+// message 时返回空串，由调用方决定回退成什么（例如响应体摘要）。
+func ResponsesFailureMessage(body string) string {
+	raw := strings.TrimSpace(body)
+	if raw == "" {
+		return ""
+	}
+	// SSE 帧可能带 event:/id: 等行，只取第一条 data: 之后的 JSON。
+	if idx := firstSSEDataFieldIndex(raw); idx >= 0 {
+		line := raw[idx:]
+		if end := strings.IndexByte(line, '\n'); end >= 0 {
+			line = line[:end]
+		}
+		raw = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	}
+	if !strings.HasPrefix(raw, "{") {
+		return ""
+	}
+	var probe responsesFailureMessageProbe
+	if err := json.Unmarshal([]byte(raw), &probe); err != nil {
+		return ""
+	}
+	candidates := []*string{probe.Message}
+	if probe.Error != nil {
+		candidates = append(candidates, probe.Error.Message)
+	}
+	if probe.Response != nil && probe.Response.Error != nil {
+		candidates = append(candidates, probe.Response.Error.Message)
+	}
+	for _, candidate := range candidates {
+		if candidate != nil && strings.TrimSpace(*candidate) != "" {
+			return strings.TrimSpace(*candidate)
+		}
+	}
+	return ""
+}
+
 // responsesErrorProbe 只读取顶层 JSON 文档中足够的信息，用来把上游错误体与合法的
 // Responses 载荷区分开。只看顶层成员，所以工具调用或消息内容里嵌套的
 // "code"/"message" 字段不会造成误判。
@@ -367,7 +461,7 @@ func (s *Store) OnUsage(rec UsageRecord) {
 			}
 			// skip_provider_on_429 模式：托管 provider 返回池级 insufficient_quota 时（Chat
 			// 的 429 JSON，或 Responses 以 200 + SSE response.failed 回送的同一种 code），或者
-			// 回 405（这一家不接受当前端点/协议）时，把它放进按 provider 的 skip 集，后续
+			// 回 405时(请求体里含有被上游拦截的字符)，把它放进按 provider 的 skip 集，后续
 			// SchedulerPick 就会过滤掉它的候选。只跳过真正池级耗尽或明确 405 的那一家，其他
 			// 托管 provider 仍然可用。 latch 语义：条目会跨非托管失败保留，由任意 200
 			// （OnUsage）或“托管候选已全部试过”来清空。其他类型的 429（exceeded-today、

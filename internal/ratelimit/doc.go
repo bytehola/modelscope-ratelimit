@@ -16,7 +16,12 @@
 //     这一把 key 的速率/额度拒绝，按 insufficient_quota_cooldown 冷却后在本家内换下一把
 //     key；只有事件 body 里同时带 insufficient_quota 才算池级，才允许 skip_provider_on_429
 //     把整家摘掉。
-//   - 405 Method Not Allowed：这一家不接受当前端点/协议，本家所有 key 都会以同样的方式被拒。
+//   - Responses API 以 HTTP 200 回送的"客户端内容被上游审查拦下"（DataInspectionFailed，
+//     上游会把 error.code 降级成 server_error，所以判据只能落在 code 与文案上）：同一个请求体
+//     在任何一把 key、任何一家上都会撞上同一条规则，轮换只是把同一个非法请求重复投递。因此既不
+//     记凭据失败也不轮换，执行器直接把 400 报错给客户端，与 Chat 侧上游回 400 的表现一致。上游
+//     写明拦的是模型输出时不算在内——换一把 key 重新生成有可能过审，仍按常规轮换。
+//   - 405 Method Not Allowed：请求体里含有被上游拦截的字符,本家所有 key 都会以同样的方式被拒。
 //     判据不看 body，与池级 insufficient_quota 共用同一个分支：skip_provider_on_429 开启时整家
 //     进 skip 集，关闭时继续逐 key 轮换。
 //   - 401 Unauthorized：该 key 全局禁用直到插件重启（午夜不恢复）。
