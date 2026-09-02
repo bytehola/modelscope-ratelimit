@@ -6,7 +6,7 @@
       "name": "Modelscope Rate Limit",
       "description": "CLIProxyAPI 的 Modelscope 限流插件：限额账号智能禁用、分组凭据智能调度、指数退避避流重试、魔粒余额监控与状态页。",
       "author": "bytehola",
-      "version": "2.2.1",
+      "version": "2.4.7",
       "repository": "https://github.com/bytehola/modelscope-ratelimit",
       "homepage": "https://github.com/bytehola/modelscope-ratelimit",
       "license": "MIT",
@@ -17,23 +17,23 @@
           {
             "goos": "linux",
             "goarch": "amd64",
-            "url": "https://github.com/bytehola/modelscope-ratelimit/releases/download/v2.2.1/modelscope-ratelimit-linux-amd64.zip",
-            "sha256": "6d66ed25b5b6c1c2df4c9d4030b1025eb1e1c1ca1531ec4386af5b70d13a551b",
-            "size": 5642517
+            "url": "https://github.com/bytehola/modelscope-ratelimit/releases/download/v2.4.7/modelscope-ratelimit-linux-amd64.zip",
+            "sha256": "5d2b8e0bcf73dccb4ed6f9194823d091b4be377f003183ed3c1085890c315153",
+            "size": 5709147
           },
           {
             "goos": "linux",
             "goarch": "arm64",
-            "url": "https://github.com/bytehola/modelscope-ratelimit/releases/download/v2.2.1/modelscope-ratelimit-linux-arm64.zip",
-            "sha256": "d416cec5a4900e824060c88c29f02a0a706d93894c5c0892b0491e3a4481158d",
-            "size": 5115951
+            "url": "https://github.com/bytehola/modelscope-ratelimit/releases/download/v2.4.7/modelscope-ratelimit-linux-arm64.zip",
+            "sha256": "6992ab6bfafb3330b8411c9a3bdb53510e10ab484c7377d9ac3f81bc3519fd24",
+            "size": 5175698
           },
           {
             "goos": "windows",
             "goarch": "amd64",
-            "url": "https://github.com/bytehola/modelscope-ratelimit/releases/download/v2.2.1/modelscope-ratelimit-windows-amd64.zip",
-            "sha256": "990fcaa7915d6516bdd590579ffabc6eef50c3cd3dad4f2745e4d2e92cc7e717",
-            "size": 5401484
+            "url": "https://github.com/bytehola/modelscope-ratelimit/releases/download/v2.4.7/modelscope-ratelimit-windows-amd64.zip",
+            "sha256": "0287c321f2d0a218a3a98331df53cb12c322f7274205a7549a0268a477232e36",
+            "size": 5466520
           }
         ]
       }
