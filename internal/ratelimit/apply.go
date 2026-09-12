@@ -284,6 +284,32 @@ func IsInsufficientBalance(statusCode int, body string) bool {
 	return strings.Contains(strings.ToLower(body), "insufficient balance")
 }
 
+// IsModelNotReady 判断响应是否是 503 + `model_not_ready`：这一家此刻服务不了这个模型
+// （上游 vLLM 还在加载权重，实测文案是 "模型尚未就绪：🟠 8卡加载中"）。它与 405 同类，是
+// provider/模型层面的可用性事实，与用哪把 key 无关：本家所有 key 都会以同样的方式被拒，逐 key
+// 轮换只是白撞（线上一次请求撞掉数百把 key、每把 ~700ms）。摘家与 405 共用 skip_provider_on_429
+// 这道闸门。
+//
+// 状态码必须是 503，不做 5xx 放宽：502/504 多数出在网关与链路上，换一把 key、换一个账号就可能
+// 正常，把它们一起摘家会误伤一家好凭据。判据本身用带引号的 "model_not_ready" token，与
+// IsPoolLevelQuotaExhausted 同风格，能容忍 JSON 空格与 SSE 分帧。
+func IsModelNotReady(statusCode int, body string) bool {
+	if statusCode != 503 {
+		return false
+	}
+	return strings.Contains(body, `"model_not_ready"`)
+}
+
+// IsProviderAvailabilityRejection 判断一次失败是不是"这一家（而不是这一把 key）服务不了当前
+// 请求"：405 表示这家不接受当前端点/协议，503 + model_not_ready 表示模型还没加载好。两者都与
+// 凭据无关，本家所有 key 都会以同样的方式被拒，所以调用方应当摘掉这一家而不是逐 key 白撞。
+//
+// 池级 insufficient_quota 刻意不在其列：那是共享额度耗尽，由 IsPoolLevelQuotaExhausted 单独
+// 判定，语义与恢复方式都不同。
+func IsProviderAvailabilityRejection(statusCode int, body string) bool {
+	return statusCode == 405 || IsModelNotReady(statusCode, body)
+}
+
 // ApplyInsufficientQuotaCooldown 检查一次额度/速率失败（判据 isInsufficientQuota：Chat 的
 // 429 + insufficient_quota，或 Responses 以 HTTP 200 回送的 rate_limit_exceeded），命中后给
 // 该 key 设一个短期冷却。
@@ -459,19 +485,22 @@ func (s *Store) OnUsage(rec UsageRecord) {
 				s.disableUnauthorized(rec.AuthID, now)
 				return
 			}
-			// skip_provider_on_429 模式：托管 provider 返回池级 insufficient_quota 时（Chat
-			// 的 429 JSON，或 Responses 以 200 + SSE response.failed 回送的同一种 code），或者
-			// 回 405时(请求体里含有被上游拦截的字符)，把它放进按 provider 的 skip 集，后续
-			// SchedulerPick 就会过滤掉它的候选。只跳过真正池级耗尽或明确 405 的那一家，其他
-			// 托管 provider 仍然可用。 latch 语义：条目会跨非托管失败保留，由任意 200
-			// （OnUsage）或“托管候选已全部试过”来清空。其他类型的 429（exceeded-today、
-			// limit_burst_rate）走常规的日禁用 + 冷却处理。
+			// skip_provider_on_429 模式：两类失败会把整家放进 skip 集，后续 SchedulerPick
+			// 就会过滤掉它的候选。
+			//   - 池级 insufficient_quota（Chat 的 429 JSON，或 Responses 以 200 + SSE
+			//     response.failed 回送的同一种 code）：共享额度耗尽。
+			//   - 本家不能服务当前请求（IsProviderAvailabilityRejection）：405 是端点/协议不
+			//     被接受，503 + model_not_ready 是模型还在加载。
+			// 只摘真正命中这两类判据的那一家，其他托管 provider 仍然可用。latch 语义：条目会跨
+			// 非托管失败保留，由任意 200（OnUsage）或“托管候选已全部试过”来清空——对
+			// model_not_ready 这种暂时性状态正好等于"下一次成功之后再探测一遍"。其他类型的 429
+			// （exceeded-today、limit_burst_rate）走常规的日禁用 + 冷却处理。
 			//
-			// 判据是池级的 IsPoolLevelQuotaExhausted，不是宽口径的 isInsufficientQuota：后
-			// 者会把 Responses 的 key 级 rate_limit_exceeded（以 HTTP 200 回送，因此也会走到
-			// 这条用量记录）算进来，那只会把整家误摘掉。405 与 body 无关：它是协议层面的事
-			// 实，本家所有 key 都会以同样的方式被拒，逐 key 轮换只是白撞。
-			if cfg.SkipProviderOn429 && (statusCode == 405 || IsPoolLevelQuotaExhausted(body)) {
+			// 池级判据用 IsPoolLevelQuotaExhausted，不是宽口径的 isInsufficientQuota：后者会
+			// 把 Responses 的 key 级 rate_limit_exceeded（以 HTTP 200 回送，因此也会走到这条
+			// 用量记录）算进来，那只会把整家误摘掉。405 与 body 无关；model_not_ready 反过来
+			// 必须看 body，5xx 本身太宽。
+			if cfg.SkipProviderOn429 && (IsProviderAvailabilityRejection(statusCode, body) || IsPoolLevelQuotaExhausted(body)) {
 				s.recordSeen([]string{rec.AuthID})
 				providerName := extractProviderName(rec.Provider)
 				s.SetSkipProvider(providerName)

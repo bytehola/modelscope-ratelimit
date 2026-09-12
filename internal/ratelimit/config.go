@@ -19,11 +19,13 @@ type Config struct {
 	// 始；各家的 key 游标彼此独立，并且跨请求继续轮转。
 	Providers []string `json:"providers" yaml:"providers"`
 
-	// SkipProviderOn429 开启“429 跳过整家”模式：托管凭据返回**池级** insufficient_quota 时
-	// （Chat 的 429 JSON，或 Responses 以 200 + SSE response.failed 回送的同一种 code），该
-	// provider 进入 latch 的 skip 集，下一次挑选直接落到下一个 provider 或非托管凭据，两个
-	// Responses 执行器循环也会丢掉这一家剩下的 key 步骤。任意 200（无论托管还是非托管）清
-	// 空 skip 集，下一次请求重新探测托管额度。该开关不会缩短每家的 key 步骤表：key 级失败
+	// SkipProviderOn429 开启“跳过整家”模式：托管凭据返回**池级** insufficient_quota（Chat 的
+	// 429 JSON，或 Responses 以 200 + SSE response.failed 回送的同一种 code），或本家服务不了
+	// 当前请求（405 端点/协议不被接受、503 + model_not_ready 模型还在加载，见
+	// IsProviderAvailabilityRejection）时，该 provider 进入 latch 的 skip 集，下一次挑选直接落到
+	// 下一个 provider 或非托管凭据，两个 Responses 执行器循环也会丢掉这一家剩下的 key 步骤。
+	// 任意 200（无论托管还是非托管）清空 skip 集，下一次请求重新探测——对“模型还在加载”这类
+	// 暂时状态，这正好等于“成功一次之后再探一次”。该开关不会缩短每家的 key 步骤表：key 级失败
 	// （含 Responses 的 rate_limit_exceeded）一定先在本家内轮换。关闭时（默认）
 	// insufficient_quota 改为给该 key 施加逐 key 退避冷却，本家的扫描继续用下一把 key。
 	SkipProviderOn429 bool `json:"skip_provider_on_429" yaml:"skip_provider_on_429"`

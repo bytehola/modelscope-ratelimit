@@ -24,6 +24,11 @@
 //   - 405 Method Not Allowed：请求体里含有被上游拦截的字符,本家所有 key 都会以同样的方式被拒。
 //     判据不看 body，与池级 insufficient_quota 共用同一个分支：skip_provider_on_429 开启时整家
 //     进 skip 集，关闭时继续逐 key 轮换。
+//   - 503 + model_not_ready（上游模型还在加载，文案是"模型尚未就绪：8卡加载中"）：与 405 同类的
+//     provider 级可用性拒绝，本家所有 key 都会同样被拒，逐 key 轮换只是白撞。判据必须同时看状态码
+//     与 body——状态码写死 503（502/504 多出在网关链路，摘家会误伤好凭据），body 里要有带引号的
+//     "model_not_ready"。与 405、池级 insufficient_quota 共用同一个分支：skip_provider_on_429
+//     开启时整家进 skip 集，关闭时继续逐 key 轮换。skip 集由任意 200 清空，正好让下一次请求再探一次。
 //   - 401 Unauthorized：该 key 全局禁用直到插件重启（午夜不恢复）。
 //   - 到配置时区的 00:00，日禁用状态清空，key 重新可调度。
 //   - 调度时跳过已禁用 key，把请求交给下一个可用账号，而不是直接失败。

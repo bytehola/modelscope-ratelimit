@@ -104,7 +104,7 @@ import (
 // 出现在宿主自己的日志文件里。
 var store = modelscope.NewStore(stderrLogger{})
 
-const pluginVersion = "2.4.8"
+const pluginVersion = "2.4.9"
 
 var pluginHost *C.cliproxy_host_api
 
@@ -2269,11 +2269,13 @@ func providerHasUsableCredential(provider string, resolved resolvedEntry) bool {
 	return false
 }
 
-// retryableResponsesStatus 判断上游状态码是否"可在本请求内继续尝试下一家"。
-// 其中 405 是偶发性的致命错误：请求体里含有被上游拦截的字符，上游直接回 Method
-// Not Allowed。换 key 无用（同一个 body 仍会触发），所以视为不可在本家重试，立即跳
-// 到下一家（skip_provider_on_429 开启时把本家摘进 skip 集）。429 与 5xx 仍按常规可
-// 重试处理。
+// retryableResponsesStatus 判断上游状态码是否"本请求内还没放弃、可以继续往下试"。
+// 405 与 5xx 都算可重试，但它们的下一步不一样：405（请求体含被上游拦截的字符，上游直接回
+// Method Not Allowed）与 503 + model_not_ready（模型还在加载）换 key 都无用——同一个 body、
+// 同一个模型在本家所有 key 上都会同样被拒。这两类由
+// modelscope.IsProviderAvailabilityRejection 结合 body 判定，命中就在调用点把本家摘掉、直接
+// 跳下一家（skip_provider_on_429 开启时才摘进跨请求的 skip 集）。纯粹的 429 与其余 5xx 仍是
+// 逐 key 轮换。
 func retryableResponsesStatus(statusCode int) bool {
 	return statusCode == http.StatusTooManyRequests ||
 		statusCode == http.StatusMethodNotAllowed ||
@@ -2396,7 +2398,9 @@ func executeResponsesPassthrough(req executorRequestWithCallback) (pluginapi.Exe
 			logInfoRequest(req.HostCallbackID, "responses upstream HTTP %d provider=%s model=%s body=%s", resp.StatusCode, cand.provider, cand.model, logBodyExcerpt(string(resp.Body)))
 			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, resp.StatusCode, string(resp.Body), cand.provider, cand.model))
 			if retryableResponsesStatus(resp.StatusCode) {
-				if resp.StatusCode == http.StatusMethodNotAllowed && cfg.SkipProviderOn429 {
+				// 405 与 503 + model_not_ready 是本家所有 key 共同的拒绝：本请求内丢掉这一家剩下的
+				// key 步骤，别逐把白撞。跨请求的 skip 集由上面那条 store.OnUsage 走核心层判据。
+				if modelscope.IsProviderAvailabilityRejection(resp.StatusCode, string(resp.Body)) && cfg.SkipProviderOn429 {
 					unsupportedProviders[providerName] = true
 				}
 				continue
@@ -2580,7 +2584,8 @@ func executeResponsesPassthroughStream(req executorRequestWithCallback) (plugina
 				store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, stream.StatusCode, string(bodyBytes), cand.provider, cand.model))
 			}
 			if retryableResponsesStatus(stream.StatusCode) {
-				if stream.StatusCode == http.StatusMethodNotAllowed && cfg.SkipProviderOn429 {
+				// 与直连分支同理：405 与 503 + model_not_ready 换 key 都救不回来，本请求内丢掉这一家。
+				if modelscope.IsProviderAvailabilityRejection(stream.StatusCode, string(bodyBytes)) && cfg.SkipProviderOn429 {
 					unsupportedProviders[providerName] = true
 				}
 				continue

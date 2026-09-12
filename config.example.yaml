@@ -28,7 +28,7 @@ plugins:
 
       # ---- 必填 ----
       providers: ["modelscope"] # 监控的 provider 名称；顺序决定轮换顺序。示例: ["modelscope", "modelscope-ai"]
-      skip_provider_on_429: false # 上游 429 时是否跳过该 provider，打开直接轮换到下一个。
+      skip_provider_on_429: false # 跳过整家：池级 insufficient_quota / 405 / 503 model_not_ready（模型还在加载）命中时换下一家；key 级失败仍在本家内换 key。
       use_responses: "*" # 填上游模型 name（不是 alias）：
       #   "*" 或 "true"        全部模型走 Responses
       #   "false" / 留空 / 删除   关闭（任意匹配不到模型的字符串等同关闭）
