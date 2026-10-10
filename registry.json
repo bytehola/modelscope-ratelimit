@@ -6,7 +6,7 @@
       "name": "Modelscope Rate Limit",
       "description": "CLIProxyAPI 的 Modelscope 限流插件：限额账号智能禁用、分组凭据智能调度、指数退避避流重试、魔粒余额监控与状态页。",
       "author": "bytehola",
-      "version": "2.4.7",
+      "version": "2.4.10",
       "repository": "https://github.com/bytehola/modelscope-ratelimit",
       "homepage": "https://github.com/bytehola/modelscope-ratelimit",
       "license": "MIT",
@@ -17,23 +17,23 @@
           {
             "goos": "linux",
             "goarch": "amd64",
-            "url": "https://github.com/bytehola/modelscope-ratelimit/releases/download/v2.4.7/modelscope-ratelimit-linux-amd64.zip",
-            "sha256": "5d2b8e0bcf73dccb4ed6f9194823d091b4be377f003183ed3c1085890c315153",
-            "size": 5709147
+            "url": "https://github.com/bytehola/modelscope-ratelimit/releases/download/v2.4.10/modelscope-ratelimit-linux-amd64.zip",
+            "sha256": "9a361a6b56bb3eb6b93169bc28c05aac34ff96a6d1184653003d3ea56016273e",
+            "size": 5735706
           },
           {
             "goos": "linux",
             "goarch": "arm64",
-            "url": "https://github.com/bytehola/modelscope-ratelimit/releases/download/v2.4.7/modelscope-ratelimit-linux-arm64.zip",
-            "sha256": "6992ab6bfafb3330b8411c9a3bdb53510e10ab484c7377d9ac3f81bc3519fd24",
-            "size": 5175698
+            "url": "https://github.com/bytehola/modelscope-ratelimit/releases/download/v2.4.10/modelscope-ratelimit-linux-arm64.zip",
+            "sha256": "77d9f8ce4295efc9a7dc36e8b51dd4454eb515152d84394c9c5c9484a0487ddf",
+            "size": 5199853
           },
           {
             "goos": "windows",
             "goarch": "amd64",
-            "url": "https://github.com/bytehola/modelscope-ratelimit/releases/download/v2.4.7/modelscope-ratelimit-windows-amd64.zip",
-            "sha256": "0287c321f2d0a218a3a98331df53cb12c322f7274205a7549a0268a477232e36",
-            "size": 5466520
+            "url": "https://github.com/bytehola/modelscope-ratelimit/releases/download/v2.4.10/modelscope-ratelimit-windows-amd64.zip",
+            "sha256": "d4a50a561fa31ae09badc489cb2e037803ef46de4bca3d2831fa200eb6ec7a53",
+            "size": 5493718
           }
         ]
       }
