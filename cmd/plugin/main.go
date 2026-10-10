@@ -104,7 +104,7 @@ import (
 // 出现在宿主自己的日志文件里。
 var store = modelscope.NewStore(stderrLogger{})
 
-const pluginVersion = "2.4.9"
+const pluginVersion = "2.4.10"
 
 var pluginHost *C.cliproxy_host_api
 
@@ -447,31 +447,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			return nil, err
 		}
 		store.OnUsage(r)
-		// 如果响应是 429 + "insufficient balance"，说明该账号魔粒已耗尽。立刻更新账号缓存，让前端不
-		// 必等待刷新就能看到真实余额。魔粒在服务端是账号维度的，所以要把核心层的禁用传播给跨 provider
-		// 共享同一原始 api key 的所有 auth ID，避免用第二个托管 provider 去撞同一个耗尽账号。
-		if r.Failed && r.Failure != nil && modelscope.IsInsufficientBalance(r.Failure.StatusCode, r.Failure.Body) {
-			// resolved.masked 是 authID 到 maskKey(apiKey) 的映射，与 accountsCache.results 里存的
-			// MaskedKey 同源。若直接用 maskKey(r.AuthID) 得到的是 auth ID 自己的 12 位十六进制后缀，跟
-			// api key 的末 12 位永远对不上。
-			resolved := getResolved()
-			if mk, ok := resolved.masked[r.AuthID]; ok && mk != "" {
-				markAccountExhausted(mk)
-			}
-			model := strings.TrimSpace(r.Alias)
-			if model == "" {
-				model = r.Model
-			}
-			rawKey, ok := resolved.raw[r.AuthID]
-			if ok {
-				now := store.Now()
-				for _, otherAuthID := range resolved.rawToAuthIDs[rawKey] {
-					if otherAuthID != r.AuthID {
-						store.DisableGlobal(otherAuthID, model, now)
-					}
-				}
-			}
-		}
+		applyAccountLevelDisable(r)
 		return okEnvelope(struct{}{})
 
 	case pluginabi.MethodManagementRegister:
@@ -486,6 +462,60 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	default:
 		// 未知方法：返回信封级错误（不是传输层错误）。
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
+	}
+}
+
+// applyAccountLevelDisable 处理两类"服务端以账号为单位拒绝"的失败。核心层已经在 OnUsage 里按
+// 日禁用处理过当前凭据，这里补上核心层看不到的两件事：
+//
+//   - 立刻更新账号缓存，让前端不必等下一次刷新就能看到真实原因。魔粒耗尽会把余额写成 0，未验证
+//     邮箱只改状态，因为那不是余额问题。
+//   - 把禁用广播给跨 provider 共享同一原始 api key 的其它 auth ID。同一个 Modelscope 账号挂在
+//     第二个托管 provider 名下时，服务端会照原样再拒一次，不能逐 provider 白撞同一个账号。
+//
+// 两类条件都是"在充值或验证之前这个账号确实不可用"，所以都走当日禁用（午夜恢复），与速率窗口
+// 那种短期退避不同。
+func applyAccountLevelDisable(rec modelscope.UsageRecord) {
+	if !rec.Failed || rec.Failure == nil {
+		return
+	}
+	var (
+		reason          string
+		markAccountView func(maskedKey string)
+	)
+	switch {
+	case modelscope.IsInsufficientBalance(rec.Failure.StatusCode, rec.Failure.Body):
+		reason = ""
+		markAccountView = markAccountExhausted
+	case modelscope.IsUnverifiedAccount(rec.Failure.StatusCode, rec.Failure.Body):
+		reason = modelscope.ReasonUnverified
+		markAccountView = markAccountUnverified
+	default:
+		return
+	}
+
+	resolved := getResolved()
+	// resolved.masked 是 authID 到 maskKey(apiKey) 的映射，与 accountsCache.results 里存的
+	// MaskedKey 同源。若直接用 maskKey(rec.AuthID) 得到的是 auth ID 自己的 12 位十六进制后缀，
+	// 跟 api key 的末 12 位永远对不上。
+	if maskedKey := resolved.masked[rec.AuthID]; maskedKey != "" {
+		markAccountView(maskedKey)
+	}
+
+	model := strings.TrimSpace(rec.Alias)
+	if model == "" {
+		model = rec.Model
+	}
+	rawKey, ok := resolved.raw[rec.AuthID]
+	if !ok {
+		return
+	}
+	now := store.Now()
+	for _, otherAuthID := range resolved.rawToAuthIDs[rawKey] {
+		if otherAuthID == rec.AuthID {
+			continue
+		}
+		store.DisableGlobalWithReason(otherAuthID, model, reason, now)
 	}
 }
 
@@ -539,9 +569,17 @@ func configure(raw []byte) error {
 		}
 		now := time.Now()
 
+		// 密钥失效的账号不再探测：那把 session 已经换不到当日魔粒，打了也是白打。重探只能走全量取数
+		// （插件重载，或管理中心"全部签到"）。
+		deadAccounts := unauthorizedMaskedKeys()
+		skippedDead := 0
 		var swg sync.WaitGroup
 		sem := make(chan struct{}, 20)
 		for _, authID := range resolved.dedupedAuthIDs {
+			if _, dead := deadAccounts[resolved.masked[authID]]; dead {
+				skippedDead++
+				continue
+			}
 			sessionID := resolved.raw[authID]
 			sb := resolved.siteBase[authID]
 			aid := authID
@@ -591,6 +629,9 @@ func configure(raw []byte) error {
 			}()
 		}
 		swg.Wait()
+		if skippedDead > 0 {
+			logInfo("modelscope-ratelimit: midnight sign-in skipped %d credential(s) marked unauthorized", skippedDead)
+		}
 		// 刷新账号缓存，让首次打开页面就能拿到数据。用 forceBackgroundRefresh 避免与正在进行的刷新争抢。
 		go func() {
 			if !forceBackgroundRefresh() {
@@ -1438,22 +1479,14 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 			if json.Unmarshal(bRaw, &b) == nil {
 				result["balance"] = map[string]any{"total": b.TotalBalance, "available": b.AvailableBalance, "frozen": b.FrozenAmount}
 				// 更新账号缓存，让下一次 ?api=accounts 显示真实余额（修正 markAccountExhausted 之前把
-				// available=0、schedule=exhausted 写死的问题）。
-				accountsCacheMu.Lock()
-				for i := range accountsCache.results {
-					if accountsCache.results[i].MaskedKey == mk {
-						accountsCache.results[i].Balance = &balanceJSON{
-							Total: b.TotalBalance, Available: b.AvailableBalance, Frozen: b.FrozenAmount,
-						}
-						if b.AvailableBalance <= 0 {
-							accountsCache.results[i].Schedule = "exhausted"
-						} else {
-							accountsCache.results[i].Schedule = "normal"
-						}
-						break
+				// available=0、schedule=exhausted 写死的问题）。schedule 走与余额刷新同一份
+				// nextSchedule：未验证邮箱与密钥失效不能被余额结果盖成 normal。
+				updateAccountByMask(mk, func(account *accountSummary) {
+					account.Balance = &balanceJSON{
+						Total: b.TotalBalance, Available: b.AvailableBalance, Frozen: b.FrozenAmount,
 					}
-				}
-				accountsCacheMu.Unlock()
+					account.Schedule = nextSchedule(account.Schedule, b.AvailableBalance)
+				})
 			}
 		}
 		if txErr == nil && txSc == 200 {
@@ -1469,14 +1502,9 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 				}
 				result["todayConsumed"] = consumed
 				// 把当日已消耗写回账号缓存，让下一次 ?api=accounts 反映最新值。
-				accountsCacheMu.Lock()
-				for i := range accountsCache.results {
-					if accountsCache.results[i].MaskedKey == mk {
-						accountsCache.results[i].TodayConsumed = consumed
-						break
-					}
-				}
-				accountsCacheMu.Unlock()
+				updateAccountByMask(mk, func(account *accountSummary) {
+					account.TodayConsumed = consumed
+				})
 				// 把 tx.Records 序列化成 []any 以放进 JSON 响应
 				recsJSON, _ := json.Marshal(tx.Records)
 				var recs []any
@@ -2269,17 +2297,22 @@ func providerHasUsableCredential(provider string, resolved resolvedEntry) bool {
 	return false
 }
 
-// retryableResponsesStatus 判断上游状态码是否"本请求内还没放弃、可以继续往下试"。
+// retryableResponsesFailure 判断一次上游失败是否"本请求内还没放弃、可以继续往下试"。
 // 405 与 5xx 都算可重试，但它们的下一步不一样：405（请求体含被上游拦截的字符，上游直接回
-// Method Not Allowed）与 503 + model_not_ready（模型还在加载）换 key 都无用——同一个 body、
+// Method Not Allowed）与 503 + model_not_ready（模型还在加载）换 key 都无用，同一个 body、
 // 同一个模型在本家所有 key 上都会同样被拒。这两类由
 // modelscope.IsProviderAvailabilityRejection 结合 body 判定，命中就在调用点把本家摘掉、直接
 // 跳下一家（skip_provider_on_429 开启时才摘进跨请求的 skip 集）。纯粹的 429 与其余 5xx 仍是
 // 逐 key 轮换。
-func retryableResponsesStatus(statusCode int) bool {
+//
+// 403 + 未验证邮箱（IsUnverifiedAccount）同样可重试：它是账号级条件，池里别的账号能正常服务，
+// 所以本家换下一把 key、本家耗尽再换下一家；命中时该凭据已被当日禁用，后续请求不会再派给它。
+// 这里必须看 body，不能把 403 一律当可重试。
+func retryableResponsesFailure(statusCode int, body string) bool {
 	return statusCode == http.StatusTooManyRequests ||
 		statusCode == http.StatusMethodNotAllowed ||
-		statusCode >= http.StatusInternalServerError
+		statusCode >= http.StatusInternalServerError ||
+		modelscope.IsUnverifiedAccount(statusCode, body)
 }
 
 // responsesKeyRateLimitBailAfter 是同一次请求内，同一个 provider 连续返回 key 级 Responses
@@ -2368,7 +2401,7 @@ func executeResponsesPassthrough(req executorRequestWithCallback) (pluginapi.Exe
 			}
 			if hostResp.StatusCode < 200 || hostResp.StatusCode >= 300 {
 				logInfoRequest(req.HostCallbackID, "responses chat fallback provider=%s model=%s -> HTTP %d", step.provider, routeModel, hostResp.StatusCode)
-				if retryableResponsesStatus(hostResp.StatusCode) {
+				if retryableResponsesFailure(hostResp.StatusCode, string(hostResp.Body)) {
 					continue
 				}
 				return pluginapi.ExecutorResponse{}, fmt.Errorf("host chat fallback: HTTP %d: %s", hostResp.StatusCode, string(hostResp.Body))
@@ -2397,7 +2430,7 @@ func executeResponsesPassthrough(req executorRequestWithCallback) (pluginapi.Exe
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			logInfoRequest(req.HostCallbackID, "responses upstream HTTP %d provider=%s model=%s body=%s", resp.StatusCode, cand.provider, cand.model, logBodyExcerpt(string(resp.Body)))
 			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, resp.StatusCode, string(resp.Body), cand.provider, cand.model))
-			if retryableResponsesStatus(resp.StatusCode) {
+			if retryableResponsesFailure(resp.StatusCode, string(resp.Body)) {
 				// 405 与 503 + model_not_ready 是本家所有 key 共同的拒绝：本请求内丢掉这一家剩下的
 				// key 步骤，别逐把白撞。跨请求的 skip 集由上面那条 store.OnUsage 走核心层判据。
 				if modelscope.IsProviderAvailabilityRejection(resp.StatusCode, string(resp.Body)) && cfg.SkipProviderOn429 {
@@ -2541,7 +2574,9 @@ func executeResponsesPassthroughStream(req executorRequestWithCallback) (plugina
 			}
 			if hostStream.StatusCode != http.StatusOK {
 				logInfoRequest(req.HostCallbackID, "responses chat fallback stream provider=%s model=%s -> HTTP %d", step.provider, routeModel, hostStream.StatusCode)
-				if retryableResponsesStatus(hostStream.StatusCode) {
+				// 这条路径拿不到响应体（HostModelStreamResponse 没有 body 字段），只能按状态码判定。
+				// 未验证邮箱的禁用由宿主这条嵌套调用的用量记录兜住，本请求内不据此重试。
+				if retryableResponsesFailure(hostStream.StatusCode, "") {
 					hostModelStreamClose(hostStream.StreamID)
 					continue
 				}
@@ -2583,7 +2618,7 @@ func executeResponsesPassthroughStream(req executorRequestWithCallback) (plugina
 			} else {
 				store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, stream.StatusCode, string(bodyBytes), cand.provider, cand.model))
 			}
-			if retryableResponsesStatus(stream.StatusCode) {
+			if retryableResponsesFailure(stream.StatusCode, string(bodyBytes)) {
 				// 与直连分支同理：405 与 503 + model_not_ready 换 key 都救不回来，本请求内丢掉这一家。
 				if modelscope.IsProviderAvailabilityRejection(stream.StatusCode, string(bodyBytes)) && cfg.SkipProviderOn429 {
 					unsupportedProviders[providerName] = true

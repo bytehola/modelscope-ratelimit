@@ -24,7 +24,7 @@ func (NoopLogger) Printf(string, ...any) {}
 type keyState struct {
 	mu                 sync.RWMutex
 	global             *time.Time // 全局（不区分模型）禁用时刻，nil 表示没有
-	globalReason       string     // "" 表示日额度禁用（午夜恢复）；"unauthorized" 表示 401（直到重启）
+	globalReason       string     // 空串/ReasonUnverified 是当日禁用（午夜恢复）；"unauthorized" 是 401（直到重启）
 	cooldown           *time.Time // 短期全局冷却到期时刻（insufficient_quota），nil 表示没有
 	successCount       int        // 当日成功请求数（午夜重置）
 	magicCubeAvailable int        // available_balance，来自 /openapi/v1/magicubes/balance
@@ -832,9 +832,22 @@ func (s *Store) ModelRemaining(model string, now time.Time) int {
 	return total
 }
 
-// disableGlobal 把 authID 标记为当天剩余时间内全局禁用，并保留最早的观察时刻。model 参数只是为
-// 了兼容调用点和调试上下文；全局禁用对该凭据的所有请求模型都生效。
+// ReasonUnverified 标记 403 + "账号未验证邮箱"造成的禁用。它与魔粒耗尽一样是日禁用（午夜恢复），
+// 只比默认原因多一个展示标签，让状态页能写明具体原因而不是笼统的"已禁用"。
+const ReasonUnverified = "unverified"
+
+// disableGlobal 是当日全局禁用的入口（不带原因标签），魔粒耗尽这类日额度条件走它。
 func (s *Store) disableGlobal(authID, model string, now time.Time) {
+	s.disableGlobalWithReason(authID, model, "", now)
+}
+
+// disableGlobalWithReason 把 authID 标记为当天剩余时间内全局禁用，并保留最早的观察时刻。model
+// 参数只是为了兼容调用点和调试上下文；全局禁用对该凭据的所有请求模型都生效。
+//
+// reason 只影响状态展示：唯一带跨日语义的取值是 "unauthorized"（401，直到插件重启），其余取值
+// （含 ReasonUnverified）都按当日禁用处理，午夜由 PruneAll 清除。同一个自然日内重复命中时保留
+// 最早的时刻与最初的原因，避免后来的失败把禁用时间一路推后。
+func (s *Store) disableGlobalWithReason(authID, model, reason string, now time.Time) {
 	ks := s.getOrCreateKey(authID)
 	loc := s.location()
 	ks.mu.Lock()
@@ -844,9 +857,13 @@ func (s *Store) disableGlobal(authID, model string, now time.Time) {
 	}
 	t := now
 	ks.global = &t
-	ks.globalReason = ""
+	ks.globalReason = reason
 	ks.mu.Unlock()
-	s.log.Printf("modelscope-ratelimit: key %s globally disabled", authID)
+	if reason == "" {
+		s.log.Printf("modelscope-ratelimit: key %s globally disabled", authID)
+		return
+	}
+	s.log.Printf("modelscope-ratelimit: key %s globally disabled (%s)", authID, reason)
 }
 
 // DisableGlobal 对外暴露的当天全局禁用入口。胶水层用它把一次 insufficient balance 禁用传播到
@@ -854,6 +871,12 @@ func (s *Store) disableGlobal(authID, model string, now time.Time) {
 // 禁用状态仍然只有一份。
 func (s *Store) DisableGlobal(authID, model string, now time.Time) {
 	s.disableGlobal(authID, model, now)
+}
+
+// DisableGlobalWithReason 与 DisableGlobal 相同，只是额外带上一个展示用的原因标签，供胶水层把
+// 账号级禁用广播给共享同一原始 api key 的其它 auth ID 时保持同一个原因（见 ReasonUnverified）。
+func (s *Store) DisableGlobalWithReason(authID, model, reason string, now time.Time) {
+	s.disableGlobalWithReason(authID, model, reason, now)
 }
 
 // disableUnauthorized 把 authID 全局禁用直到插件重启（午夜不恢复），原因是该 api key 返回了

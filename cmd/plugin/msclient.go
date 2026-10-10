@@ -362,6 +362,26 @@ var (
 	refreshInProgress bool // 避免重复的后台刷新
 )
 
+// nextSchedule 由"余额接口返回成功时的可用魔粒数"推出账号该显示的调度状态。
+//
+// 它只处理余额能解释的状态：unverified（markAccountUnverified 记下的 403 未验证邮箱）与
+// unauthorized（login/info 返回 401/403 的密钥失效）都与余额多少无关，必须原样保留，否则余额
+// 结果会把真实原因盖成 normal 或 exhausted；这两个标签只由 login/info 的全量取数改写。
+//
+// 余额的两个入口（账号缓存刷新、账号详情的 refresh-balance）共用这一份规则；markAccountExhausted
+// 拿到的是确凿的 429 事实，直接落 exhausted，刻意不经过这里。
+func nextSchedule(current string, available int) string {
+	switch {
+	case current == "unverified", current == "unauthorized":
+		return current
+	case available <= 0:
+		return "exhausted"
+	case current == "exhausted":
+		return "normal" // 已恢复
+	}
+	return current
+}
+
 // fetchAccountBalanceOnly 只取余额和限流，不查 login/info 也不查流水，用于首次加载之后的缓存刷新。
 // 资料（昵称、邮箱等）沿用现有缓存。
 func (c *msClient) fetchAccountBalanceOnly(idx int, sessionID, siteBase, site string, existing *accountSummary) accountSummary {
@@ -390,16 +410,14 @@ func (c *msClient) fetchAccountBalanceOnly(idx int, sessionID, siteBase, site st
 		var b ratelimit.MagicCubeBalance
 		if json.Unmarshal(bRaw, &b) == nil {
 			a.Balance = &balanceJSON{Total: b.TotalBalance, Available: b.AvailableBalance, Frozen: b.FrozenAmount}
-			// 余额接口成功：按真实余额设置 schedule，覆盖 markAccountExhausted 留下的过期 exhausted 状态。
-			if b.AvailableBalance <= 0 {
-				a.Schedule = "exhausted"
-			} else if a.Schedule == "exhausted" {
-				a.Schedule = "normal" // 已恢复
-			}
+			// 余额接口成功：按真实余额推导 schedule，覆盖 markAccountExhausted 留下的过期
+			// exhausted 状态。
+			a.Schedule = nextSchedule(a.Schedule, b.AvailableBalance)
 		}
 	} else {
 		// 余额接口失败：如果之前的 schedule 是 exhausted（由 markAccountExhausted 设置），不要保留它。此时我
-		// 并不了解真实状态，退回 normal，避免卡在一个假的禁用上。
+		// 并不了解真实状态，退回 normal，避免卡在一个假的禁用上。unverified 同样不动：那是模型请求拿到的
+		// 403 事实，与余额接口能不能连通无关。
 		if a.Schedule == "exhausted" {
 			a.Schedule = "normal"
 		}
@@ -417,7 +435,8 @@ func (c *msClient) fetchAccountBalanceOnly(idx int, sessionID, siteBase, site st
 func refreshAccountsCache(resolved resolvedEntry) []accountSummary {
 	mc := &msClient{}
 	// 先看有没有现成缓存（决定这次是刷新还是首次加载）。
-	// 在持锁期间深拷贝切片，避免并发的 markAccountExhausted 写入与下面不加锁的遍历发生竞争。
+	// 在持锁期间取一份切片 + 逐条结构体副本；写入方一律走 copy-on-write（updateAccountByMask
+	// 复制整片后再替换），所以锁外使用这些副本是安全的，不会读到半写状态。
 	accountsCacheMu.Lock()
 	existing := accountsCache.results
 	isRefresh := existing != nil && len(existing) == len(resolved.dedupedAuthIDs)
@@ -467,10 +486,20 @@ func refreshAccountsCache(resolved resolvedEntry) []accountSummary {
 			var s accountSummary
 			if isRefresh {
 				ex, ok := existingByMask[mk]
-				if ok {
-					s = mc.fetchAccountBalanceOnly(i, sid, sbCopy, siteCopy, ex)
-				} else {
+				switch {
+				case !ok:
 					s = mc.fetchLoginInfo(i, sid, sbCopy, siteCopy)
+				case ex.Schedule == "unauthorized":
+					// 密钥失效的凭据要等到全量取数（插件重载，或管理中心"全部签到"）才有意义重探：
+					// 那把 session 已经被判死，后台每 30 分钟再打一次只是撞同一个 401/403。沿用现有
+					// 快照，连 Balance 一起复制，避免与已交出的旧切片共享同一个对象。
+					s = *ex
+					if s.Balance != nil {
+						balanceCopy := *s.Balance
+						s.Balance = &balanceCopy
+					}
+				default:
+					s = mc.fetchAccountBalanceOnly(i, sid, sbCopy, siteCopy, ex)
 				}
 			} else {
 				s = mc.fetchLoginInfo(i, sid, sbCopy, siteCopy)
@@ -545,27 +574,57 @@ func clearAccountsCache() {
 	accountsCacheMu.Unlock()
 }
 
+// updateAccountByMask 按 maskedKey 更新账号缓存里的一条账号记录，命中返回 true。
+//
+// 它复制整个切片（连同该账号的 Balance 指向的对象）后再替换，因此已经交出去的切片在交出去
+// 之后就固定不变：状态页拿到 accountsCache.results 后在锁外 json.Marshal，refreshAccountsCache
+// 也把同一个切片返回给调用方去序列化。就地改元素会让那些读方与这里的写入竞争（Schedule 是
+// string，撕裂读能吐出损坏的字符串）。复制后替换消除了这条路径，读方不必加锁也不会看到半写
+// 状态。
+//
+// mutate 里可以原地改 Balance 的字段：助手已经把它复制成私有对象。
+func updateAccountByMask(maskedKey string, mutate func(*accountSummary)) bool {
+	accountsCacheMu.Lock()
+	defer accountsCacheMu.Unlock()
+	for i := range accountsCache.results {
+		if accountsCache.results[i].MaskedKey != maskedKey {
+			continue
+		}
+		next := make([]accountSummary, len(accountsCache.results))
+		copy(next, accountsCache.results)
+		if next[i].Balance != nil {
+			balanceCopy := *next[i].Balance
+			next[i].Balance = &balanceCopy
+		}
+		mutate(&next[i])
+		accountsCache.results = next
+		return true
+	}
+	return false
+}
+
 // markAccountExhausted 把该账号在账号缓存里的余额置 0、schedule 置为 exhausted。模型请求返回
 // 429 + insufficient balance 时调用它，让前端不必等下一次刷新就能看到真实的余额状态。
 func markAccountExhausted(maskedKey string) {
-	accountsCacheMu.Lock()
-	defer accountsCacheMu.Unlock()
-	if accountsCache.results == nil {
-		return
-	}
-	for i := range accountsCache.results {
-		if accountsCache.results[i].MaskedKey == maskedKey {
-			accountsCache.results[i].Schedule = "exhausted"
-			// 这里替换 Balance 指针而不是原地改字段，避免并发的刷新（它可能拷贝了结构体并握着旧指针）在
-			// Available 字段上产生竞争。
-			total := 0
-			if accountsCache.results[i].Balance != nil {
-				total = accountsCache.results[i].Balance.Total
-			}
-			accountsCache.results[i].Balance = &balanceJSON{Total: total, Available: 0, Frozen: 0}
-			break
+	updateAccountByMask(maskedKey, func(account *accountSummary) {
+		account.Schedule = "exhausted"
+		// updateAccountByMask 已经把 Balance 复制成私有对象，这里直接替换指针即可。
+		total := 0
+		if account.Balance != nil {
+			total = account.Balance.Total
 		}
-	}
+		account.Balance = &balanceJSON{Total: total, Available: 0, Frozen: 0}
+	})
+}
+
+// markAccountUnverified 把该账号在账号缓存里的 schedule 置为 unverified。模型请求返回
+// 403 + "未验证邮箱" 时调用它，让前端不必等下一次刷新就能看到真实原因。
+//
+// 它只改状态、不碰余额：未验证邮箱不是余额问题，把余额写成 0 会让前端看到假数据。
+func markAccountUnverified(maskedKey string) {
+	updateAccountByMask(maskedKey, func(account *accountSummary) {
+		account.Schedule = "unverified"
+	})
 }
 
 // fetchAccountDetailConcurrent 首次加载时并发调用 users/info、binding/check、tokens/list 和
@@ -710,6 +769,27 @@ func getStaleAccountsCache() []accountSummary {
 	accountsCacheMu.Lock()
 	defer accountsCacheMu.Unlock()
 	return accountsCache.results
+}
+
+// unauthorizedMaskedKeys 返回账号缓存里已被判定"密钥失效"的账号（maskedKey 集合）。
+//
+// 这些凭据在插件重载之前不会恢复，所以后台缓存刷新与午夜签到都不再探测它们：重探只能走全量取数
+// （reconfigure，或管理中心"全部签到"触发的清缓存 + 全量刷新）。余额归零（exhausted）与未验证
+// 邮箱（unverified）刻意不在其列：前者的余额探测正是"已恢复"的判定手段，后者只禁用推理、余额仍然
+// 值得显示。
+func unauthorizedMaskedKeys() map[string]struct{} {
+	accountsCacheMu.Lock()
+	defer accountsCacheMu.Unlock()
+	if len(accountsCache.results) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{}, len(accountsCache.results))
+	for _, account := range accountsCache.results {
+		if account.Schedule == "unauthorized" {
+			out[account.MaskedKey] = struct{}{}
+		}
+	}
+	return out
 }
 
 func getAccountsCacheTime() string {

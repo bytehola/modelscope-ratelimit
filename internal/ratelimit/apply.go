@@ -9,7 +9,8 @@ import (
 // ApplyRateLimit 检查 Modelscope API 的响应并记录对应的禁用状态。它是响应拦截器、
 // 流拦截器（仅响应头阶段）和用量钩子共用的唯一判定入口。
 //
-//   - 429 + "insufficient balance" => 全局禁用（魔粒已耗尽）。
+//   - 429 + "insufficient balance" => 当日全局禁用（魔粒已耗尽）。
+//   - 403 + "未验证邮箱" => 当日全局禁用（账号没完成邮箱验证，魔粒不可用）。
 func (s *Store) ApplyRateLimit(authID, model string, headers map[string][]string, statusCode int, body string, now time.Time) {
 	if authID == "" {
 		// 没有 auth id 就无法把禁用归因到具体凭据；用量钩子（一定带 AuthID）会补上。
@@ -22,6 +23,14 @@ func (s *Store) ApplyRateLimit(authID, model string, headers map[string][]string
 	if IsInsufficientBalance(statusCode, body) {
 		s.recordSeen([]string{authID})
 		s.disableGlobal(authID, model, now)
+		return
+	}
+	// 403 + 未验证邮箱同样是账号级事实：完成验证之前这个账号的魔粒确实不可用，它不是速率窗口。
+	// 判据必须同时看状态码与文案（裸 403 另有语义）。与魔粒耗尽一样按当日禁用处理：当天完成验证
+	// 后只要跨过午夜就会再试一次，不会一直卡在禁用上。
+	if IsUnverifiedAccount(statusCode, body) {
+		s.recordSeen([]string{authID})
+		s.disableGlobalWithReason(authID, model, ReasonUnverified, now)
 		return
 	}
 }
@@ -282,6 +291,35 @@ func IsInsufficientBalance(statusCode int, body string) bool {
 		return false
 	}
 	return strings.Contains(strings.ToLower(body), "insufficient balance")
+}
+
+// unverifiedAccountMarkers 是上游"账号未完成邮箱验证"的 403 文案特征（大小写不敏感子串）。
+// 实测文案形如 "For account security, please complete your profile via email verification.
+// ModelScope Magicubes is only available to verified accounts. Please refer to
+// https://modelscope.cn/my/settings/account"，并附带一个 request_id；判据不得依赖 request_id。
+var unverifiedAccountMarkers = []string{
+	"email verification",
+	"verified accounts",
+	"/my/settings/account",
+}
+
+// IsUnverifiedAccount 判断一次失败是不是 403 + "未验证邮箱"：账号没完成邮箱验证时，魔粒推理接口
+// 直接拒绝服务，充魔粒也救不回来，唯一出路是在账号设置页完成验证。
+//
+// 必须同时看状态码与文案：403 还有别的权限语义，只看状态码会把无关失败误判成账号未验证。命中的
+// 凭据当天全局禁用（与魔粒耗尽共用日禁用路径），因为这是账号级条件，与用哪把 key、请求哪个模型
+// 都无关。
+func IsUnverifiedAccount(statusCode int, body string) bool {
+	if statusCode != 403 || body == "" {
+		return false
+	}
+	lower := strings.ToLower(body)
+	for _, marker := range unverifiedAccountMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // IsModelNotReady 判断响应是否是 503 + `model_not_ready`：这一家此刻服务不了这个模型

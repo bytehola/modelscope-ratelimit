@@ -6,12 +6,12 @@
 ![CLIProxyAPI](https://img.shields.io/badge/CLIProxyAPI-v7.2.51+-blue)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
 ![Build](https://img.shields.io/badge/build-c--shared-black)
-![Version](https://img.shields.io/badge/version-2.4.9-green)
+![Version](https://img.shields.io/badge/version-2.4.10-green)
 
 ## 核心特性
 - 🎲 **自动签到 + 魔粒监控**：每日 00:00 签到领取魔粒，定时拉取余额与消费流水。
 - 📊 **状态页**：管理中心查看余额、消耗，5 秒刷新。
-- 🔴 **限额账号禁用**：余额耗尽禁用该 key，次日 00:00（按配置时区）自动恢复，调度跳过禁用凭据。
+- 🔴 **限额账号禁用**：魔粒耗尽（429 `insufficient balance`）与账号未验证邮箱（403）都当日禁用该账号，次日 00:00（按配置时区）自动恢复，调度跳过禁用凭据；同一原始 api key 挂在多家 provider 名下时会一起禁用，本请求内继续换下一把可用 key。
 - 🔁 **凭据轮换**：支持 `round-robin` / `fill-first`。
 - 🧪 **use_responses 透传**：填上游模型 `name` 命中即透传 Respnses API。
 - 📜 **日志接入宿主**：插件日志经 `host.log` 写入 CPA 自己的日志文件，`GET /v0/management/logs` 与管理中心可直接检索；明细调度为 debug 级，需打开 CPA 调试模式。

@@ -8,6 +8,9 @@
 // 业务规则：
 //
 //   - 429 + insufficient balance（该账号魔粒耗尽）：这把 key 当天全局禁用。
+//   - 403 + "账号未完成邮箱验证"（文案里带 email verification / verified accounts）：验证之前魔粒
+//     确实不可用，所以与魔粒耗尽同路，这把 key 当天全局禁用、状态页写明"未验证邮箱"；在本请求内
+//     继续换下一把 key，因为池里别的账号能正常服务。
 //   - 429 + insufficient_quota（整家共享的额度耗尽）：skip_provider_on_429 开启
 //     时整个 provider 进 latch 的 skip 集，下一次挑选直接落到下一个 provider 或
 //     非托管兜底；关闭时按 insufficient_quota_cooldown 给该 key 设指数退避（基准
