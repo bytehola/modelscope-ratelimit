@@ -35,6 +35,11 @@ type keyState struct {
 	lastCheckIn        time.Time  // 执行签到的时刻
 }
 
+type streamDetectionState struct {
+	tail      []byte
+	updatedAt time.Time
+}
+
 // Store 是所有插件钩子共用的、并发安全的限流状态。
 type Store struct {
 	cfg atomic.Pointer[Config]
@@ -146,6 +151,13 @@ type Store struct {
 	responsesRateLimitAppliedMu sync.Mutex
 	responsesRateLimitApplied   map[string]time.Time
 
+	// streamDetection 保存每个流请求最近的一段字节，用于识别被网络分块拆开的
+	// response.failed / rate_limit_exceeded。schema 5+ 不再向插件发送 HistoryChunks，
+	// 因此这个滚动尾部必须由插件自己维护。
+	streamDetectionMu        sync.Mutex
+	streamDetections         map[string]streamDetectionState
+	streamDetectionLastPrune time.Time
+
 	clock func() time.Time // 可在测试中注入，默认是 time.Now
 
 	stopMu  sync.Mutex
@@ -169,6 +181,7 @@ func NewStore(log Logger) *Store {
 		managedOrder:              make(map[string][]string),
 		responsesRateLimited:      make(map[string]time.Time),
 		responsesRateLimitApplied: make(map[string]time.Time),
+		streamDetections:          make(map[string]streamDetectionState),
 		clock:                     time.Now,
 		stop:                      make(chan struct{}),
 		log:                       log,
@@ -531,6 +544,7 @@ func (s *Store) Reconfigure(cfg *Config) {
 	s.responsesRateLimitAppliedMu.Lock()
 	s.responsesRateLimitApplied = make(map[string]time.Time)
 	s.responsesRateLimitAppliedMu.Unlock()
+	s.resetAllStreamDetections()
 }
 
 const responsesRateLimitWindow = time.Minute
@@ -615,6 +629,7 @@ func (s *Store) cleaner() {
 			return
 		case now := <-ticker.C:
 			s.PruneAll(now)
+			s.pruneStreamDetections(now)
 		}
 	}
 }
@@ -692,9 +707,17 @@ func (s *Store) IsKeyDisabled(authID, model string, now time.Time) bool {
 }
 
 func (s *Store) isDisabled(authID, model string, now time.Time) bool {
+	disabled, _ := s.GlobalDisableState(authID, now)
+	return disabled
+}
+
+// GlobalDisableState 返回 authID 当前是否处于全局禁用，以及状态页需要的禁用原因。
+// 空原因表示普通的当日禁用（例如魔粒耗尽），ReasonUnverified 表示当日未验证邮箱，
+// ReasonUnauthorized 表示直到插件重载才恢复的密钥失效。
+func (s *Store) GlobalDisableState(authID string, now time.Time) (bool, string) {
 	ks := s.getKey(authID)
 	if ks == nil {
-		return false
+		return false, ""
 	}
 	loc := s.location()
 	ks.mu.RLock()
@@ -702,10 +725,10 @@ func (s *Store) isDisabled(authID, model string, now time.Time) bool {
 	// 这里故意不检查 insufficient_quota 冷却：Modelscope 的额度在所有 key 和所有 provider
 	// 之间共享，所以冷却是全局的而不是逐 key 的，改由 SchedulerPick 在挑选之前按最长的有效
 	// 冷却统一阻塞一次；阻塞结束后冷却已到期，key 重新可用。日级全局禁用仍然在这里检查。
-	if ks.global != nil && (ks.globalReason == "unauthorized" || active(*ks.global, now, loc)) {
-		return true
+	if ks.global != nil && (ks.globalReason == ReasonUnauthorized || active(*ks.global, now, loc)) {
+		return true, ks.globalReason
 	}
-	return false
+	return false, ""
 }
 
 // recordSeen 登记调度器见过的凭据 ID，以便能报出 key 总数。
@@ -832,9 +855,13 @@ func (s *Store) ModelRemaining(model string, now time.Time) int {
 	return total
 }
 
-// ReasonUnverified 标记 403 + "账号未验证邮箱"造成的禁用。它与魔粒耗尽一样是日禁用（午夜恢复），
-// 只比默认原因多一个展示标签，让状态页能写明具体原因而不是笼统的"已禁用"。
-const ReasonUnverified = "unverified"
+const (
+	// ReasonUnverified 标记 403 + "账号未验证邮箱"造成的禁用。它与魔粒耗尽一样是日禁用
+	// （午夜恢复），只比默认原因多一个展示标签，让状态页能写明具体原因而不是笼统的"已禁用"。
+	ReasonUnverified = "unverified"
+	// ReasonUnauthorized 标记 401/403 鉴权失败造成的长期禁用。它不会在午夜恢复。
+	ReasonUnauthorized = "unauthorized"
+)
 
 // disableGlobal 是当日全局禁用的入口（不带原因标签），魔粒耗尽这类日额度条件走它。
 func (s *Store) disableGlobal(authID, model string, now time.Time) {
@@ -885,13 +912,13 @@ func (s *Store) disableUnauthorized(authID string, now time.Time) {
 	ks := s.getOrCreateKey(authID)
 	loc := s.location()
 	ks.mu.Lock()
-	if ks.global != nil && (ks.globalReason == "unauthorized" || active(*ks.global, now, loc)) {
+	if ks.global != nil && (ks.globalReason == ReasonUnauthorized || active(*ks.global, now, loc)) {
 		ks.mu.Unlock()
 		return // 已经禁用；保留最早的时间
 	}
 	t := now
 	ks.global = &t
-	ks.globalReason = "unauthorized"
+	ks.globalReason = ReasonUnauthorized
 	ks.mu.Unlock()
 	s.log.Printf("modelscope-ratelimit: key %s disabled (unauthorized: secret may be invalid)", authID)
 }

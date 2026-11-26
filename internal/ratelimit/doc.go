@@ -5,6 +5,15 @@
 // 约定的插件钩子上（scheduler.pick、response.intercept_after、
 // response.intercept_stream_chunk、usage.handle）。
 //
+// 线上帧的字节字段（Body/OriginalRequest/RequestBody/HistoryChunks）在宿主侧是 []byte，
+// 经 encoding/json 序列化后是 base64 字符串。本包对应字段因此也声明为 []byte，让标准库
+// 自动解码——声明成 string 会把 base64 密文当作明文，所有基于子串的判据都会静默失效。
+// wire_frame_test.go 用真实的 json.Marshal → json.Unmarshal 往返守着这条约定。
+//
+// 插件与宿主协商到 schema 6：payload chunk 不再重复携带请求体，也不保证提供
+// HistoryChunks。流式限流判据因此优先按 RequestID 在插件内维护滚动尾部；只有旧宿主
+// 没有 RequestID 时才回退到 HistoryChunks。
+//
 // 业务规则：
 //
 //   - 429 + insufficient balance（该账号魔粒耗尽）：这把 key 当天全局禁用。

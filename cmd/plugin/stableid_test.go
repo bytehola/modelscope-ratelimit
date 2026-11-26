@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"io"
+	"net/http"
 	"strconv"
 	"strings"
 	"testing"
@@ -50,6 +53,182 @@ func TestStableIDGenReplicatesHost(t *testing.T) {
 	}
 }
 
+func TestResolveKeysUsesLiveAuthIDForConnectionPool(t *testing.T) {
+	const (
+		runtimeIndex = "runtime-index-pool"
+		liveAuthID   = "openai-compatibility:modelscope:live-id"
+	)
+	body, errMarshal := json.Marshal(map[string]any{
+		"openai-compatibility": []any{
+			map[string]any{
+				"name":     "modelscope",
+				"base-url": "https://api.modelscope.cn/v1",
+				"api-key-entries": []any{
+					map[string]any{
+						"api-key":         "ms-key-pool",
+						"auth-index":      runtimeIndex,
+						"connection-pool": map[string]any{},
+					},
+				},
+				"models": []any{map[string]any{"name": "Qwen/Qwen3", "alias": "qwen3"}},
+			},
+		},
+	})
+	if errMarshal != nil {
+		t.Fatalf("marshal management response: %v", errMarshal)
+	}
+	originalHTTPClient := resolveHTTPClient
+	resolveHTTPClient = &http.Client{Transport: resolveKeysRoundTrip(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/v0/management/openai-compatibility" {
+			return nil, io.ErrUnexpectedEOF
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(string(body))),
+			Request:    r,
+		}, nil
+	})}
+	t.Cleanup(func() { resolveHTTPClient = originalHTTPClient })
+
+	originalHostAuthModels := hostAuthModels
+	hostAuthModels = func() ([]hostAuthModelEntry, error) {
+		return []hostAuthModelEntry{{
+			ID:        liveAuthID,
+			AuthIndex: runtimeIndex,
+		}}, nil
+	}
+	t.Cleanup(func() { hostAuthModels = originalHostAuthModels })
+
+	_, raw, _, ordered, _, _, _, _, _, _, err := resolveKeys("http://host.invalid", "management-key", []string{"modelscope"})
+	if err != nil {
+		t.Fatalf("resolveKeys returned error: %v", err)
+	}
+	if len(ordered) != 1 || ordered[0] != liveAuthID {
+		t.Fatalf("resolved auth IDs = %v, want live ID %q", ordered, liveAuthID)
+	}
+	if got := raw[liveAuthID]; got != "ms-key-pool" {
+		t.Fatalf("raw[%q] = %q, want configured key", liveAuthID, got)
+	}
+}
+
+func TestResolveKeysFallsBackToStableIDWhenLiveAuthLookupFails(t *testing.T) {
+	const (
+		providerName = "modelscope"
+		apiKey       = "ms-key-fallback"
+		baseURL      = "https://api.modelscope.cn/v1"
+		runtimeIndex = "runtime-index-fallback"
+	)
+	body, errMarshal := json.Marshal(map[string]any{
+		"openai-compatibility": []any{
+			map[string]any{
+				"name":     providerName,
+				"base-url": baseURL,
+				"api-key-entries": []any{
+					map[string]any{
+						"api-key":    apiKey,
+						"auth-index": runtimeIndex,
+					},
+				},
+				"models": []any{map[string]any{"name": "Qwen/Qwen3", "alias": "qwen3"}},
+			},
+		},
+	})
+	if errMarshal != nil {
+		t.Fatalf("marshal management response: %v", errMarshal)
+	}
+	originalHTTPClient := resolveHTTPClient
+	resolveHTTPClient = &http.Client{Transport: resolveKeysRoundTrip(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(string(body))),
+			Request:    r,
+		}, nil
+	})}
+	t.Cleanup(func() { resolveHTTPClient = originalHTTPClient })
+
+	originalHostAuthModels := hostAuthModels
+	hostAuthModels = func() ([]hostAuthModelEntry, error) {
+		return nil, io.ErrUnexpectedEOF
+	}
+	t.Cleanup(func() { hostAuthModels = originalHostAuthModels })
+
+	_, raw, _, ordered, _, _, _, _, _, _, err := resolveKeys("http://host.invalid", "management-key", []string{providerName})
+	if err != nil {
+		t.Fatalf("resolveKeys returned error: %v", err)
+	}
+	wantAuthID := newStableIDGen().Next("openai-compatibility:"+providerName, apiKey, baseURL, "")
+	if len(ordered) != 1 || ordered[0] != wantAuthID {
+		t.Fatalf("resolved auth IDs = %v, want stable ID %q", ordered, wantAuthID)
+	}
+	if got := raw[wantAuthID]; got != apiKey {
+		t.Fatalf("raw[%q] = %q, want configured key", wantAuthID, got)
+	}
+}
+
+func TestResolveKeysSkipsCredentialMissingFromSuccessfulLiveLookup(t *testing.T) {
+	const (
+		providerName = "modelscope"
+		baseURL      = "https://api.modelscope.cn/v1"
+	)
+	body, errMarshal := json.Marshal(map[string]any{
+		"openai-compatibility": []any{
+			map[string]any{
+				"name":     providerName,
+				"base-url": baseURL,
+				"api-key-entries": []any{
+					map[string]any{"api-key": "ms-key-disabled", "auth-index": "runtime-missing"},
+					map[string]any{"api-key": "ms-key-live", "auth-index": "runtime-live"},
+				},
+				"models": []any{map[string]any{"name": "Qwen/Qwen3", "alias": "qwen3"}},
+			},
+		},
+	})
+	if errMarshal != nil {
+		t.Fatalf("marshal management response: %v", errMarshal)
+	}
+	originalHTTPClient := resolveHTTPClient
+	resolveHTTPClient = &http.Client{Transport: resolveKeysRoundTrip(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(string(body))),
+			Request:    r,
+		}, nil
+	})}
+	t.Cleanup(func() { resolveHTTPClient = originalHTTPClient })
+
+	originalHostAuthModels := hostAuthModels
+	hostAuthModels = func() ([]hostAuthModelEntry, error) {
+		return []hostAuthModelEntry{{
+			ID:        "openai-compatibility:modelscope:live",
+			AuthIndex: "runtime-live",
+		}}, nil
+	}
+	t.Cleanup(func() { hostAuthModels = originalHostAuthModels })
+
+	_, raw, _, ordered, providerOrder, _, _, _, _, _, err := resolveKeys("http://host.invalid", "management-key", []string{providerName})
+	if err != nil {
+		t.Fatalf("resolveKeys returned error: %v", err)
+	}
+	if len(ordered) != 1 || ordered[0] != "openai-compatibility:modelscope:live" {
+		t.Fatalf("resolved auth IDs = %v, want only the live credential", ordered)
+	}
+	if len(raw) != 1 || raw[ordered[0]] != "ms-key-live" {
+		t.Fatalf("resolved raw keys = %v, want only ms-key-live", raw)
+	}
+	if got := providerOrder[providerName]; len(got) != 1 || got[0] != ordered[0] {
+		t.Fatalf("provider order = %v, want only the live credential", got)
+	}
+}
+
+type resolveKeysRoundTrip func(*http.Request) (*http.Response, error)
+
+func (roundTrip resolveKeysRoundTrip) RoundTrip(req *http.Request) (*http.Response, error) {
+	return roundTrip(req)
+}
+
 // collisionSuffix 返回 12 位 short 之后的 -N 部分，没有时返回空串。
 func collisionSuffix(id string) string {
 	// id 形如 kind:short[-N]；short 是最后一个冒号后面的 12 个十六进制字符。
@@ -67,7 +246,7 @@ func collisionSuffix(id string) string {
 // TestMaskKeyShowsLast12NoEllipsis 校验 key 列显示 api-key 的末 12 位且不带省略号前缀，
 // 这样运维可以把表里的掩码与 config.yaml 里某个 key 的尾部直接对上。
 func TestMaskKeyShowsLast12NoEllipsis(t *testing.T) {
-	full := "ms-b57ca7a1-2bbb-4867-a1ec-840ef1c90968"
+	full := "ms-11111111-2222-3333-4444-abcdef123456"
 	want := full[len(full)-12:]
 	if got := maskKey(full); got != want {
 		t.Fatalf("maskKey = %q, want last 12 %q", got, want)
@@ -100,7 +279,7 @@ func TestBuildDedupMaps(t *testing.T) {
 		"openai-compatibility:modelscope:dddd11112222",
 	}
 
-	dedup, groups, _, maskToSite := buildDedupMaps(ordered, raw, siteBase)
+	dedup, groups, _, maskToSite, maskToAuthID := buildDedupMaps(ordered, raw, siteBase)
 
 	if len(dedup) != 2 {
 		t.Fatalf("dedup count = %d, want 2 (duplicate key collapsed)", len(dedup))
@@ -119,6 +298,9 @@ func TestBuildDedupMaps(t *testing.T) {
 
 	if got := maskToSite[maskKey("ms-key-dup-1")]; got != "https://modelscope.cn" {
 		t.Fatalf("maskToSite = %q, want the first provider's site", got)
+	}
+	if got := maskToAuthID[maskKey("ms-key-dup-1")]; got != ordered[0] {
+		t.Fatalf("maskToAuthID = %q, want the first auth ID %q", got, ordered[0])
 	}
 }
 

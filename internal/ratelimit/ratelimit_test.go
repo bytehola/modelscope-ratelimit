@@ -491,11 +491,11 @@ func TestOnResponseWithMetadataAuthID(t *testing.T) {
 
 	resp := s.OnResponse(ResponseInterceptRequest{
 		Model:           "Qwen-72B",
-		ResponseHeaders: nil, StatusCode: 429, Body: insufficientBalanceBody,
+		ResponseHeaders: nil, StatusCode: 429, Body: []byte(insufficientBalanceBody),
 		Metadata: map[string]any{"auth_id": "auth-1"},
 	})
 	// 插件不得改写响应。
-	if resp.Body != "" || len(resp.Headers) != 0 {
+	if len(resp.Body) != 0 || len(resp.Headers) != 0 {
 		t.Fatal("response interceptor must return a no-op result")
 	}
 	if !s.isDisabled("auth-1", "Qwen-72B", now) {

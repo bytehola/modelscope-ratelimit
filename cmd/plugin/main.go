@@ -104,9 +104,31 @@ import (
 // 出现在宿主自己的日志文件里。
 var store = modelscope.NewStore(stderrLogger{})
 
-const pluginVersion = "2.4.10"
+const pluginVersion = "2.4.15"
 
 var pluginHost *C.cliproxy_host_api
+
+const maxPluginSchemaVersion uint32 = 6
+
+var activePluginSchemaVersion atomic.Uint32
+
+func negotiatePluginSchemaVersion(hostVersion uint32) uint32 {
+	if hostVersion == 0 {
+		return 1
+	}
+	if hostVersion > maxPluginSchemaVersion {
+		return maxPluginSchemaVersion
+	}
+	return hostVersion
+}
+
+func currentPluginSchemaVersion() uint32 {
+	version := activePluginSchemaVersion.Load()
+	if version == 0 {
+		return 1
+	}
+	return version
+}
 
 //go:embed status_page.html
 var statusPageHTML []byte
@@ -139,12 +161,13 @@ type strategyEntry struct {
 }
 
 type resolvedEntry struct {
-	masked     map[string]string
-	raw        map[string]string // authID 到原始 API key（即 m_session_id cookie 值）
-	maskToRaw  map[string]string // maskedKey 到原始 API key（O(1) 查找）
-	maskToSite map[string]string // maskedKey 到站点基础地址（O(1) 查找）
-	siteBase   map[string]string // authID 到 Modelscope 站点基础地址（cn/ai）
-	baseURL    map[string]string // authID 到上游 OpenAI 兼容基础地址
+	masked       map[string]string
+	raw          map[string]string // authID 到原始 API key（即 m_session_id cookie 值）
+	maskToRaw    map[string]string // maskedKey 到原始 API key（O(1) 查找）
+	maskToSite   map[string]string // maskedKey 到站点基础地址（O(1) 查找）
+	maskToAuthID map[string]string // maskedKey 到配置顺序中第一个真实 auth ID
+	siteBase     map[string]string // authID 到 Modelscope 站点基础地址（cn/ai）
+	baseURL      map[string]string // authID 到上游 OpenAI 兼容基础地址
 	// routeToName 把某个 provider 可被宿主路由的模型 ID 映射到真正的上游模型名。路由 ID 就是
 	// CLIProxyAPI 注册进模型注册表的那个名字：alias 非空时是 alias，否则是 name（见 sdk/cliproxy
 	// 的 buildConfiguredModelInfo：ModelInfo.ID = alias || name）。
@@ -314,6 +337,13 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	return 0
 }
 
+// maxPluginRequestBytes 是接受的最大请求帧长度。
+//
+// 宿主送来的拦截帧里带着响应体（非流式是一次完整响应，流式是单个分块），正常情况下都在
+// 兆字节级。这里设 64 MiB 只是为了让病态帧显式失败，而不是把插件堆推到 OOM —— Windows
+// 上一次失败的 16 MiB 分配就会触发 runtime.throw，recover 拦不住，进程直接消失。
+const maxPluginRequestBytes = 64 << 20
+
 //export cliproxyPluginCall
 func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
 	// 顶层保险：插件 Go 代码里任何位置的 panic 都不能越过 cgo 边界，否则宿主会把整个插件
@@ -332,6 +362,11 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	}
 	if method == nil {
 		writeResponse(response, errorEnvelope("invalid_method", "method is required"))
+		return 1
+	}
+	if requestLen > maxPluginRequestBytes {
+		writeResponse(response, errorEnvelope("request_too_large",
+			fmt.Sprintf("request frame is %d bytes, limit is %d", uint64(requestLen), uint64(maxPluginRequestBytes))))
 		return 1
 	}
 	var requestBytes []byte
@@ -446,8 +481,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		if err := json.Unmarshal(request, &r); err != nil {
 			return nil, err
 		}
-		store.OnUsage(r)
-		applyAccountLevelDisable(r)
+		processUsageRecord(r)
 		return okEnvelope(struct{}{})
 
 	case pluginabi.MethodManagementRegister:
@@ -519,14 +553,33 @@ func applyAccountLevelDisable(rec modelscope.UsageRecord) {
 	}
 }
 
-func configure(raw []byte) error {
-	var req struct {
-		ConfigYAML []byte `json:"config_yaml"`
+// processUsageRecord 是胶水层所有用量入口的统一路径。核心层先更新调度状态，随后账号级
+// 失败再同步账号缓存和共享同一原始 key 的其它 AuthID。
+func processUsageRecord(rec modelscope.UsageRecord) {
+	store.OnUsage(rec)
+	applyAccountLevelDisable(rec)
+}
+
+type pluginLifecycleRequest struct {
+	SchemaVersion uint32 `json:"schema_version"`
+	ConfigYAML    []byte `json:"config_yaml"`
+}
+
+func decodePluginLifecycleRequest(raw []byte) (pluginLifecycleRequest, error) {
+	var request pluginLifecycleRequest
+	if len(raw) == 0 {
+		return request, nil
 	}
-	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &req); err != nil {
-			return err
-		}
+	if err := json.Unmarshal(raw, &request); err != nil {
+		return pluginLifecycleRequest{}, err
+	}
+	return request, nil
+}
+
+func configure(raw []byte) error {
+	req, err := decodePluginLifecycleRequest(raw)
+	if err != nil {
+		return err
 	}
 	var cfgMap map[string]any
 	if len(req.ConfigYAML) > 0 {
@@ -539,6 +592,7 @@ func configure(raw []byte) error {
 		return err
 	}
 	store.Reconfigure(cfg)
+	activePluginSchemaVersion.Store(negotiatePluginSchemaVersion(req.SchemaVersion))
 	// 每次配置真正变化只打印一行，便于从宿主日志里看出是哪个构建、按什么生效参数在应答。宿主会同时调
 	// 用 plugin.register 和 plugin.reconfigure，没有保护的横幅会在一次重载里重复多行。这里绝不打印
 	// 管理密钥或任何凭据内容。
@@ -697,6 +751,11 @@ func currentConfig() *modelscope.Config {
 // 直连本机 HTTP 只会返回错误，最多退化成一页引导提示。
 var resolveHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
+// maxManagementResponseBytes 是管理 API 响应体的读取上限。这些接口返回的是本机
+// openai-compatibility 配置与账号列表，正常在几百 KiB 以内；设上限是为了防止异常响应把
+// 插件堆撑大，而不是为了支持大响应。
+const maxManagementResponseBytes = 16 << 20
+
 // httpDo 在插件自己的 runtime 里发起 HTTP 请求，返回状态码和响应体。只用于本机管理 API，因此不需
 // 要代理或宿主的传输策略。
 func httpDo(method, url, bearerKey string) (int, []byte, error) {
@@ -713,9 +772,13 @@ func httpDo(method, url, bearerKey string) (int, []byte, error) {
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	// 比上限多读一个字节，用来区分"正好到上限"和"超限被截断"。
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxManagementResponseBytes+1))
 	if err != nil {
 		return resp.StatusCode, nil, err
+	}
+	if len(body) > maxManagementResponseBytes {
+		return resp.StatusCode, nil, fmt.Errorf("management response exceeds %d bytes", maxManagementResponseBytes)
 	}
 	return resp.StatusCode, body, nil
 }
@@ -740,8 +803,9 @@ type mgmtOpenAICompatEntry struct {
 	Disabled      bool   `json:"disabled"`
 	BaseURL       string `json:"base-url"`
 	APIKeyEntries []struct {
-		APIKey   string `json:"api-key"`
-		ProxyURL string `json:"proxy-url"`
+		APIKey    string `json:"api-key"`
+		ProxyURL  string `json:"proxy-url"`
+		AuthIndex string `json:"auth-index"`
 	} `json:"api-key-entries"`
 	Models []struct {
 		Name  string `json:"name"`
@@ -749,11 +813,10 @@ type mgmtOpenAICompatEntry struct {
 	} `json:"models"`
 }
 
-// stableIDGen 完整复刻宿主的 synthesizer.StableIDGenerator，包括按 (kind:short) 维护的碰撞计数
-// 器：当两条不同的 api-key 哈希出同一个 12 位十六进制 short 时，会追加 "-N" 后缀（例如
-// "1ae0d269c959-1"）。没有这个计数器时，碰撞的 key 会合并成一条掩码条目，带后缀的那条永远不出现在
-// key 明细表里。条目按配置顺序处理（管理 API 保持该顺序），并跳过 disabled 的兼容配置，与
-// synthesizeOpenAICompat 一致，因此推导出的 ID 与插件实际看到的 auth ID 逐字节相同。
+// stableIDGen 复刻旧宿主的 synthesizer.StableIDGenerator，包括按 (kind:short) 维护的碰撞
+// 计数器。最新宿主的 hash parts 还包含 connection-pool 身份，因此只要管理 API 给出
+// auth-index，就优先使用 host.auth.models 返回的全部运行时凭据；stableIDGen 仅作为旧宿主
+// 和实时映射暂时不可用时的回退。
 type stableIDGen struct {
 	counters map[string]int
 }
@@ -784,10 +847,54 @@ func (g *stableIDGen) Next(kind string, parts ...string) string {
 	return kind + ":" + short
 }
 
+const methodHostAuthModels = "host.auth.models"
+
+type hostAuthModelEntry struct {
+	ID        string `json:"id"`
+	AuthIndex string `json:"auth_index"`
+}
+
+// hostAuthModels 通过宿主回调读取全部运行时凭据。与 host.auth.list 只返回文件型和显式
+// runtime-only 凭据不同，host.auth.models 也包含配置式 openai-compatibility 凭据，因此能覆盖
+// 本插件管理的 Modelscope API key。
+var hostAuthModels = func() ([]hostAuthModelEntry, error) {
+	raw, err := callHost(methodHostAuthModels, []byte(`{}`))
+	if err != nil {
+		return nil, err
+	}
+	var response struct {
+		Credentials []hostAuthModelEntry `json:"credentials"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return nil, fmt.Errorf("decode host.auth.models response: %w", err)
+	}
+	return response.Credentials, nil
+}
+
+var hostAuthModelsFallbackLogged sync.Once
+
+// liveAuthIDsByRuntimeIndex 把管理页返回的 auth-index 映射到调度器实际使用的 AuthID。
+func liveAuthIDsByRuntimeIndex() (map[string]string, error) {
+	files, err := hostAuthModels()
+	if err != nil {
+		return nil, err
+	}
+	authIDs := make(map[string]string, len(files))
+	for _, file := range files {
+		authIndex := strings.TrimSpace(file.AuthIndex)
+		authID := strings.TrimSpace(file.ID)
+		if authIndex == "" || authID == "" {
+			continue
+		}
+		authIDs[authIndex] = authID
+	}
+	return authIDs, nil
+}
+
 // resolveKeys 用直连 net/http 拉取 /v0/management/openai-compatibility，返回掩码 key
-// （authID 到掩码）、真实配置的 key 数量，以及在上游找不到的配置 provider。auth ID 由每把
-// api-key 经 stableIDGen（宿主的 StableIDGenerator 算法）推导，因此不需要再去 join auth-files
-// （auth-files 不含配置式 api-key）。管理密钥只留在服务端，任何敏感内容都不会进浏览器。
+// （authID 到掩码）、真实配置的 key 数量，以及在上游找不到的配置 provider。最新宿主在
+// auth-index 里给出运行时索引，再用 host.auth.models 映射到真实 AuthID；旧宿主没有该字段或
+// 实时映射暂时不可用时回退到 stableIDGen。管理密钥只留在服务端，任何敏感内容都不会进浏览器。
 func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string]string, raw map[string]string, siteBase map[string]string, orderedAuthIDs []string, providerOrder map[string][]string, realTotal int, unmatched []string, baseURLs map[string]string, routeToName map[string]map[string]string, nameToRoute map[string]map[string]string, err error) {
 	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if base == "" {
@@ -826,6 +933,23 @@ func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string
 	realTotal = 0
 	matched := make(map[string]bool, len(providers))
 	idGen := newStableIDGen()
+	var (
+		authIDsByRuntimeIndex map[string]string
+		liveAuthLoadErr       error
+		liveAuthIDsLoaded     bool
+		missingLiveAuthIDs    int
+	)
+	loadLiveAuthIDs := func() error {
+		if liveAuthIDsLoaded {
+			return liveAuthLoadErr
+		}
+		liveAuthIDsLoaded = true
+		authIDsByRuntimeIndex, liveAuthLoadErr = liveAuthIDsByRuntimeIndex()
+		if liveAuthLoadErr != nil {
+			liveAuthLoadErr = fmt.Errorf("resolve live auth IDs: %w", liveAuthLoadErr)
+		}
+		return liveAuthLoadErr
+	}
 	for _, e := range oc.List {
 		nm := strings.ToLower(strings.TrimSpace(e.Name))
 		if len(want) > 0 && !want[nm] {
@@ -851,6 +975,20 @@ func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string
 				continue
 			}
 			authID := idGen.Next(idKind, k.APIKey, e.BaseURL, k.ProxyURL)
+			if authIndex := strings.TrimSpace(k.AuthIndex); authIndex != "" {
+				if err := loadLiveAuthIDs(); err != nil {
+					hostAuthModelsFallbackLogged.Do(func() {
+						logInfo("modelscope-ratelimit: live auth lookup failed, falling back to stable IDs: %v", err)
+					})
+				} else if liveAuthID := strings.TrimSpace(authIDsByRuntimeIndex[authIndex]); liveAuthID != "" {
+					authID = liveAuthID
+				} else {
+					// models 回调成功但索引缺失，通常表示该凭据已被宿主禁用或移除。此时不能
+					// 猜 stable ID，否则连接池开启后会把状态记到错误的 AuthID 上。
+					missingLiveAuthIDs++
+					continue
+				}
+			}
 			masked[authID] = maskKey(k.APIKey)
 			raw[authID] = k.APIKey
 			siteBase[authID] = siteBaseFromURL(e.BaseURL)
@@ -877,6 +1015,9 @@ func resolveKeys(baseURL, mgmtKey string, providers []string) (masked map[string
 		}
 		routeToName[nm] = routes
 		nameToRoute[nm] = toRoute
+	}
+	if missingLiveAuthIDs > 0 {
+		logInfo("modelscope-ratelimit: skipped %d configured credential(s) absent from host.auth.models", missingLiveAuthIDs)
 	}
 
 	// 配置里写了、但没有任何上游 openai-compatibility 条目能匹配上的 provider。
@@ -913,8 +1054,8 @@ func resolvedExpired(c resolvedEntry) bool {
 // 径（startResolveRefresh）共用它，保证写缓存的逻辑只有一处。
 func performResolve(baseURL, mgmtKey string, providers []string) resolvedEntry {
 	masked, raw, siteBase, orderedAuthIDs, providerOrder, realTotal, unmatched, baseURLs, routeToName, nameToRoute, err := resolveKeys(baseURL, mgmtKey, providers)
-	dedupedAuthIDs, rawToAuthIDs, maskToRaw, maskToSite := buildDedupMaps(orderedAuthIDs, raw, siteBase)
-	refreshed := resolvedEntry{masked: masked, raw: raw, maskToRaw: maskToRaw, maskToSite: maskToSite, siteBase: siteBase, baseURL: baseURLs, routeToName: routeToName, nameToRoute: nameToRoute, orderedAuthIDs: orderedAuthIDs, dedupedAuthIDs: dedupedAuthIDs, rawToAuthIDs: rawToAuthIDs, providerOrder: providerOrder, realTotal: realTotal, unmatched: unmatched, err: err, at: time.Now()}
+	dedupedAuthIDs, rawToAuthIDs, maskToRaw, maskToSite, maskToAuthID := buildDedupMaps(orderedAuthIDs, raw, siteBase)
+	refreshed := resolvedEntry{masked: masked, raw: raw, maskToRaw: maskToRaw, maskToSite: maskToSite, maskToAuthID: maskToAuthID, siteBase: siteBase, baseURL: baseURLs, routeToName: routeToName, nameToRoute: nameToRoute, orderedAuthIDs: orderedAuthIDs, dedupedAuthIDs: dedupedAuthIDs, rawToAuthIDs: rawToAuthIDs, providerOrder: providerOrder, realTotal: realTotal, unmatched: unmatched, err: err, at: time.Now()}
 	resolvedMu.Lock()
 	resolvedCache = refreshed
 	resolvedMu.Unlock()
@@ -966,11 +1107,12 @@ func resolveKeysCached(baseURL, mgmtKey string, providers []string) (map[string]
 
 // buildDedupMaps 从解析出的 key 数据构建去重与查找映射。单独抽成纯函数是为了不依赖 HTTP 也能单测。
 // 同一把原始 api key 出现在多个 provider（不同 auth ID）时，dedupedAuthIDs、maskToRaw、
-// maskToSite 只保留第一次出现的那条（配置顺序里的第一家），而 rawToAuthIDs 会把共享该原始 key 的
-// 所有 auth ID 归组，用于禁用传播。
-func buildDedupMaps(orderedAuthIDs []string, raw map[string]string, siteBase map[string]string) (dedupedAuthIDs []string, rawToAuthIDs map[string][]string, maskToRaw map[string]string, maskToSite map[string]string) {
+// maskToSite、maskToAuthID 只保留第一次出现的那条（配置顺序里的第一家），而 rawToAuthIDs 会把
+// 共享该原始 key 的所有 auth ID 归组，用于禁用传播。
+func buildDedupMaps(orderedAuthIDs []string, raw map[string]string, siteBase map[string]string) (dedupedAuthIDs []string, rawToAuthIDs map[string][]string, maskToRaw map[string]string, maskToSite map[string]string, maskToAuthID map[string]string) {
 	maskToRaw = make(map[string]string, len(raw))
 	maskToSite = make(map[string]string, len(raw))
+	maskToAuthID = make(map[string]string, len(raw))
 	rawToAuthIDs = make(map[string][]string, len(raw))
 	seenKeys := make(map[string]bool, len(raw))
 	dedupedAuthIDs = make([]string, 0, len(orderedAuthIDs))
@@ -985,8 +1127,9 @@ func buildDedupMaps(orderedAuthIDs []string, raw map[string]string, siteBase map
 		mk := maskKey(sid)
 		maskToRaw[mk] = sid
 		maskToSite[mk] = siteBase[authID]
+		maskToAuthID[mk] = authID
 	}
-	return dedupedAuthIDs, rawToAuthIDs, maskToRaw, maskToSite
+	return dedupedAuthIDs, rawToAuthIDs, maskToRaw, maskToSite, maskToAuthID
 }
 
 // getResolved 返回缓存解析条目的值拷贝。这些 map 在构造之后不再修改，所以拷贝结构体开销很小，还能避
@@ -1097,7 +1240,7 @@ func pluginRegistration() any {
 		Metadata      pluginapi.Metadata       `json:"metadata"`
 		Capabilities  registrationCapabilities `json:"capabilities"`
 	}{
-		SchemaVersion: pluginabi.SchemaVersion,
+		SchemaVersion: currentPluginSchemaVersion(),
 		Metadata: pluginapi.Metadata{
 			Name:             "modelscope-ratelimit",
 			Version:          pluginVersion,
@@ -1283,8 +1426,9 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 	switch api {
 	case "config":
 		return mgmtJSON(map[string]any{
-			"version":       pluginVersion,
-			"use_responses": cfg.UseResponses,
+			"version":        pluginVersion,
+			"schema_version": currentPluginSchemaVersion(),
+			"use_responses":  cfg.UseResponses,
 		})
 	case "accounts":
 		refresh := getQuery(r, "refresh")
@@ -1455,6 +1599,7 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 		if sessionID == "" {
 			return mgmtJSONError(404, "key not found")
 		}
+		authID := authIDByMask(resolved, mk)
 		mc := &msClient{}
 		// 并发拉取余额与流水
 		var (
@@ -1480,12 +1625,13 @@ func handleStatusAPI(r managementRequest, api string) managementResponse {
 				result["balance"] = map[string]any{"total": b.TotalBalance, "available": b.AvailableBalance, "frozen": b.FrozenAmount}
 				// 更新账号缓存，让下一次 ?api=accounts 显示真实余额（修正 markAccountExhausted 之前把
 				// available=0、schedule=exhausted 写死的问题）。schedule 走与余额刷新同一份
-				// nextSchedule：未验证邮箱与密钥失效不能被余额结果盖成 normal。
+				// scheduleAfterBalance 会优先保留核心层仍有效的禁用原因。
 				updateAccountByMask(mk, func(account *accountSummary) {
+					account.authID = authID
 					account.Balance = &balanceJSON{
 						Total: b.TotalBalance, Available: b.AvailableBalance, Frozen: b.FrozenAmount,
 					}
-					account.Schedule = nextSchedule(account.Schedule, b.AvailableBalance)
+					account.Schedule = scheduleAfterBalance(authID, account.Schedule, b.AvailableBalance, store.Now())
 				})
 			}
 		}
@@ -1554,6 +1700,20 @@ func getQueryInt(r managementRequest, key string) int {
 // maskToRaw、maskToSite 做 O(1) 查找。
 func getKeysByMask(r resolvedEntry, maskedKey string) (string, string) {
 	return r.maskToRaw[maskedKey], r.maskToSite[maskedKey]
+}
+
+// authIDByMask 返回账号页掩码对应的真实 AuthID。新解析结果直接走 map；测试夹具和旧缓存
+// 没有 maskToAuthID 时，再按配置顺序反查一次。
+func authIDByMask(r resolvedEntry, maskedKey string) string {
+	if authID := strings.TrimSpace(r.maskToAuthID[maskedKey]); authID != "" {
+		return authID
+	}
+	for _, authID := range r.dedupedAuthIDs {
+		if r.masked[authID] == maskedKey {
+			return authID
+		}
+	}
+	return ""
 }
 
 func mgmtJSON(v any) managementResponse {
@@ -2424,15 +2584,15 @@ func executeResponsesPassthrough(req executorRequestWithCallback) (pluginapi.Exe
 		resp, errDo := hostHTTPDo(upstreamReq, req.HostCallbackID)
 		if errDo != nil {
 			logInfoRequest(req.HostCallbackID, "responses upstream request failed provider=%s model=%s: %v", cand.provider, cand.model, errDo)
-			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, errDo.Error(), cand.provider, cand.model))
+			processUsageRecord(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, errDo.Error(), cand.provider, cand.model))
 			continue
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			logInfoRequest(req.HostCallbackID, "responses upstream HTTP %d provider=%s model=%s body=%s", resp.StatusCode, cand.provider, cand.model, logBodyExcerpt(string(resp.Body)))
-			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, resp.StatusCode, string(resp.Body), cand.provider, cand.model))
+			processUsageRecord(usageRecordForFailure(cand.authID, req.ExecutorRequest, resp.StatusCode, string(resp.Body), cand.provider, cand.model))
 			if retryableResponsesFailure(resp.StatusCode, string(resp.Body)) {
 				// 405 与 503 + model_not_ready 是本家所有 key 共同的拒绝：本请求内丢掉这一家剩下的
-				// key 步骤，别逐把白撞。跨请求的 skip 集由上面那条 store.OnUsage 走核心层判据。
+				// key 步骤，别逐把白撞。跨请求的 skip 集由上面的 processUsageRecord 走核心层判据。
 				if modelscope.IsProviderAvailabilityRejection(resp.StatusCode, string(resp.Body)) && cfg.SkipProviderOn429 {
 					unsupportedProviders[providerName] = true
 				}
@@ -2464,7 +2624,7 @@ func executeResponsesPassthrough(req executorRequestWithCallback) (pluginapi.Exe
 				return pluginapi.ExecutorResponse{}, errRejected
 			}
 			logInfoRequest(req.HostCallbackID, "responses failed provider=%s model=%s body=%s", cand.provider, cand.model, logBodyExcerpt(respBody))
-			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, resp.StatusCode, respBody, cand.provider, cand.model))
+			processUsageRecord(usageRecordForFailure(cand.authID, req.ExecutorRequest, resp.StatusCode, respBody, cand.provider, cand.model))
 			continue
 		}
 		// Modelscope 会把部分拒绝以 HTTP 200 加一段裸错误文档返回。要把它
@@ -2475,10 +2635,10 @@ func executeResponsesPassthrough(req executorRequestWithCallback) (pluginapi.Exe
 				return pluginapi.ExecutorResponse{}, errRejected
 			}
 			logInfoRequest(req.HostCallbackID, "responses provider=%s model=%s returned an error payload with HTTP 200: %s", cand.provider, cand.model, logBodyExcerpt(respBody))
-			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, resp.StatusCode, respBody, cand.provider, cand.model))
+			processUsageRecord(usageRecordForFailure(cand.authID, req.ExecutorRequest, resp.StatusCode, respBody, cand.provider, cand.model))
 			continue
 		}
-		store.OnUsage(modelscope.UsageRecord{
+		processUsageRecord(modelscope.UsageRecord{
 			Provider: "openai-compatible-" + cand.provider,
 			AuthID:   cand.authID,
 			Model:    cand.model,
@@ -2606,7 +2766,7 @@ func executeResponsesPassthroughStream(req executorRequestWithCallback) (plugina
 		stream, errStream := hostHTTPDoStream(upstreamReq, req.HostCallbackID)
 		if errStream != nil {
 			logInfoRequest(req.HostCallbackID, "responses upstream stream open failed provider=%s model=%s: %v", cand.provider, cand.model, errStream)
-			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, errStream.Error(), cand.provider, cand.model))
+			processUsageRecord(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, errStream.Error(), cand.provider, cand.model))
 			continue
 		}
 		if stream.StatusCode != 200 {
@@ -2614,9 +2774,9 @@ func executeResponsesPassthroughStream(req executorRequestWithCallback) (plugina
 			hostHTTPStreamClose(stream.StreamID)
 			logInfoRequest(req.HostCallbackID, "responses upstream stream HTTP %d provider=%s model=%s body=%s", stream.StatusCode, cand.provider, cand.model, logBodyExcerpt(string(bodyBytes)))
 			if errRead != nil {
-				store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, stream.StatusCode, errRead.Error(), cand.provider, cand.model))
+				processUsageRecord(usageRecordForFailure(cand.authID, req.ExecutorRequest, stream.StatusCode, errRead.Error(), cand.provider, cand.model))
 			} else {
-				store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, stream.StatusCode, string(bodyBytes), cand.provider, cand.model))
+				processUsageRecord(usageRecordForFailure(cand.authID, req.ExecutorRequest, stream.StatusCode, string(bodyBytes), cand.provider, cand.model))
 			}
 			if retryableResponsesFailure(stream.StatusCode, string(bodyBytes)) {
 				// 与直连分支同理：405 与 503 + model_not_ready 换 key 都救不回来，本请求内丢掉这一家。
@@ -2631,13 +2791,13 @@ func executeResponsesPassthroughStream(req executorRequestWithCallback) (plugina
 		first, done, errRead := readHostStreamChunk(stream.StreamID)
 		if errRead != nil {
 			hostHTTPStreamClose(stream.StreamID)
-			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, errRead.Error(), cand.provider, cand.model))
+			processUsageRecord(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, errRead.Error(), cand.provider, cand.model))
 			continue
 		}
 		preflight, errPreflight := preflightResponsesStream(stream.StreamID, first, done)
 		if errPreflight != nil {
 			hostHTTPStreamClose(stream.StreamID)
-			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, errPreflight.Error(), cand.provider, cand.model))
+			processUsageRecord(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, errPreflight.Error(), cand.provider, cand.model))
 			continue
 		}
 		switch preflight.status {
@@ -2666,7 +2826,7 @@ func executeResponsesPassthroughStream(req executorRequestWithCallback) (plugina
 			}
 			logInfoRequest(req.HostCallbackID, "responses stream failed provider=%s model=%s: %s", cand.provider, cand.model, logBodyExcerpt(preflight.reason))
 			hostHTTPStreamClose(stream.StreamID)
-			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, stream.StatusCode, preflight.reason, cand.provider, cand.model))
+			processUsageRecord(usageRecordForFailure(cand.authID, req.ExecutorRequest, stream.StatusCode, preflight.reason, cand.provider, cand.model))
 			continue
 		case responsesStreamPreflightErrorPayload:
 			// Modelscope 会把部分拒绝以 HTTP 200 加一段裸错误文档返回，而不是 SSE
@@ -2678,7 +2838,7 @@ func executeResponsesPassthroughStream(req executorRequestWithCallback) (plugina
 			}
 			logInfoRequest(req.HostCallbackID, "responses stream provider=%s model=%s returned an error payload with HTTP 200: %s", cand.provider, cand.model, logBodyExcerpt(preflight.reason))
 			hostHTTPStreamClose(stream.StreamID)
-			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, stream.StatusCode, preflight.reason, cand.provider, cand.model))
+			processUsageRecord(usageRecordForFailure(cand.authID, req.ExecutorRequest, stream.StatusCode, preflight.reason, cand.provider, cand.model))
 			continue
 		}
 		logDebugRequest(req.HostCallbackID, "responses stream served provider=%s mode=passthrough model=%s", cand.provider, cand.model)
@@ -2883,7 +3043,7 @@ func forwardResponsesStream(req executorRequestWithCallback, cand retryCandidate
 
 	if first.Payload != nil || first.Err != nil {
 		if first.Err != nil {
-			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, first.Err.Error(), cand.provider, cand.model))
+			processUsageRecord(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, first.Err.Error(), cand.provider, cand.model))
 			_ = hostStreamEmit(req.StreamID, nil, first.Err.Error())
 			hostStreamClose(req.StreamID, first.Err.Error())
 			return
@@ -2897,9 +3057,9 @@ func forwardResponsesStream(req executorRequestWithCallback, cand retryCandidate
 		// 首个数据块已由 executeResponsesPassthroughStream 预筛过：response.failed 不会走到
 		// 这里。flush(final=true) 已把末尾无 \n 的行也吐出。
 		if responsesFailed {
-			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 200, failedBody, cand.provider, cand.model))
+			processUsageRecord(usageRecordForFailure(cand.authID, req.ExecutorRequest, 200, failedBody, cand.provider, cand.model))
 		} else {
-			store.OnUsage(modelscope.UsageRecord{
+			processUsageRecord(modelscope.UsageRecord{
 				Provider: "openai-compatible-" + cand.provider,
 				AuthID:   cand.authID,
 				Model:    cand.model,
@@ -2913,14 +3073,14 @@ func forwardResponsesStream(req executorRequestWithCallback, cand retryCandidate
 		chunk, isDone, errRead := readHostStreamChunk(upstreamStreamID)
 		if errRead != nil {
 			_ = flush(nil, false)
-			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, errRead.Error(), cand.provider, cand.model))
+			processUsageRecord(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, errRead.Error(), cand.provider, cand.model))
 			_ = hostStreamEmit(req.StreamID, nil, errRead.Error())
 			hostStreamClose(req.StreamID, errRead.Error())
 			return
 		}
 		if chunk.Err != nil {
 			_ = flush(nil, false)
-			store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, chunk.Err.Error(), cand.provider, cand.model))
+			processUsageRecord(usageRecordForFailure(cand.authID, req.ExecutorRequest, 0, chunk.Err.Error(), cand.provider, cand.model))
 			_ = hostStreamEmit(req.StreamID, nil, chunk.Err.Error())
 			hostStreamClose(req.StreamID, chunk.Err.Error())
 			return
@@ -2931,9 +3091,9 @@ func forwardResponsesStream(req executorRequestWithCallback, cand retryCandidate
 		}
 		if isDone {
 			if responsesFailed {
-				store.OnUsage(usageRecordForFailure(cand.authID, req.ExecutorRequest, 200, failedBody, cand.provider, cand.model))
+				processUsageRecord(usageRecordForFailure(cand.authID, req.ExecutorRequest, 200, failedBody, cand.provider, cand.model))
 			} else {
-				store.OnUsage(modelscope.UsageRecord{
+				processUsageRecord(modelscope.UsageRecord{
 					Provider: "openai-compatible-" + cand.provider,
 					AuthID:   cand.authID,
 					Model:    cand.model,

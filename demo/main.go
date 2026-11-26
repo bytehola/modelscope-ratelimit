@@ -67,6 +67,13 @@ func maskKey(k string) string {
 	return k[len(k)-12:]
 }
 
+func maskToken(token string) string {
+	if len(token) <= 10 {
+		return "***"
+	}
+	return token[:6] + "..." + token[len(token)-4:]
+}
+
 // Modelscope API 客户端（把 token 当作 m_session_id cookie 使用）
 
 var httpClient = &http.Client{Timeout: 15 * time.Second}
@@ -355,14 +362,14 @@ func (s *server) handleAccountDetail(w http.ResponseWriter, r *http.Request) {
 		if json.Unmarshal(data, &tl) == nil {
 			for _, t := range tl.Tokens {
 				d.Tokens = append(d.Tokens, tokenInfo{
-					ID: t.ID, Name: t.Name, Token: t.Token,
+					ID: t.ID, Name: t.Name, Token: maskToken(t.Token),
 					Valid: t.Valid == "1", Expires: t.Expires,
 				})
 			}
 		}
 	}
 
-	d.SdkToken = token
+	d.SdkToken = maskToken(token)
 	writeJSON(w, d)
 }
 
@@ -436,7 +443,7 @@ func writeJSONError(w http.ResponseWriter, msg string) {
 
 func main() {
 	keysFile := flag.String("keys", "../keys.txt", "path to keys.txt")
-	addr := flag.String("addr", ":8318", "listen address")
+	addr := flag.String("addr", "127.0.0.1:8318", "listen address")
 	flag.Parse()
 
 	cfg, err := loadKeys(*keysFile)
@@ -458,6 +465,6 @@ func main() {
 	})
 	mux.HandleFunc("/api/checkin-all", srv.handleCheckinAll)
 
-	log.Printf("demo server: http://127.0.0.1%s", *addr)
+	log.Printf("demo server: http://%s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))
 }

@@ -98,7 +98,7 @@ func TestOnStreamChunkResponsesRateLimitCooldown(t *testing.T) {
 		ChunkIndex:     0,
 		Model:          "Qwen-72B",
 		RequestedModel: "Qwen-72B",
-		Body:           responsesRateLimitBody,
+		Body:           []byte(responsesRateLimitBody),
 		Metadata:       map[string]any{"auth_id": "auth-1"},
 	})
 
@@ -125,6 +125,104 @@ func TestOnStreamChunkResponsesRateLimitCooldown(t *testing.T) {
 	}
 }
 
+func TestOnStreamChunkResponsesRateLimitAcrossLegacyHistoryChunks(t *testing.T) {
+	now := time.Date(2026, 8, 26, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
+	s, _ := newTestStore(now)
+	cfg := cfgWith("modelscope")
+	cfg.InsufficientQuotaCooldown = 0.1
+	s.Reconfigure(cfg)
+
+	firstChunk := []byte(`data: {"type":"response.fa`)
+	s.OnStreamChunk(StreamChunkInterceptRequest{
+		ChunkIndex:     0,
+		Model:          "Qwen-72B",
+		RequestedModel: "Qwen-72B",
+		Body:           firstChunk,
+		Metadata:       map[string]any{"auth_id": "auth-1"},
+	})
+	s.OnStreamChunk(StreamChunkInterceptRequest{
+		ChunkIndex:     1,
+		Model:          "Qwen-72B",
+		RequestedModel: "Qwen-72B",
+		Body:           []byte(`iled","response":{"error":{"code":"rate_limit_exceeded"}}}` + "\n\n"),
+		HistoryChunks:  [][]byte{firstChunk},
+		Metadata:       map[string]any{"auth_id": "auth-1"},
+	})
+
+	if s.RateLimitCount() != 1 {
+		t.Fatalf("RateLimitCount = %d, want 1", s.RateLimitCount())
+	}
+	if wait := s.cooldownWaitDuration(now); wait <= 0 {
+		t.Fatal("cross-chunk response.failed/rate_limit_exceeded must set a cooldown")
+	}
+}
+
+func TestOnStreamChunkResponsesRateLimitAcrossChunksWithoutHistory(t *testing.T) {
+	now := time.Date(2026, 8, 26, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
+	s, _ := newTestStore(now)
+	cfg := cfgWith("modelscope")
+	cfg.InsufficientQuotaCooldown = 0.1
+	s.Reconfigure(cfg)
+
+	const requestID = "stream-without-history"
+	s.OnStreamChunk(StreamChunkInterceptRequest{
+		RequestID:      requestID,
+		ChunkIndex:     0,
+		Model:          "Qwen-72B",
+		RequestedModel: "Qwen-72B",
+		Body:           []byte(`data: {"type":"response.failed","response":{"error":{`),
+		Metadata:       map[string]any{"auth_id": "auth-1"},
+	})
+	s.OnStreamChunk(StreamChunkInterceptRequest{
+		RequestID:      requestID,
+		ChunkIndex:     1,
+		Model:          "Qwen-72B",
+		RequestedModel: "Qwen-72B",
+		Body:           []byte(`"code":"rate_limit_exceeded","message":"slow down"}}}` + "\n\n"),
+		Metadata:       map[string]any{"auth_id": "auth-1"},
+	})
+
+	if s.RateLimitCount() != 1 {
+		t.Fatalf("RateLimitCount = %d, want 1", s.RateLimitCount())
+	}
+	if wait := s.cooldownWaitDuration(now); wait <= 0 {
+		t.Fatal("schema 5+ path without HistoryChunks must still detect a split rate-limit event")
+	}
+}
+
+func TestOnStreamChunkTerminalStateWaitsForBoundaryAfterMarker(t *testing.T) {
+	now := time.Date(2026, 8, 26, 10, 0, 0, 0, time.FixedZone("CST", 8*3600))
+	s, _ := newTestStore(now)
+	cfg := cfgWith("modelscope")
+	cfg.InsufficientQuotaCooldown = 0.1
+	s.Reconfigure(cfg)
+
+	const requestID = "stream-after-previous-event"
+	s.OnStreamChunk(StreamChunkInterceptRequest{
+		RequestID:      requestID,
+		ChunkIndex:     0,
+		Model:          "Qwen-72B",
+		RequestedModel: "Qwen-72B",
+		Body: []byte(
+			"data: {\"type\":\"response.created\"}\n\n" +
+				`data: {"type":"response.failed","response":{"error":{`,
+		),
+		Metadata: map[string]any{"auth_id": "auth-1"},
+	})
+	s.OnStreamChunk(StreamChunkInterceptRequest{
+		RequestID:      requestID,
+		ChunkIndex:     1,
+		Model:          "Qwen-72B",
+		RequestedModel: "Qwen-72B",
+		Body:           []byte(`"code":"rate_limit_exceeded","message":"slow down"}}}` + "\n\n"),
+		Metadata:       map[string]any{"auth_id": "auth-1"},
+	})
+
+	if s.RateLimitCount() != 1 {
+		t.Fatalf("RateLimitCount = %d, want 1", s.RateLimitCount())
+	}
+}
+
 // Responses 以 200 + response.failed(rate_limit_exceeded) 回送的拒绝只代表这一把 key，不允许把整家摘掉：
 // 否则请求会在第一家还剩大量可用 key 时提前跳到下一家，而下一家应答的是另一个上游模型。
 func TestOnStreamChunkResponsesRateLimitKeyLevelDoesNotSkipProvider(t *testing.T) {
@@ -138,7 +236,7 @@ func TestOnStreamChunkResponsesRateLimitKeyLevelDoesNotSkipProvider(t *testing.T
 		ChunkIndex:     0,
 		Model:          "Qwen-72B",
 		RequestedModel: "Qwen-72B",
-		Body:           responsesRateLimitBody,
+		Body:           []byte(responsesRateLimitBody),
 		Metadata: map[string]any{
 			"auth_id":  "auth-1",
 			"provider": "openai-compatible-modelscope",
@@ -209,10 +307,10 @@ func TestOnResponseResponsesRateLimitCooldown(t *testing.T) {
 		Model:          "Qwen-72B",
 		RequestedModel: "Qwen-72B",
 		StatusCode:     200,
-		Body:           responsesRateLimitBody,
+		Body:           []byte(responsesRateLimitBody),
 		Metadata:       map[string]any{"auth_id": "auth-1"},
 	})
-	if resp.Body != "" || len(resp.Headers) != 0 {
+	if len(resp.Body) != 0 || len(resp.Headers) != 0 {
 		t.Fatal("response interceptor must return a no-op result")
 	}
 	wait := s.cooldownWaitDuration(now)

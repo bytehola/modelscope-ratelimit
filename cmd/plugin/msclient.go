@@ -162,6 +162,7 @@ func (c *msClient) rateLimitFetcher(siteBase string) ratelimit.RateLimitFetcher 
 // ---- 管理接口端点（供前端 XHR 调用）----
 
 type accountSummary struct {
+	authID        string       // 宿主调度与用量记录使用的真实 AuthID，仅用于内部状态对齐
 	Index         int          `json:"index"`
 	MaskedKey     string       `json:"maskedKey"`
 	Phone         string       `json:"phone,omitempty"`
@@ -219,8 +220,8 @@ type tokenJSON struct {
 
 // fetchLoginInfo 调用 login/info（每日签到）和 users/info（手机号）。返回的 accountSummary 只填了
 // 资料部分，余额、限流和流水在第 2 阶段单独拉取，以便所有账号先完成签到再读余额。
-func (c *msClient) fetchLoginInfo(idx int, sessionID, siteBase, site string) accountSummary {
-	a := accountSummary{Index: idx, MaskedKey: maskKey(sessionID), Site: site, Schedule: "normal"}
+func (c *msClient) fetchLoginInfo(idx int, authID, sessionID, siteBase, site string) accountSummary {
+	a := accountSummary{authID: authID, Index: idx, MaskedKey: maskKey(sessionID), Site: site, Schedule: "normal"}
 
 	// 并发调用 login/info 与 users/info
 	var (
@@ -319,11 +320,13 @@ func (c *msClient) fetchBalanceData(a *accountSummary, sessionID, siteBase strin
 			}
 		}
 	}
-	// 收尾：按真实余额设置 schedule 状态
+	// 收尾：按真实余额与核心层禁用事实共同设置 schedule 状态。
 	if a.Balance == nil {
-		// 余额接口失败：schedule 保持原样（normal）
-	} else if a.Balance.Available <= 0 {
-		a.Schedule = "exhausted"
+		a.Schedule = scheduleAfterBalanceFailure(a.authID, a.Schedule, store.Now())
+	} else {
+		a.Schedule = scheduleAfterBalance(a.authID, a.Schedule, a.Balance.Available, store.Now())
+	}
+	if a.Balance != nil && a.Balance.Available <= 0 {
 		if a.Balance.Total == 0 && a.TodayConsumed > 0 {
 			a.Balance.Total = a.TodayConsumed
 		}
@@ -362,30 +365,75 @@ var (
 	refreshInProgress bool // 避免重复的后台刷新
 )
 
-// nextSchedule 由"余额接口返回成功时的可用魔粒数"推出账号该显示的调度状态。
-//
-// 它只处理余额能解释的状态：unverified（markAccountUnverified 记下的 403 未验证邮箱）与
-// unauthorized（login/info 返回 401/403 的密钥失效）都与余额多少无关，必须原样保留，否则余额
-// 结果会把真实原因盖成 normal 或 exhausted；这两个标签只由 login/info 的全量取数改写。
-//
-// 余额的两个入口（账号缓存刷新、账号详情的 refresh-balance）共用这一份规则；markAccountExhausted
-// 拿到的是确凿的 429 事实，直接落 exhausted，刻意不经过这里。
-func nextSchedule(current string, available int) string {
-	switch {
-	case current == "unverified", current == "unauthorized":
-		return current
-	case available <= 0:
+// scheduleForGlobalDisable 把核心层的全局禁用原因映射为账号页状态。
+func scheduleForGlobalDisable(reason string) string {
+	switch reason {
+	case ratelimit.ReasonUnverified:
+		return "unverified"
+	case ratelimit.ReasonUnauthorized:
+		return "unauthorized"
+	default:
 		return "exhausted"
-	case current == "exhausted":
-		return "normal" // 已恢复
+	}
+}
+
+// scheduleAfterBalance 根据一次成功的余额读取推导账号状态。核心层的全局禁用是调度事实，
+// 优先级高于余额；没有核心禁用时，正余额意味着恢复，零余额意味着耗尽。unauthorized 也可能
+// 来自 login/info 的账号页事实，因此在核心层没有对应记录时仍保留。
+func scheduleAfterBalance(authID, current string, available int, now time.Time) string {
+	if disabled, reason := store.GlobalDisableState(authID, now); disabled {
+		return scheduleForGlobalDisable(reason)
+	}
+	if current == "unauthorized" {
+		return current
+	}
+	if available <= 0 {
+		return "exhausted"
+	}
+	return "normal"
+}
+
+// scheduleAfterBalanceFailure 保留仍有效的失败状态。unverified 是当日核心禁用，跨日后必须
+// 立刻退出；exhausted 则可能是上一次成功余额读取得到的事实，不能在读取失败时擅自恢复。
+func scheduleAfterBalanceFailure(authID, current string, now time.Time) string {
+	if disabled, reason := store.GlobalDisableState(authID, now); disabled {
+		return scheduleForGlobalDisable(reason)
+	}
+	if current == "unverified" {
+		return "normal"
 	}
 	return current
 }
 
+// reconcileAccountSchedule 把账号摘要和核心层当前状态对齐。它同时处理禁用事件到达时缓存
+// 尚不存在、后台刷新持有旧快照，以及 unverified/exhausted 跨日后的恢复。
+func reconcileAccountSchedule(account *accountSummary, now time.Time) {
+	if account == nil || account.authID == "" {
+		return
+	}
+	if account.Balance != nil {
+		account.Schedule = scheduleAfterBalance(account.authID, account.Schedule, account.Balance.Available, now)
+		return
+	}
+	account.Schedule = scheduleAfterBalanceFailure(account.authID, account.Schedule, now)
+}
+
+func reconcileAccountSummaries(accounts []accountSummary, now time.Time) []accountSummary {
+	if accounts == nil {
+		return nil
+	}
+	out := append([]accountSummary(nil), accounts...)
+	for i := range out {
+		reconcileAccountSchedule(&out[i], now)
+	}
+	return out
+}
+
 // fetchAccountBalanceOnly 只取余额和限流，不查 login/info 也不查流水，用于首次加载之后的缓存刷新。
 // 资料（昵称、邮箱等）沿用现有缓存。
-func (c *msClient) fetchAccountBalanceOnly(idx int, sessionID, siteBase, site string, existing *accountSummary) accountSummary {
+func (c *msClient) fetchAccountBalanceOnly(idx int, authID, sessionID, siteBase, site string, existing *accountSummary) accountSummary {
 	a := *existing // 保留首次加载时拿到的资料
+	a.authID = authID
 	a.Index = idx
 
 	// 这里只并发拉取余额和限流
@@ -406,21 +454,17 @@ func (c *msClient) fetchAccountBalanceOnly(idx int, sessionID, siteBase, site st
 	}()
 	wg.Wait()
 
+	balanceKnown := false
 	if bErr == nil && bSc == 200 {
 		var b ratelimit.MagicCubeBalance
 		if json.Unmarshal(bRaw, &b) == nil {
 			a.Balance = &balanceJSON{Total: b.TotalBalance, Available: b.AvailableBalance, Frozen: b.FrozenAmount}
-			// 余额接口成功：按真实余额推导 schedule，覆盖 markAccountExhausted 留下的过期
-			// exhausted 状态。
-			a.Schedule = nextSchedule(a.Schedule, b.AvailableBalance)
+			balanceKnown = true
+			a.Schedule = scheduleAfterBalance(authID, a.Schedule, b.AvailableBalance, store.Now())
 		}
-	} else {
-		// 余额接口失败：如果之前的 schedule 是 exhausted（由 markAccountExhausted 设置），不要保留它。此时我
-		// 并不了解真实状态，退回 normal，避免卡在一个假的禁用上。unverified 同样不动：那是模型请求拿到的
-		// 403 事实，与余额接口能不能连通无关。
-		if a.Schedule == "exhausted" {
-			a.Schedule = "normal"
-		}
+	}
+	if !balanceKnown {
+		a.Schedule = scheduleAfterBalanceFailure(authID, a.Schedule, store.Now())
 	}
 	if rlErr == nil && rlSc == 200 {
 		var rl ratelimit.InferenceRateLimit
@@ -488,7 +532,7 @@ func refreshAccountsCache(resolved resolvedEntry) []accountSummary {
 				ex, ok := existingByMask[mk]
 				switch {
 				case !ok:
-					s = mc.fetchLoginInfo(i, sid, sbCopy, siteCopy)
+					s = mc.fetchLoginInfo(i, authID, sid, sbCopy, siteCopy)
 				case ex.Schedule == "unauthorized":
 					// 密钥失效的凭据要等到全量取数（插件重载，或管理中心"全部签到"）才有意义重探：
 					// 那把 session 已经被判死，后台每 30 分钟再打一次只是撞同一个 401/403。沿用现有
@@ -499,10 +543,10 @@ func refreshAccountsCache(resolved resolvedEntry) []accountSummary {
 						s.Balance = &balanceCopy
 					}
 				default:
-					s = mc.fetchAccountBalanceOnly(i, sid, sbCopy, siteCopy, ex)
+					s = mc.fetchAccountBalanceOnly(i, authID, sid, sbCopy, siteCopy, ex)
 				}
 			} else {
-				s = mc.fetchLoginInfo(i, sid, sbCopy, siteCopy)
+				s = mc.fetchLoginInfo(i, authID, sid, sbCopy, siteCopy)
 			}
 			mu.Lock()
 			out = append(out, indexedResult{i, s})
@@ -552,7 +596,14 @@ func refreshAccountsCache(resolved resolvedEntry) []accountSummary {
 		}
 	}
 	accountsCacheMu.Lock()
-	accountsCache = accountsCacheEntry{results: results, dedupedAuthIDs: resolved.dedupedAuthIDs, siteBase: resolved.siteBase, raw: resolved.raw, at: time.Now()}
+	now := store.Now()
+	for i := range results {
+		if results[i].authID == "" {
+			results[i].authID = authIDByMask(resolved, results[i].MaskedKey)
+		}
+		reconcileAccountSchedule(&results[i], now)
+	}
+	accountsCache = accountsCacheEntry{results: results, dedupedAuthIDs: resolved.dedupedAuthIDs, siteBase: resolved.siteBase, raw: resolved.raw, at: now}
 	accountsCacheMu.Unlock()
 	return results
 }
@@ -560,11 +611,13 @@ func refreshAccountsCache(resolved resolvedEntry) []accountSummary {
 // getAccountsCache 返回缓存的账号概况，为空时返回 nil。
 func getAccountsCache() []accountSummary {
 	accountsCacheMu.Lock()
-	defer accountsCacheMu.Unlock()
 	if accountsCache.results == nil || time.Since(accountsCache.at) >= accountsCacheTTL {
+		accountsCacheMu.Unlock()
 		return nil
 	}
-	return accountsCache.results
+	accounts := accountsCache.results
+	accountsCacheMu.Unlock()
+	return reconcileAccountSummaries(accounts, store.Now())
 }
 
 // clearAccountsCache 让缓存失效（reconfigure 时调用）。
@@ -767,8 +820,9 @@ func markRefreshDone() {
 // 忽略 TTL 返回缓存数据，供重新校验期间继续使用。
 func getStaleAccountsCache() []accountSummary {
 	accountsCacheMu.Lock()
-	defer accountsCacheMu.Unlock()
-	return accountsCache.results
+	accounts := accountsCache.results
+	accountsCacheMu.Unlock()
+	return reconcileAccountSummaries(accounts, store.Now())
 }
 
 // unauthorizedMaskedKeys 返回账号缓存里已被判定"密钥失效"的账号（maskedKey 集合）。

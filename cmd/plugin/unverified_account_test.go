@@ -170,6 +170,13 @@ func TestExecuteResponsesPassthroughUnverified403RotatesKey(t *testing.T) {
 	pluginCfg.SkipProviderOn429 = true
 	pluginCfg.UseResponses = []string{"vendor/Shared-Model"}
 	setTestResolvedTwoKeyProviders()
+	maskedKey := maskKey("key-a1")
+	accountOf := seedAccountsCache(t, accountSummary{
+		authID:    "a1",
+		MaskedKey: maskedKey,
+		Schedule:  "normal",
+		Balance:   &balanceJSON{Total: 100, Available: 42},
+	})
 
 	origHTTP := hostHTTPDo
 	origModel := hostModelExecute
@@ -198,6 +205,9 @@ func TestExecuteResponsesPassthroughUnverified403RotatesKey(t *testing.T) {
 	if !store.IsKeyDisabled("a1", "vendor/Shared-Model", store.Now()) {
 		t.Fatal("the unverified credential must be disabled so later requests skip it")
 	}
+	if account := accountOf(maskedKey); account.Schedule != "unverified" {
+		t.Fatalf("executor failure must update the account cache, schedule=%q", account.Schedule)
+	}
 }
 
 // 同一个判定在流式路径上也要成立，那条路径有一份独立的调用点。
@@ -210,6 +220,13 @@ func TestExecuteResponsesPassthroughStreamUnverified403RotatesKey(t *testing.T) 
 	pluginCfg.SkipProviderOn429 = true
 	pluginCfg.UseResponses = []string{"vendor/Shared-Model"}
 	setTestResolvedTwoKeyProviders()
+	maskedKey := maskKey("key-a1")
+	accountOf := seedAccountsCache(t, accountSummary{
+		authID:    "a1",
+		MaskedKey: maskedKey,
+		Schedule:  "normal",
+		Balance:   &balanceJSON{Total: 100, Available: 42},
+	})
 
 	origStream := hostHTTPDoStream
 	origModelStream := hostModelExecuteStream
@@ -245,5 +262,53 @@ func TestExecuteResponsesPassthroughStreamUnverified403RotatesKey(t *testing.T) 
 	wantSameProviderRetry(t, attempts, 2)
 	if !store.IsKeyDisabled("a1", "vendor/Shared-Model", store.Now()) {
 		t.Fatal("the unverified credential must be disabled so later requests skip it")
+	}
+	if account := accountOf(maskedKey); account.Schedule != "unverified" {
+		t.Fatalf("stream executor failure must update the account cache, schedule=%q", account.Schedule)
+	}
+}
+
+// 直连执行器失败没有宿主用量回调兜底，也必须自行广播到共享同一原始 key 的其它 provider。
+func TestExecuteResponsesPassthroughUnverifiedBroadcastsSharedAccount(t *testing.T) {
+	origStore := store
+	store = modelscope.NewStore(stderrLogger{})
+	t.Cleanup(func() { store = origStore })
+
+	setTestPluginConfig("alpha", "beta")
+	pluginCfg.UseResponses = []string{"vendor/Shared-Model"}
+	setTestResolvedSharedRawKey()
+	maskedKey := maskKey("key-shared")
+	accountOf := seedAccountsCache(t, accountSummary{
+		authID:    "a1",
+		MaskedKey: maskedKey,
+		Schedule:  "normal",
+		Balance:   &balanceJSON{Total: 100, Available: 42},
+	})
+
+	origHTTP := hostHTTPDo
+	origModel := hostModelExecute
+	t.Cleanup(func() {
+		hostHTTPDo = origHTTP
+		hostModelExecute = origModel
+	})
+	hostHTTPDo = func(_ pluginapi.HTTPRequest, _ string) (hostHTTPResponse, error) {
+		return hostHTTPResponse{StatusCode: 403, Body: []byte(unverifiedAccountBody)}, nil
+	}
+	hostModelExecute = func(_ executorRequestWithCallback) (pluginapi.HostModelExecutionResponse, error) {
+		return pluginapi.HostModelExecutionResponse{
+			StatusCode: 200,
+			Body:       []byte(`{"id":"fallback"}`),
+		}, nil
+	}
+
+	if _, err := executeResponsesPassthrough(responsesTestRequest("shared-a")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	now := store.Now()
+	if !store.IsKeyDisabled("a1", "shared-a", now) || !store.IsKeyDisabled("b1", "shared-b", now) {
+		t.Fatal("unverified account failure must disable every auth ID sharing the raw key")
+	}
+	if account := accountOf(maskedKey); account.Schedule != "unverified" {
+		t.Fatalf("account cache schedule = %q, want unverified", account.Schedule)
 	}
 }

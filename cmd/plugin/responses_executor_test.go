@@ -1775,7 +1775,22 @@ func setTestResolvedTwoKeyProviders() {
 	}
 	resolvedMu.Lock()
 	resolvedCache = resolvedEntry{
-		raw:         map[string]string{"a1": "key-a1", "a2": "key-a2", "b1": "key-b1"},
+		masked: map[string]string{
+			"a1": maskKey("key-a1"),
+			"a2": maskKey("key-a2"),
+			"b1": maskKey("key-b1"),
+		},
+		raw: map[string]string{"a1": "key-a1", "a2": "key-a2", "b1": "key-b1"},
+		rawToAuthIDs: map[string][]string{
+			"key-a1": {"a1"},
+			"key-a2": {"a2"},
+			"key-b1": {"b1"},
+		},
+		maskToAuthID: map[string]string{
+			maskKey("key-a1"): "a1",
+			maskKey("key-a2"): "a2",
+			maskKey("key-b1"): "b1",
+		},
 		baseURL:     map[string]string{"a1": "https://alpha.example/v1", "a2": "https://alpha.example/v1", "b1": "https://beta.example/v1"},
 		routeToName: routes,
 		nameToRoute: withRouteIndex(routes),

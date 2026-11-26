@@ -375,8 +375,9 @@ func (s *Store) ApplyInsufficientQuotaCooldown(authID, model string, statusCode 
 // 东西的拦截结果（本插件只观察，绝不改写 Modelscope 的响应）。
 func (s *Store) OnResponse(req ResponseInterceptRequest) ResponseInterceptResponse {
 	authID := AuthIDFromMetadata(req.Metadata)
-	s.ApplyRateLimit(authID, req.Model, req.ResponseHeaders, req.StatusCode, req.Body, s.now())
-	if IsResponsesRateLimitExceeded(req.Body) {
+	body := string(req.Body)
+	s.ApplyRateLimit(authID, req.Model, req.ResponseHeaders, req.StatusCode, body, s.now())
+	if IsResponsesRateLimitExceeded(body) {
 		if s.consumeResponsesRateLimitApplied(authID, s.now()) {
 			return ResponseInterceptResponse{}
 		}
@@ -384,22 +385,150 @@ func (s *Store) OnResponse(req ResponseInterceptRequest) ResponseInterceptRespon
 			authID,
 			ProviderFromMetadata(req.Metadata),
 			req.RequestedModel,
-			req.Body,
+			body,
 			s.now(),
 		)
 	}
 	return ResponseInterceptResponse{}
 }
 
+const (
+	responsesRateLimitTailBytes        = 64 << 10
+	responsesRateLimitStreamTTL        = 10 * time.Minute
+	responsesRateLimitStreamPruneEvery = time.Minute
+)
+
+// responsesRateLimitHistoryWindow 为旧宿主构造判据窗口。旧协议仍发送 HistoryChunks，
+// 可以从中取有限尾部；schema 5+ 的新宿主走插件自维护的 streamDetection。
+func responsesRateLimitHistoryWindow(history [][]byte, body []byte) string {
+	if len(history) == 0 {
+		return string(body)
+	}
+	parts := make([][]byte, 0, len(history)+1)
+	remaining := responsesRateLimitTailBytes
+	for i := len(history) - 1; i >= 0 && remaining > 0; i-- {
+		chunk := history[i]
+		if len(chunk) > remaining {
+			chunk = chunk[len(chunk)-remaining:]
+		}
+		parts = append(parts, chunk)
+		remaining -= len(chunk)
+	}
+	var window strings.Builder
+	for i := len(parts) - 1; i >= 0; i-- {
+		window.Write(parts[i])
+	}
+	window.Write(body)
+	return window.String()
+}
+
+func latestResponsesRateLimitTerminalIndex(body string) int {
+	latest := -1
+	for _, marker := range []string{
+		`"response.completed"`,
+		`"response.incomplete"`,
+		`"response.failed"`,
+		"[DONE]",
+	} {
+		if index := strings.LastIndex(body, marker); index > latest {
+			latest = index
+		}
+	}
+	return latest
+}
+
+func responsesRateLimitTerminalEvent(body string) bool {
+	terminalIndex := latestResponsesRateLimitTerminalIndex(body)
+	if terminalIndex < 0 {
+		return false
+	}
+	afterTerminal := body[terminalIndex:]
+	return strings.Contains(afterTerminal, "\n\n") || strings.Contains(afterTerminal, "\r\n\r\n")
+}
+
+func (s *Store) resetStreamDetection(requestID string) {
+	if requestID == "" {
+		return
+	}
+	s.streamDetectionMu.Lock()
+	delete(s.streamDetections, requestID)
+	s.streamDetectionMu.Unlock()
+}
+
+func (s *Store) resetAllStreamDetections() {
+	s.streamDetectionMu.Lock()
+	s.streamDetections = make(map[string]streamDetectionState)
+	s.streamDetectionLastPrune = time.Time{}
+	s.streamDetectionMu.Unlock()
+}
+
+func (s *Store) pruneStreamDetectionsLocked(now time.Time) {
+	if !s.streamDetectionLastPrune.IsZero() &&
+		now.Sub(s.streamDetectionLastPrune) < responsesRateLimitStreamPruneEvery {
+		return
+	}
+	s.streamDetectionLastPrune = now
+	for requestID, state := range s.streamDetections {
+		if now.Sub(state.updatedAt) > responsesRateLimitStreamTTL {
+			delete(s.streamDetections, requestID)
+		}
+	}
+}
+
+func (s *Store) pruneStreamDetections(now time.Time) {
+	s.streamDetectionMu.Lock()
+	s.pruneStreamDetectionsLocked(now)
+	s.streamDetectionMu.Unlock()
+}
+
+// responsesRateLimitDetectionBody 返回本次流块的连续判据窗口。新宿主通过 RequestID
+// 标识同一个流，插件按请求保存 64 KiB 滚动尾部，因此不依赖 schema 6 已移除的
+// HistoryChunks；旧宿主没有 RequestID 时继续使用宿主提供的 HistoryChunks。
+func (s *Store) responsesRateLimitDetectionBody(req StreamChunkInterceptRequest) string {
+	if req.RequestID == "" {
+		return responsesRateLimitHistoryWindow(req.HistoryChunks, req.Body)
+	}
+
+	now := s.now()
+	s.streamDetectionMu.Lock()
+	defer s.streamDetectionMu.Unlock()
+	if s.streamDetections == nil {
+		s.streamDetections = make(map[string]streamDetectionState)
+	}
+	s.pruneStreamDetectionsLocked(now)
+
+	previous := s.streamDetections[req.RequestID]
+	combined := make([]byte, 0, len(previous.tail)+len(req.Body))
+	combined = append(combined, previous.tail...)
+	combined = append(combined, req.Body...)
+
+	tail := combined
+	if len(tail) > responsesRateLimitTailBytes {
+		tail = tail[len(tail)-responsesRateLimitTailBytes:]
+	}
+	body := string(combined)
+	if responsesRateLimitTerminalEvent(body) {
+		delete(s.streamDetections, req.RequestID)
+		return body
+	}
+	s.streamDetections[req.RequestID] = streamDetectionState{
+		tail:      append([]byte(nil), tail...),
+		updatedAt: now,
+	}
+	return body
+}
+
 // OnStreamChunk 处理 response.intercept_stream_chunk。只有仅带头信息的初始化调用
 // （ChunkIndex == -1）才带限流响应头，数据块原样放行。
 func (s *Store) OnStreamChunk(req StreamChunkInterceptRequest) StreamChunkInterceptResponse {
 	if req.ChunkIndex == -1 {
+		s.resetStreamDetection(req.RequestID)
 		authID := AuthIDFromMetadata(req.Metadata)
 		s.ApplyRateLimit(authID, req.Model, req.ResponseHeaders, 0, "", s.now())
 		return StreamChunkInterceptResponse{}
 	}
-	if IsResponsesRateLimitExceeded(req.Body) {
+	body := s.responsesRateLimitDetectionBody(req)
+	if IsResponsesRateLimitExceeded(body) {
 		authID := AuthIDFromMetadata(req.Metadata)
 		if s.consumeResponsesRateLimitApplied(authID, s.now()) {
 			return StreamChunkInterceptResponse{}
@@ -408,7 +537,7 @@ func (s *Store) OnStreamChunk(req StreamChunkInterceptRequest) StreamChunkInterc
 			authID,
 			ProviderFromMetadata(req.Metadata),
 			req.RequestedModel,
-			req.Body,
+			body,
 			s.now(),
 		)
 	}

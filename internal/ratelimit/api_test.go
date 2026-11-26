@@ -6,7 +6,7 @@ import (
 )
 
 func TestNormalizeAPIResponseCamelCase(t *testing.T) {
-	raw := []byte(`{"Code":200,"Data":{"Name":"liuzhijie","Email":"test@qq.com"},"Message":"success","Success":true,"RequestId":"abc"}`)
+	raw := []byte(`{"Code":200,"Data":{"Name":"test-user","Email":"test@example.com"},"Message":"success","Success":true,"RequestId":"abc"}`)
 	resp, err := NormalizeAPIResponse(raw)
 	if err != nil {
 		t.Fatalf("normalize: %v", err)
@@ -21,7 +21,7 @@ func TestNormalizeAPIResponseCamelCase(t *testing.T) {
 	if err := json.Unmarshal(resp.Data, &li); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if li.Name != "liuzhijie" || li.Email != "test@qq.com" {
+	if li.Name != "test-user" || li.Email != "test@example.com" {
 		t.Fatalf("unexpected: %+v", li)
 	}
 }

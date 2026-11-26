@@ -7,6 +7,11 @@ package ratelimit
 //   - response-stream-interceptor.md（StreamChunkInterceptRequest/Response）
 //   - usage-plugin.md         （UsageRecord、UsageFailure）
 // 结构体带 json tag，SDK 胶水层可以直接序列化/反序列化。
+//
+// 凡是承载响应体/请求体的字段一律声明为 []byte，与宿主 pluginapi 里的同名成员保持同一
+// 类型。宿主的帧是用 encoding/json 把 []byte 编码出来的，形态是 base64 字符串；声明成
+// []byte 时标准库会自动解码，声明成 string 则会把 base64 密文原样收下，所有基于子串的
+// 判据（response.failed、rate_limit_exceeded、insufficient_quota、审查文案）全部失效。
 
 // SchedulerOptions 是 scheduler 请求里的 Options 子对象。
 type SchedulerOptions struct {
@@ -54,9 +59,9 @@ type ResponseInterceptRequest struct {
 	Stream          bool                `json:"Stream"`
 	RequestHeaders  map[string][]string `json:"RequestHeaders,omitempty"`
 	ResponseHeaders map[string][]string `json:"ResponseHeaders,omitempty"`
-	OriginalRequest string              `json:"OriginalRequest,omitempty"`
-	RequestBody     string              `json:"RequestBody,omitempty"`
-	Body            string              `json:"Body,omitempty"`
+	OriginalRequest []byte              `json:"OriginalRequest,omitempty"`
+	RequestBody     []byte              `json:"RequestBody,omitempty"`
+	Body            []byte              `json:"Body,omitempty"`
 	StatusCode      int                 `json:"StatusCode"`
 	Metadata        map[string]any      `json:"Metadata,omitempty"`
 }
@@ -65,22 +70,24 @@ type ResponseInterceptRequest struct {
 // 返回零值表示“不改动任何东西”。
 type ResponseInterceptResponse struct {
 	Headers      map[string][]string `json:"Headers,omitempty"`
-	Body         string              `json:"Body,omitempty"`
+	Body         []byte              `json:"Body,omitempty"`
 	ClearHeaders []string            `json:"ClearHeaders,omitempty"`
 }
 
 // StreamChunkInterceptRequest 是 response.intercept_stream_chunk 的请求载荷。
 // ChunkIndex == -1 表示仅带响应头的初始化调用。
 type StreamChunkInterceptRequest struct {
+	// RequestID 在最新宿主中唯一标识一条流，供插件维护跨块检测状态。
+	RequestID       string              `json:"RequestID"`
 	SourceFormat    string              `json:"SourceFormat"`
 	Model           string              `json:"Model"`
 	RequestedModel  string              `json:"RequestedModel"`
 	RequestHeaders  map[string][]string `json:"RequestHeaders,omitempty"`
 	ResponseHeaders map[string][]string `json:"ResponseHeaders,omitempty"`
-	OriginalRequest string              `json:"OriginalRequest,omitempty"`
-	RequestBody     string              `json:"RequestBody,omitempty"`
-	Body            string              `json:"Body,omitempty"`
-	HistoryChunks   []string            `json:"HistoryChunks,omitempty"`
+	OriginalRequest []byte              `json:"OriginalRequest,omitempty"`
+	RequestBody     []byte              `json:"RequestBody,omitempty"`
+	Body            []byte              `json:"Body,omitempty"`
+	HistoryChunks   [][]byte            `json:"HistoryChunks,omitempty"`
 	ChunkIndex      int                 `json:"ChunkIndex"`
 	Metadata        map[string]any      `json:"Metadata,omitempty"`
 }
@@ -88,7 +95,7 @@ type StreamChunkInterceptRequest struct {
 // StreamChunkInterceptResponse 是分块流拦截的返回结果。
 type StreamChunkInterceptResponse struct {
 	Headers      map[string][]string `json:"Headers,omitempty"`
-	Body         string              `json:"Body,omitempty"`
+	Body         []byte              `json:"Body,omitempty"`
 	ClearHeaders []string            `json:"ClearHeaders,omitempty"`
 	DropChunk    bool                `json:"DropChunk"`
 }
@@ -114,6 +121,9 @@ type UsageRecord struct {
 }
 
 // UsageFailure 描述一次失败请求。
+//
+// 这里的 Body 保持 string：宿主 pluginapi.UsageFailure.Body 本身就是 string，JSON 里是
+// 明文而非 base64，直接用子串判据即可。
 type UsageFailure struct {
 	StatusCode int    `json:"StatusCode"`
 	Body       string `json:"Body,omitempty"`

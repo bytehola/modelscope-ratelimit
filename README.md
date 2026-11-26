@@ -3,10 +3,10 @@
 > CLIProxyAPI 的 Modelscope 限流插件：限额账号禁用、凭据轮换、魔粒监控与自动签到。
 
 ![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go&logoColor=white)
-![CLIProxyAPI](https://img.shields.io/badge/CLIProxyAPI-v7.2.51+-blue)
+![CLIProxyAPI](https://img.shields.io/badge/CLIProxyAPI-v8.1.2+-blue)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
 ![Build](https://img.shields.io/badge/build-c--shared-black)
-![Version](https://img.shields.io/badge/version-2.4.10-green)
+![Version](https://img.shields.io/badge/version-2.4.15-green)
 
 ## 核心特性
 - 🎲 **自动签到 + 魔粒监控**：每日 00:00 签到领取魔粒，定时拉取余额与消费流水。
@@ -15,6 +15,7 @@
 - 🔁 **凭据轮换**：支持 `round-robin` / `fill-first`。
 - 🧪 **use_responses 透传**：填上游模型 `name` 命中即透传 Respnses API。
 - 📜 **日志接入宿主**：插件日志经 `host.log` 写入 CPA 自己的日志文件，`GET /v0/management/logs` 与管理中心可直接检索；明细调度为 debug 级，需打开 CPA 调试模式。
+- 🧩 **协议自动协商**：按宿主能力协商到最高 schema 6；新版宿主省略逐块重复请求体和历史窗口，跨块限流检测由插件自行维护。
 
 ## 快速开始
 
